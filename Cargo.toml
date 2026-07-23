@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["core", "cli", "src/rust_scanner", "src/rust_exporter"]

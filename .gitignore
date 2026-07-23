@@ -206,6 +206,11 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# Build / dist
+dist/
+build/
+*.spec
+
 # PyPI configuration file
 .pypirc
 
@@ -216,3 +221,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# duscan build artifacts, local config, and scan output
+/duscan
+/duscan-static
+/duscan.toml
+/reports/
+# legacy binary names (pre-rename)
+/check-disk-bin
+/check-disk-bin-static
