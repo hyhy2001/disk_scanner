@@ -68,7 +68,17 @@ enum Command {
     AddTeam { name: String, #[arg(long)] target: String },
     AddUser { users: Vec<String>, #[arg(long)] team: String, #[arg(long)] target: String },
     RemoveUser { users: Vec<String>, #[arg(long)] target: String },
-    Detail { #[arg(long)] user: Vec<String>, #[arg(long)] output_dir: Option<String>, #[arg(long, default_value = "30")] top: usize, #[arg(long)] target: Option<String>, #[arg(long)] json: bool },
+    Detail {
+        #[arg(long)] user: Vec<String>,
+        #[arg(long)] output_dir: Option<String>,
+        #[arg(long, default_value = "30")] top: usize,
+        #[arg(long)] target: Option<String>,
+        #[arg(long)] json: bool,
+        /// Section to show: report (default), permission, inode.
+        #[arg(long = "type", default_value = "report")] section: String,
+        /// Filter permission issues by path substring (permission section only).
+        #[arg(long)] search: Option<String>,
+    },
     /// Show directory tree from treemap data
     TreeShow {
         #[arg(long)]
@@ -462,7 +472,7 @@ fn main() {
         Command::Run { output_dir, tree_map, workers, level, target } => {
             run_scan(&mut cfg, output_dir.clone(), *tree_map, *workers, *level, target);
         }
-        Command::Detail { user, output_dir, top, target, json } => {
+        Command::Detail { user, output_dir, top, target, json, section, search } => {
             let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
             let mut json_out: Vec<serde_json::Value> = Vec::new();
             for username in user {
@@ -480,42 +490,61 @@ fn main() {
                         let prefix = detail_prefix(&conn);
                         let tname = path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
-                        let sql = format!(
-                            "SELECT uid, total_files, total_dirs, total_size FROM {}users WHERE username = ?1", prefix
-                        );
-                        let Ok(mut stmt) = conn.prepare(&sql) else { continue };
-                        let Ok(rows) = stmt.query_map([&username], |r| {
-                            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
-                        }) else { continue };
-                        for row in rows.flatten() {
-                            let (uid, total_files, total_dirs, total_size) = row;
-                            found = true;
-                            let top_dirs = query_top(&conn, &format!(
-                                "SELECT d.size, d.path FROM {}dirs d WHERE d.uid = ?1 ORDER BY d.size DESC LIMIT ?2", prefix), uid, *top);
-                            let top_files = query_top(&conn, &format!(
-                                "SELECT f.size, n.name FROM {}files f JOIN {}file_names n ON f.name_id = n.id \
-                                 WHERE f.uid = ?1 ORDER BY f.size DESC LIMIT ?2", prefix, prefix), uid, *top);
+                        match section.as_str() {
+                            // Permission issues for the user (from the merged perm_issues table).
+                            "permission" => {
+                                if detail_query_permission(&conn, username, *top, search.as_deref(),
+                                    &tname, *json, &mut json_out) { found = true; }
+                            }
+                            // Per-directory file-count (inode) breakdown, sorted by file count.
+                            "inode" => {
+                                if detail_query_inode(&conn, &prefix, username, *top,
+                                    &tname, *json, &mut json_out) { found = true; }
+                            }
+                            // Default: size report (top dirs/files by size).
+                            _ => {
+                                let sql = format!(
+                                    "SELECT uid, total_files, total_dirs, total_size FROM {}users WHERE username = ?1", prefix
+                                );
+                                let Ok(mut stmt) = conn.prepare(&sql) else { continue };
+                                let Ok(rows) = stmt.query_map([&username], |r| {
+                                    Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
+                                }) else { continue };
+                                for row in rows.flatten() {
+                                    let (uid, total_files, total_dirs, total_size) = row;
+                                    found = true;
+                                    let top_dirs = query_top(&conn, &format!(
+                                        "SELECT d.size, d.path FROM {}dirs d WHERE d.uid = ?1 ORDER BY d.size DESC LIMIT ?2", prefix), uid, *top);
+                                    let top_files = query_top(&conn, &format!(
+                                        "SELECT f.size, n.name FROM {}files f JOIN {}file_names n ON f.name_id = n.id \
+                                         WHERE f.uid = ?1 ORDER BY f.size DESC LIMIT ?2", prefix, prefix), uid, *top);
 
-                            if *json {
-                                json_out.push(serde_json::json!({
-                                    "user": username, "target": tname, "uid": uid,
-                                    "total_files": total_files, "total_dirs": total_dirs, "total_size": total_size,
-                                    "top_dirs": top_dirs.iter().map(|(s, p)| serde_json::json!({"size": s, "path": p})).collect::<Vec<_>>(),
-                                    "top_files": top_files.iter().map(|(s, p)| serde_json::json!({"size": s, "name": p})).collect::<Vec<_>>(),
-                                }));
-                            } else {
-                                println!("\n=== root on {} ===", tname);
-                                println!("  Files: {}  Dirs: {}  Size: {}", total_files, total_dirs, fmt_size(total_size));
-                                println!("\n  {}  Top Directories", "─".repeat(40));
-                                for (s, p) in &top_dirs { println!("    {:>10}  {}", fmt_size(*s), p); }
-                                println!("\n  {}  Top Files", "─".repeat(40));
-                                for (s, p) in &top_files { println!("    {:>10}  {}", fmt_size(*s), p); }
+                                    if *json {
+                                        json_out.push(serde_json::json!({
+                                            "user": username, "target": tname, "uid": uid,
+                                            "total_files": total_files, "total_dirs": total_dirs, "total_size": total_size,
+                                            "top_dirs": top_dirs.iter().map(|(s, p)| serde_json::json!({"size": s, "path": p})).collect::<Vec<_>>(),
+                                            "top_files": top_files.iter().map(|(s, p)| serde_json::json!({"size": s, "name": p})).collect::<Vec<_>>(),
+                                        }));
+                                    } else {
+                                        println!("\n=== root on {} ===", tname);
+                                        println!("  Files: {}  Dirs: {}  Size: {}", total_files, total_dirs, fmt_size(total_size));
+                                        println!("\n  {}  Top Directories", "─".repeat(40));
+                                        for (s, p) in &top_dirs { println!("    {:>10}  {}", fmt_size(*s), p); }
+                                        println!("\n  {}  Top Files", "─".repeat(40));
+                                        for (s, p) in &top_files { println!("    {:>10}  {}", fmt_size(*s), p); }
+                                    }
+                                }
                             }
                         }
                     }
                 }
                 if !found && !*json {
-                    println!("User '{}' not found.", username);
+                    match section.as_str() {
+                        "permission" => println!("No permission issues for user '{}'.", username),
+                        "inode" => println!("No inode data for user '{}'.", username),
+                        _ => println!("User '{}' not found.", username),
+                    }
                 }
             }
             if *json {
@@ -799,6 +828,119 @@ pub fn query_report_users(db: &std::path::Path) -> Vec<ReportUser> {
     // Team users first, then Other; each group sorted by size desc.
     users.sort_by(|a, b| b.has_team.cmp(&a.has_team).then(b.size.cmp(&a.size)));
     users
+}
+
+/// Whether the merged report.db has the permission-issues table.
+fn has_perm_issues(conn: &rusqlite::Connection) -> bool {
+    conn.prepare("SELECT 1 FROM perm_issues LIMIT 1").is_ok()
+}
+
+/// Permission-issues section of `detail`: list a user's permission errors from
+/// the merged `perm_issues` table (Type / Error / Path), optionally filtered by
+/// a path substring. Returns true if any issue was printed/collected.
+fn detail_query_permission(
+    conn: &rusqlite::Connection,
+    user: &str,
+    top: usize,
+    search: Option<&str>,
+    tname: &str,
+    json: bool,
+    json_out: &mut Vec<serde_json::Value>,
+) -> bool {
+    if !has_perm_issues(conn) { return false; }
+    // Total + rows, with an optional case-insensitive path LIKE filter.
+    let (total, rows): (i64, Vec<(String, String, String)>) = if let Some(kw) = search {
+        let pat = format!("%{}%", kw);
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM perm_issues WHERE user = ?1 AND path LIKE ?2 COLLATE NOCASE",
+            rusqlite::params![user, pat], |r| r.get(0)).unwrap_or(0);
+        let mut stmt = match conn.prepare(
+            "SELECT item_type, error, path FROM perm_issues \
+             WHERE user = ?1 AND path LIKE ?2 COLLATE NOCASE ORDER BY id LIMIT ?3") {
+            Ok(s) => s, Err(_) => return false,
+        };
+        let rows = stmt.query_map(rusqlite::params![user, pat, top as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        }).map(|it| it.flatten().collect()).unwrap_or_default();
+        (total, rows)
+    } else {
+        let total: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM perm_issues WHERE user = ?1",
+            rusqlite::params![user], |r| r.get(0)).unwrap_or(0);
+        let mut stmt = match conn.prepare(
+            "SELECT item_type, error, path FROM perm_issues WHERE user = ?1 ORDER BY id LIMIT ?2") {
+            Ok(s) => s, Err(_) => return false,
+        };
+        let rows = stmt.query_map(rusqlite::params![user, top as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        }).map(|it| it.flatten().collect()).unwrap_or_default();
+        (total, rows)
+    };
+
+    if total == 0 { return false; }
+
+    if json {
+        json_out.push(serde_json::json!({
+            "user": user, "target": tname, "section": "permission", "total": total,
+            "issues": rows.iter().map(|(t, e, p)|
+                serde_json::json!({"type": t, "error": e, "path": p})).collect::<Vec<_>>(),
+        }));
+    } else {
+        println!("\n=== permission issues: {} on {} ===", user, tname);
+        println!("  Total: {}", total);
+        if let Some(kw) = search { println!("  Search: '{}'", kw); }
+        println!("  {:<10}  {:<22}  {}", "Type", "Error", "Path");
+        println!("  {}", "─".repeat(72));
+        for (t, e, p) in &rows {
+            println!("  {:<10}  {:<22}  {}", t, e, p);
+        }
+    }
+    true
+}
+
+/// Inode section of `detail`: per-directory file-count breakdown for a user,
+/// sorted by file count (largest first). Uses the `files` column already in the
+/// detail dirs table. Returns true if any dir row was printed/collected.
+fn detail_query_inode(
+    conn: &rusqlite::Connection,
+    prefix: &str,
+    user: &str,
+    top: usize,
+    tname: &str,
+    json: bool,
+    json_out: &mut Vec<serde_json::Value>,
+) -> bool {
+    // Resolve uid + totals for the user.
+    let sql = format!("SELECT uid, total_files, total_dirs FROM {}users WHERE username = ?1", prefix);
+    let (uid, total_files, total_dirs): (i64, i64, i64) = match conn.query_row(
+        &sql, rusqlite::params![user], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))) {
+        Ok(v) => v, Err(_) => return false,
+    };
+    // Per-dir file count, largest first.
+    let dsql = format!(
+        "SELECT files, size, path FROM {}dirs WHERE uid = ?1 ORDER BY files DESC, size DESC LIMIT ?2", prefix);
+    let mut stmt = match conn.prepare(&dsql) { Ok(s) => s, Err(_) => return false };
+    let dirs: Vec<(i64, i64, String)> = stmt.query_map(rusqlite::params![uid, top as i64], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+    }).map(|it| it.flatten().collect()).unwrap_or_default();
+
+    if json {
+        json_out.push(serde_json::json!({
+            "user": user, "target": tname, "section": "inode", "uid": uid,
+            "total_files": total_files, "total_dirs": total_dirs,
+            "dirs": dirs.iter().map(|(f, s, p)|
+                serde_json::json!({"files": f, "size": s, "path": p})).collect::<Vec<_>>(),
+        }));
+    } else {
+        println!("\n=== inode report: {} on {} ===", user, tname);
+        println!("  Total files: {}   Total dirs: {}", total_files, total_dirs);
+        println!("  {:>10}  {:>10}  {}", "Files", "Size", "Directory");
+        println!("  {}", "─".repeat(72));
+        for (f, s, p) in &dirs {
+            println!("  {:>10}  {:>10}  {}", f, fmt_size(*s), p);
+        }
+    }
+    true
 }
 
 /// Detect the treemap table prefix, or None if this report.db has no treemap.
