@@ -254,7 +254,22 @@ fn browse_teams_users(app: &mut App, key: event::KeyEvent) {
     let nteams = app.cfg.targets.get(app.target_sel).map(|t| t.teams.len()).unwrap_or(0);
     let nusers = app.current_team_users().len();
     match key.code {
-        // Teams: k/j move team selection. Users: K/J (shift) move user selection.
+        // [ / ] switch which target this tab operates on, without leaving the tab.
+        KeyCode::Char('[') => {
+            if app.target_sel > 0 {
+                app.target_sel -= 1;
+                app.team_sel = 0; app.user_sel = 0;
+                app.status = format!("Target: {}", app.current_target_name().unwrap_or_default());
+            }
+        }
+        KeyCode::Char(']') => {
+            if app.target_sel + 1 < app.cfg.targets.len() {
+                app.target_sel += 1;
+                app.team_sel = 0; app.user_sel = 0;
+                app.status = format!("Target: {}", app.current_target_name().unwrap_or_default());
+            }
+        }
+        // Teams: k/j move team selection. Users: ←→ move user selection.
         KeyCode::Up | KeyCode::Char('k') => { if app.team_sel > 0 { app.team_sel -= 1; app.user_sel = 0; } }
         KeyCode::Down | KeyCode::Char('j') => { if app.team_sel + 1 < nteams { app.team_sel += 1; app.user_sel = 0; } }
         KeyCode::Left => { if app.user_sel > 0 { app.user_sel -= 1; } }
@@ -506,7 +521,7 @@ fn footer_hint(app: &App) -> &'static str {
         Mode::Confirm { .. } => "y confirm · any other key cancel",
         Mode::Browse => match app.tab {
             Tab::Targets => "↑↓ move · a add · e path · s end-scan · p purge · d delete · Enter→teams · ↹ tab · q quit",
-            Tab::TeamsUsers => "↑↓ team · ←→ user · a add-team · d del-team · u add-users · x del-user · ↹ tab · q quit",
+            Tab::TeamsUsers => "[ ] target · ↑↓ team · ←→ user · a add-team · d del-team · u add-users · x del-user · ↹ tab · q quit",
             Tab::Settings => "↑↓ move · Enter/e edit · ↹ tab · q quit",
         },
     }
@@ -558,6 +573,8 @@ fn draw_teams_users(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let tname = app.current_target_name().unwrap_or_else(|| "(no target)".into());
+    // Show which target (n/total) and that [ ] switches it, so the binding is discoverable.
+    let target_label = format!("{} [{}/{}]  ([ ] switch)", tname, app.target_sel + 1, app.cfg.targets.len());
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -573,7 +590,7 @@ fn draw_teams_users(frame: &mut Frame, app: &App, area: Rect) {
         _ => vec![ListItem::new(Span::styled("Press  a  to add a team", Style::default().fg(Color::Cyan)))],
     };
     let teams = List::new(team_items)
-        .block(Block::default().borders(Borders::ALL).title(format!(" Teams — target: {} ", tname)))
+        .block(Block::default().borders(Borders::ALL).title(format!(" Teams — target: {} ", target_label)))
         .highlight_style(selected_style());
     let mut ts = ListState::default();
     if app.cfg.targets.get(app.target_sel).map(|t| !t.teams.is_empty()).unwrap_or(false) {
