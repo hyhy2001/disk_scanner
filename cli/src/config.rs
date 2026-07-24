@@ -48,8 +48,11 @@ pub struct TargetSpec {
     pub purge_time: Option<i64>,
 }
 
+/// On-disk shape of `duscan.toml`: global settings only. Targets no longer live
+/// here — each target is its own file under `targets/` (see `TargetFile`). This
+/// keeps `duscan.toml` small and lets each target be reviewed/versioned alone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Config {
+pub struct Globals {
     #[serde(default = "default_output_dir")]
     pub output_dir: String,
     #[serde(default = "default_workers")]
@@ -58,7 +61,49 @@ pub struct Config {
     pub max_parallel_devices: i64,
     #[serde(default = "default_nfs_parallel")]
     pub nfs_parallel: i64,
+}
+
+impl Default for Globals {
+    fn default() -> Self {
+        Self {
+            output_dir: default_output_dir(),
+            workers: default_workers(),
+            max_parallel_devices: 0,
+            nfs_parallel: default_nfs_parallel(),
+        }
+    }
+}
+
+/// Ergonomic on-disk shape of one `targets/<name>.toml` file: teams carry their
+/// member usernames directly and `team_id` is never written — it's assigned
+/// internally on load. This is the hand-editable format (same idea as `apply`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetFile {
+    pub name: String,
+    pub path: String,
     #[serde(default)]
+    pub teams: Vec<TeamFile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_scan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purge_time: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamFile {
+    pub name: String,
+    #[serde(default)]
+    pub users: Vec<String>,
+}
+
+/// In-memory config. `targets` is assembled from the per-target files on load
+/// and written back out (one file each) on save; it is not serialized as a whole.
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub output_dir: String,
+    pub workers: String,
+    pub max_parallel_devices: i64,
+    pub nfs_parallel: i64,
     pub targets: Vec<Target>,
 }
 
@@ -68,14 +113,71 @@ fn default_nfs_parallel() -> i64 { 4 }
 
 impl Default for Config {
     fn default() -> Self {
+        let g = Globals::default();
         Self {
-            output_dir: default_output_dir(),
-            workers: default_workers(),
-            max_parallel_devices: 0,
-            nfs_parallel: default_nfs_parallel(),
+            output_dir: g.output_dir,
+            workers: g.workers,
+            max_parallel_devices: g.max_parallel_devices,
+            nfs_parallel: g.nfs_parallel,
             targets: Vec::new(),
         }
     }
+}
+
+/// Build an internal `Target` (with assigned team_ids) from the ergonomic
+/// on-disk `TargetFile`. Team ids are allocated sequentially; each declared
+/// user is attached to its team's id. Mirrors the id-assignment in
+/// `upsert_target_full` so both entry paths agree on shape.
+fn target_from_file(tf: TargetFile) -> Target {
+    let mut teams: Vec<Team> = Vec::new();
+    let mut users: Vec<User> = Vec::new();
+    let mut next_id: i64 = 1;
+    for team in tf.teams {
+        let team_id = next_id;
+        next_id += 1;
+        teams.push(Team { name: team.name, team_id });
+        for uname in team.users {
+            if !users.iter().any(|u| u.name == uname) {
+                users.push(User { name: uname, team_id });
+            }
+        }
+    }
+    Target {
+        name: tf.name,
+        path: tf.path,
+        teams,
+        users,
+        end_scan: tf.end_scan,
+        purge_time: tf.purge_time,
+    }
+}
+
+/// Collapse an internal `Target` back into the ergonomic on-disk shape: users
+/// are grouped under their team by `team_id`. Teams appear in their stored
+/// order; users within a team follow their stored order.
+fn target_to_file(t: &Target) -> TargetFile {
+    let teams: Vec<TeamFile> = t.teams.iter().map(|tm| {
+        let users: Vec<String> = t.users.iter()
+            .filter(|u| u.team_id == tm.team_id)
+            .map(|u| u.name.clone())
+            .collect();
+        TeamFile { name: tm.name.clone(), users }
+    }).collect();
+    TargetFile {
+        name: t.name.clone(),
+        path: t.path.clone(),
+        teams,
+        end_scan: t.end_scan.clone(),
+        purge_time: t.purge_time,
+    }
+}
+
+/// Turn a target name into a safe file stem: path separators and other unsafe
+/// characters become `_` so a target name can never escape `targets/`.
+fn sanitize_stem(name: &str) -> String {
+    name.chars()
+        .map(|c| if c == '/' || c == '\\' || c == '.' || c.is_control() { '_' } else { c })
+        .collect()
 }
 
 impl Config {
@@ -102,35 +204,120 @@ impl Config {
         cwd.join("duscan.toml")
     }
 
-    pub fn load() -> Self {
+    /// Directory holding the per-target files, alongside `duscan.toml`.
+    pub fn targets_dir() -> PathBuf {
         let p = Self::path();
-        if !p.exists() {
-            return Config::default();
-        }
-        match fs::read_to_string(&p) {
-            Ok(content) => {
-                toml::from_str(&content).unwrap_or_else(|e| {
-                    eprintln!("Warning: config parse error ({}): {}", p.display(), e);
-                    Config::default()
-                })
-            }
-            Err(e) => {
-                eprintln!("Warning: config read error ({}): {}", p.display(), e);
-                Config::default()
-            }
-        }
+        let parent = p.parent().map(|x| x.to_path_buf()).unwrap_or_default();
+        parent.join("targets")
     }
 
+    /// Load global settings from `duscan.toml` and assemble `targets` from every
+    /// `targets/<name>.toml`. Both layers degrade gracefully: a missing or
+    /// unparseable file yields defaults / is skipped with a warning rather than
+    /// aborting, matching the previous single-file behavior.
+    pub fn load() -> Self {
+        let p = Self::path();
+        let globals: Globals = if p.exists() {
+            match fs::read_to_string(&p) {
+                Ok(content) => toml::from_str(&content).unwrap_or_else(|e| {
+                    eprintln!("Warning: config parse error ({}): {}", p.display(), e);
+                    Globals::default()
+                }),
+                Err(e) => {
+                    eprintln!("Warning: config read error ({}): {}", p.display(), e);
+                    Globals::default()
+                }
+            }
+        } else {
+            Globals::default()
+        };
+
+        let mut cfg = Config {
+            output_dir: globals.output_dir,
+            workers: globals.workers,
+            max_parallel_devices: globals.max_parallel_devices,
+            nfs_parallel: globals.nfs_parallel,
+            targets: Vec::new(),
+        };
+
+        // Read every targets/*.toml into a Target. Sorted for stable order.
+        let dir = Self::targets_dir();
+        if let Ok(entries) = fs::read_dir(&dir) {
+            let mut files: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("toml"))
+                .collect();
+            files.sort();
+            for f in files {
+                let text = match fs::read_to_string(&f) {
+                    Ok(t) => t,
+                    Err(e) => { eprintln!("Warning: cannot read {}: {}", f.display(), e); continue; }
+                };
+                match toml::from_str::<TargetFile>(&text) {
+                    Ok(tf) => {
+                        if cfg.targets.iter().any(|t| t.name == tf.name) {
+                            eprintln!("Warning: duplicate target '{}' in {} — keeping first", tf.name, f.display());
+                            continue;
+                        }
+                        cfg.targets.push(target_from_file(tf));
+                    }
+                    Err(e) => eprintln!("Warning: invalid target file {}: {}", f.display(), e),
+                }
+            }
+        }
+        cfg
+    }
+
+    /// Write global settings to `duscan.toml` and one file per target under
+    /// `targets/`. Each write is atomic (tmp + rename). Target files whose stem
+    /// no longer matches a configured target are deleted, so `remove-target` and
+    /// `apply` (replace) reconcile the directory without extra bookkeeping.
     pub fn save(&self) -> Result<(), String> {
         let p = Self::path();
         if let Some(parent) = p.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("mkdir: {}", e))?;
         }
-        let content = toml::to_string_pretty(self).map_err(|e| format!("serialize: {}", e))?;
-        // Atomic write: write to .tmp then rename
+
+        // 1. Globals -> duscan.toml (atomic).
+        let globals = Globals {
+            output_dir: self.output_dir.clone(),
+            workers: self.workers.clone(),
+            max_parallel_devices: self.max_parallel_devices,
+            nfs_parallel: self.nfs_parallel,
+        };
+        let content = toml::to_string_pretty(&globals).map_err(|e| format!("serialize: {}", e))?;
         let tmp = p.with_extension("toml.tmp");
         fs::write(&tmp, &content).map_err(|e| format!("write: {}", e))?;
         fs::rename(&tmp, &p).map_err(|e| format!("rename: {}", e))?;
+
+        // 2. One file per target (atomic), tracking the stems we own.
+        let dir = Self::targets_dir();
+        fs::create_dir_all(&dir).map_err(|e| format!("mkdir targets: {}", e))?;
+        let mut kept: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for t in &self.targets {
+            let stem = sanitize_stem(&t.name);
+            kept.insert(stem.clone());
+            let tf = target_to_file(t);
+            let body = toml::to_string_pretty(&tf).map_err(|e| format!("serialize target '{}': {}", t.name, e))?;
+            let dest = dir.join(format!("{}.toml", stem));
+            let tmp = dest.with_extension("toml.tmp");
+            fs::write(&tmp, &body).map_err(|e| format!("write target '{}': {}", t.name, e))?;
+            fs::rename(&tmp, &dest).map_err(|e| format!("rename target '{}': {}", t.name, e))?;
+        }
+
+        // 3. Delete orphaned target files (stem not among current targets).
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("toml") { continue; }
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if !kept.contains(stem) {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

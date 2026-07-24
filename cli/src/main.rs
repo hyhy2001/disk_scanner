@@ -45,10 +45,13 @@ enum Command {
     },
     /// Create or update a target with its teams and users in one shot.
     /// Repeat --team NAME=user1,user2 per team (empty user list allowed: --team NAME).
+    /// A user token may be @file to load usernames from a text file.
     SetTarget {
         name: String,
         path: String,
-        /// team spec: "teamname=user1,user2" (repeatable)
+        /// team spec: "teamname=user1,user2" (repeatable). A user token may be
+        /// "@path" to load names from a text file (newline/comma/space separated,
+        /// # comments ok), e.g. --team dev=alice,@more_users.txt
         #[arg(long = "team")]
         teams: Vec<String>,
         #[arg(long)]
@@ -818,15 +821,43 @@ fn parse_team_specs(raw: &[String]) -> Result<Vec<config::TeamSpec>, String> {
         if specs.iter().any(|s: &config::TeamSpec| s.name == name) {
             return Err(format!("duplicate --team '{}'", name));
         }
-        let users: Vec<String> = users_str
-            .split(',')
-            .map(|u| u.trim())
-            .filter(|u| !u.is_empty())
-            .map(|u| u.to_string())
-            .collect();
+        // Each comma-separated token is either a literal username or `@file`,
+        // which loads usernames from a text file (split on newlines/commas/
+        // whitespace, `#` starts a comment). Literals and files can be mixed.
+        let mut users: Vec<String> = Vec::new();
+        for tok in users_str.split(',') {
+            let tok = tok.trim();
+            if tok.is_empty() { continue; }
+            if let Some(path) = tok.strip_prefix('@') {
+                for u in read_user_list(path)? {
+                    if !users.contains(&u) { users.push(u); }
+                }
+            } else if !users.contains(&tok.to_string()) {
+                users.push(tok.to_string());
+            }
+        }
         specs.push(config::TeamSpec { name: name.to_string(), users });
     }
     Ok(specs)
+}
+
+/// Read a username list from a text file: usernames are separated by any of
+/// newline, comma, or whitespace; blank lines and `#` comments are ignored.
+/// Used by `--team NAME=@file` so large teams don't have to be typed inline.
+fn read_user_list(path: &str) -> Result<Vec<String>, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("read user list '{}': {}", path, e))?;
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("");
+        for tok in line.split([',', ' ', '\t']) {
+            let tok = tok.trim();
+            if !tok.is_empty() && !out.contains(&tok.to_string()) {
+                out.push(tok.to_string());
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn import_legacy_config(dir: &str, force: bool) -> Result<std::path::PathBuf, String> {
@@ -835,8 +866,17 @@ fn import_legacy_config(dir: &str, force: bool) -> Result<std::path::PathBuf, St
         return Err(format!("'{}' is not a directory", dir));
     }
     let dest = Config::path();
-    if dest.exists() && !force {
-        return Err(format!("{} already exists (use --force to overwrite)", dest.display()));
+    // Refuse to clobber an existing config: either duscan.toml or any per-target
+    // file under targets/ counts as "already configured".
+    let targets_dir = Config::targets_dir();
+    let has_target_files = std::fs::read_dir(&targets_dir)
+        .map(|mut it| it.any(|e| e.as_ref().map(|e| {
+            e.path().extension().and_then(|s| s.to_str()) == Some("toml")
+        }).unwrap_or(false)))
+        .unwrap_or(false);
+    if (dest.exists() || has_target_files) && !force {
+        return Err(format!("config already exists ({} / {}) — use --force to overwrite",
+            dest.display(), targets_dir.display()));
     }
 
     let mut cfg = Config::default();

@@ -226,6 +226,7 @@ __marimo__/
 /duscan
 /duscan-static
 /duscan.toml
+/targets/
 /reports/
 # legacy binary names (pre-rename)
 /check-disk-bin

@@ -53,7 +53,36 @@ purge_time = 90
   users = ["carol"]
 ```
 
-Config file: `duscan.toml` (TOML, auto-created next to binary or in current dir).
+Config layout (TOML, auto-created next to binary or in current dir):
+
+```
+duscan.toml            # global settings only: output_dir, workers, max_parallel_devices, nfs_parallel
+targets/
+├── backend.toml       # one target per file (ergonomic: teams carry users, no team_id)
+├── frontend.toml
+└── logs.toml
+```
+
+Each `targets/<name>.toml` is the hand-editable, version-controllable declaration of a
+single target — `team_id`s are assigned internally on load, never written. `set-target`,
+`apply`, and the CRUD commands all write these files (one atomic write each) and delete
+orphaned files automatically, so `remove-target` / `apply --replace` reconcile the dir.
+
+```toml
+# targets/backend.toml
+name = "backend"
+path = "/data/backend"
+end_scan = "20270101"
+purge_time = 90
+
+[[teams]]
+name = "dev"
+users = ["alice", "bob"]
+
+[[teams]]
+name = "ops"
+users = ["carol"]
+```
 
 Per-target output: `<output-dir>/<target>/` holds `report.db`, `permission_issues.db`, `scan_status.json`, and `logs/scan_<ts>.log` (one log per scan, legacy-style phase summary).
 
