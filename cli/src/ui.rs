@@ -87,6 +87,9 @@ fn phase_style(phase: &str) -> (Style, &'static str) {
         // waiting for the serialized build slot — distinct amber so it's clear
         // the target finished scanning and is queued, not hung.
         "queued" => (Style::default().fg(Color::Yellow), " ⏸"),
+        // post-scan rsync to a remote host — magenta so it stands out from the
+        // cyan build phases.
+        "syncing" => (Style::default().fg(Color::Magenta), " ⇅"),
         // any active phase (scanning/building/treemap/merging/history)
         _ => (Style::default().fg(Color::Cyan), " ◇"),
     }

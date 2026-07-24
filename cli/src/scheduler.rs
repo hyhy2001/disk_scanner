@@ -39,6 +39,13 @@ pub struct TargetView {
     pub output_subdir: PathBuf,
     pub end_scan: Option<String>,
     pub purge_time: Option<i64>,
+    // Per-target scan overrides + sync config (None = global default).
+    pub tree_map: Option<bool>,
+    pub level: Option<i64>,
+    pub workers: Option<i64>,
+    pub sync_host: Option<String>,
+    pub sync_dest_dir: Option<String>,
+    pub sync_user: Option<String>,
 }
 
 /// Build a device-aware scan plan from config targets.
@@ -109,6 +116,12 @@ pub fn build_scan_plan(config: &Config, budget: usize) -> ScanPlan {
                     output_subdir: output_dir.join(&t.name),
                     end_scan: t.end_scan.clone(),
                     purge_time: t.purge_time,
+                    tree_map: t.tree_map,
+                    level: t.level,
+                    workers: t.workers,
+                    sync_host: t.sync_host.clone(),
+                    sync_dest_dir: t.sync_dest_dir.clone(),
+                    sync_user: t.sync_user.clone(),
                 }
             };
 
