@@ -230,3 +230,8 @@ __marimo__/
 # legacy binary names (pre-rename)
 /check-disk-bin
 /check-disk-bin-static
+
+# Python reference copy (kept locally, not tracked)
+/legacy/
+# compiled PyO3 extension modules (build artifacts)
+/src/*.abi3.so
