@@ -58,6 +58,7 @@ target's `report.db`; empty states point you to press `r` to scan first.
 # Scan + read (all reader commands fall back to output_dir from duscan.toml — no need to repeat --output-dir)
 ./duscan run [--output-dir DIR] [--tree-map] [--workers N] [--level N] [--target <name>]
 ./duscan detail --user <user> [--output-dir DIR] [--top N] [--target <name>] [--json]
+#   --type report (default: top dirs/files by size) | permission (perm_issues, filter with --search KW) | inode (per-dir file counts)
 ./duscan tree-show [--output-dir DIR] [--level N] [--limit N] [--path P] [--search KW] [--target <name>]
 ./duscan export --user <user> [--output-dir DIR] [--export-dir DIR] [--target <name>]   # -> <export-dir>/<target>/usage_dir_<u>.txt + usage_file_<u>.txt
 ./duscan notify --webhook-url URL [--output-dir DIR] [--target <name>]
