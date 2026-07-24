@@ -24,7 +24,16 @@ enum Tab {
     Targets,
     TeamsUsers,
     ScanSync,
+    Output,
     Settings,
+}
+
+/// Which report view is shown on the Output tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputView {
+    History,
+    Detail,
+    Treemap,
 }
 
 /// What kind of value the single-line input box is currently collecting, so the
@@ -89,6 +98,17 @@ struct App {
     /// When Some, the run loop should drop the TUI, scan these targets (empty =
     /// all), then re-enter the TUI. Set by the r/R keys.
     pending_scan: Option<Vec<String>>,
+    // ── Output tab state ──
+    /// Which report view is shown on the Output tab.
+    output_view: OutputView,
+    /// History sub-view scroll offset.
+    hist_sel: usize,
+    /// Detail sub-view: selected user index (into the current target's users).
+    detail_sel: usize,
+    /// Treemap navigation stack: (dir_id, name) from root to current node.
+    tm_stack: Vec<(i64, String)>,
+    /// Selected child index in the current treemap node.
+    tm_sel: usize,
 }
 
 impl App {
@@ -105,6 +125,11 @@ impl App {
             status: "↹ tab · ↑↓ move · a add · e edit · d delete · r scan · R scan-all · q quit".into(),
             quit: false,
             pending_scan: None,
+            output_view: OutputView::History,
+            hist_sel: 0,
+            detail_sel: 0,
+            tm_stack: Vec::new(),
+            tm_sel: 0,
         }
     }
 
@@ -126,6 +151,13 @@ impl App {
         t.users.iter().filter(|u| u.team_id == tm.team_id).map(|u| u.name.clone()).collect()
     }
 
+    /// All usernames configured on the current target (any team) — used by the
+    /// Output/Detail sub-view.
+    fn current_target_users(&self) -> Vec<String> {
+        let Some(t) = self.cfg.targets.get(self.target_sel) else { return Vec::new() };
+        t.users.iter().map(|u| u.name.clone()).collect()
+    }
+
     /// Clamp all selection indices so they stay within the current data after
     /// add/remove operations change list lengths.
     fn clamp_selections(&mut self) {
@@ -137,6 +169,8 @@ impl App {
         if self.user_sel >= nusers { self.user_sel = nusers.saturating_sub(1); }
         if self.settings_sel > 3 { self.settings_sel = 3; }
         if self.scansync_sel > 5 { self.scansync_sel = 5; }
+        let ntusers = self.current_target_users().len();
+        if self.detail_sel >= ntusers { self.detail_sel = ntusers.saturating_sub(1); }
     }
 }
 
@@ -229,9 +263,10 @@ fn handle_browse_key(app: &mut App, key: event::KeyEvent) {
         KeyCode::Char('1') => { app.tab = Tab::Targets; return; }
         KeyCode::Char('2') => { app.tab = Tab::TeamsUsers; return; }
         KeyCode::Char('3') => { app.tab = Tab::ScanSync; return; }
-        KeyCode::Char('4') => { app.tab = Tab::Settings; return; }
-        // r = scan the selected target; R = scan all targets. Requests a scan;
-        // the run loop drops the TUI, runs it, and re-enters.
+        KeyCode::Char('4') => { app.tab = Tab::Output; return; }
+        KeyCode::Char('5') => { app.tab = Tab::Settings; return; }
+        // r = scan selected target; R = scan all. Treemap navigation uses
+        // arrows/Enter/Backspace so r/R don't clash on the Output tab.
         KeyCode::Char('r') => {
             match app.current_target_name() {
                 Some(n) => { app.pending_scan = Some(vec![n]); }
@@ -250,6 +285,7 @@ fn handle_browse_key(app: &mut App, key: event::KeyEvent) {
         Tab::Targets => browse_targets(app, key),
         Tab::TeamsUsers => browse_teams_users(app, key),
         Tab::ScanSync => browse_scansync(app, key),
+        Tab::Output => browse_output(app, key),
         Tab::Settings => browse_settings(app, key),
     }
 }
@@ -258,7 +294,8 @@ fn next_tab(t: Tab) -> Tab {
     match t {
         Tab::Targets => Tab::TeamsUsers,
         Tab::TeamsUsers => Tab::ScanSync,
-        Tab::ScanSync => Tab::Settings,
+        Tab::ScanSync => Tab::Output,
+        Tab::Output => Tab::Settings,
         Tab::Settings => Tab::Targets,
     }
 }
@@ -267,7 +304,8 @@ fn prev_tab(t: Tab) -> Tab {
         Tab::Targets => Tab::Settings,
         Tab::TeamsUsers => Tab::Targets,
         Tab::ScanSync => Tab::TeamsUsers,
-        Tab::Settings => Tab::ScanSync,
+        Tab::Output => Tab::ScanSync,
+        Tab::Settings => Tab::Output,
     }
 }
 
@@ -421,6 +459,96 @@ fn opt_bool_str(v: Option<bool>) -> String {
 }
 fn opt_i64_str(v: Option<i64>) -> String {
     v.map(|n| n.to_string()).unwrap_or_default()
+}
+
+/// report.db path of the currently selected target, if it exists on disk.
+fn current_report_db(app: &App) -> Option<std::path::PathBuf> {
+    let name = app.current_target_name()?;
+    crate::resolve_report_db(&app.cfg.output_dir, &name)
+}
+
+/// Load the treemap children of the node at the top of `tm_stack` (or root when
+/// empty). Returns the children plus the resolved treemap prefix, or an empty
+/// vec when there is no treemap / no report.db.
+fn load_tm_children(app: &App) -> Vec<crate::TreeEntry> {
+    let Some(db) = current_report_db(app) else { return Vec::new() };
+    let Ok(conn) = rusqlite::Connection::open(&db) else { return Vec::new() };
+    let Some(tp) = crate::treemap_prefix(&conn) else { return Vec::new() };
+    let node = match app.tm_stack.last() {
+        Some((id, _)) => *id,
+        None => match crate::treemap_root(&conn, tp) { Some(r) => r, None => return Vec::new() },
+    };
+    crate::treemap_children(&conn, tp, node, 500)
+}
+
+/// Reset treemap navigation to the root of the current target.
+fn reset_treemap(app: &mut App) {
+    app.tm_stack.clear();
+    app.tm_sel = 0;
+}
+
+fn browse_output(app: &mut App, key: event::KeyEvent) {
+    // Switch target with [ ] (resets treemap nav + selections).
+    match key.code {
+        KeyCode::Char('[') => {
+            if app.target_sel > 0 { app.target_sel -= 1; app.team_sel = 0; app.user_sel = 0;
+                app.hist_sel = 0; app.detail_sel = 0; reset_treemap(app);
+                app.status = format!("Target: {}", app.current_target_name().unwrap_or_default()); }
+            return;
+        }
+        KeyCode::Char(']') => {
+            if app.target_sel + 1 < app.cfg.targets.len() { app.target_sel += 1; app.team_sel = 0; app.user_sel = 0;
+                app.hist_sel = 0; app.detail_sel = 0; reset_treemap(app);
+                app.status = format!("Target: {}", app.current_target_name().unwrap_or_default()); }
+            return;
+        }
+        // Switch sub-view.
+        KeyCode::Char('h') => { app.output_view = OutputView::History; app.hist_sel = 0; return; }
+        KeyCode::Char('d') => { app.output_view = OutputView::Detail; app.detail_sel = 0; return; }
+        KeyCode::Char('t') => { app.output_view = OutputView::Treemap; reset_treemap(app); return; }
+        _ => {}
+    }
+    match app.output_view {
+        OutputView::History => {
+            let n = current_report_db(app).map(|db| crate::query_history(&db, 60).len()).unwrap_or(0);
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => { if app.hist_sel > 0 { app.hist_sel -= 1; } }
+                KeyCode::Down | KeyCode::Char('j') => { if app.hist_sel + 1 < n { app.hist_sel += 1; } }
+                _ => {}
+            }
+        }
+        OutputView::Detail => {
+            let nusers = app.cfg.targets.get(app.target_sel).map(|t| t.users.len()).unwrap_or(0);
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => { if app.detail_sel > 0 { app.detail_sel -= 1; } }
+                KeyCode::Down | KeyCode::Char('j') => { if app.detail_sel + 1 < nusers { app.detail_sel += 1; } }
+                _ => {}
+            }
+        }
+        OutputView::Treemap => {
+            let children = load_tm_children(app);
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => { if app.tm_sel > 0 { app.tm_sel -= 1; } }
+                KeyCode::Down | KeyCode::Char('j') => { if app.tm_sel + 1 < children.len() { app.tm_sel += 1; } }
+                // Enter: descend into the selected child (only if it has children).
+                KeyCode::Enter | KeyCode::Right => {
+                    if let Some(entry) = children.get(app.tm_sel) {
+                        app.tm_stack.push((entry.id, entry.name.clone()));
+                        app.tm_sel = 0;
+                        // If the new node has no children, pop back (it's a leaf dir).
+                        if load_tm_children(app).is_empty() {
+                            app.tm_stack.pop();
+                            app.status = "Leaf directory (no sub-dirs).".into();
+                        }
+                    }
+                }
+                KeyCode::Backspace | KeyCode::Left => {
+                    if app.tm_stack.pop().is_some() { app.tm_sel = 0; }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn browse_settings(app: &mut App, key: event::KeyEvent) {
@@ -684,8 +812,10 @@ fn draw(frame: &mut Frame, app: &App) {
         .split(area);
 
     // Tab bar with the active config path in the block title.
-    let titles = vec!["1 Targets", "2 Teams & Users", "3 Scan/Sync", "4 Settings"];
-    let sel = match app.tab { Tab::Targets => 0, Tab::TeamsUsers => 1, Tab::ScanSync => 2, Tab::Settings => 3 };
+    let titles = vec!["1 Targets", "2 Teams & Users", "3 Scan/Sync", "4 Output", "5 Settings"];
+    let sel = match app.tab {
+        Tab::Targets => 0, Tab::TeamsUsers => 1, Tab::ScanSync => 2, Tab::Output => 3, Tab::Settings => 4,
+    };
     let path = Config::path();
     let tabs = Tabs::new(titles)
         .select(sel)
@@ -697,6 +827,7 @@ fn draw(frame: &mut Frame, app: &App) {
         Tab::Targets => draw_targets(frame, app, chunks[1]),
         Tab::TeamsUsers => draw_teams_users(frame, app, chunks[1]),
         Tab::ScanSync => draw_scansync(frame, app, chunks[1]),
+        Tab::Output => draw_output(frame, app, chunks[1]),
         Tab::Settings => draw_settings(frame, app, chunks[1]),
     }
 
@@ -727,6 +858,11 @@ fn footer_hint(app: &App) -> &'static str {
             Tab::Targets => "↑↓ move · a add · e path · s end-scan · p purge · d delete · r scan · R scan-all · ↹ tab · q quit",
             Tab::TeamsUsers => "[ ] target · ↑↓ team · ←→ user · a add-team · d del-team · u add-users · x del-user · r/R scan · q quit",
             Tab::ScanSync => "[ ] target · ↑↓ move · Enter/e edit · r scan this · R scan-all · ↹ tab · q quit",
+            Tab::Output => match app.output_view {
+                OutputView::History => "[ ] target · h/d/t view · ↑↓ scroll · r/R scan · ↹ tab · q quit",
+                OutputView::Detail => "[ ] target · h/d/t view · ↑↓ user · r/R scan · ↹ tab · q quit",
+                OutputView::Treemap => "[ ] target · h/d/t view · ↑↓ move · Enter open · Bksp up · r/R scan · q quit",
+            },
             Tab::Settings => "↑↓ move · Enter/e edit · r/R scan · ↹ tab · q quit",
         },
     }
@@ -821,6 +957,158 @@ fn draw_teams_users(frame: &mut Frame, app: &App, area: Rect) {
     let mut us = ListState::default();
     if !users.is_empty() { us.select(Some(app.user_sel)); }
     frame.render_stateful_widget(ulist, cols[1], &mut us);
+}
+
+fn fmt_size(sz: i64) -> String {
+    let s = sz as f64;
+    if s >= 1e12 { format!("{:.1} TB", s / 1e12) }
+    else if s >= 1e9 { format!("{:.1} GB", s / 1e9) }
+    else if s >= 1e6 { format!("{:.1} MB", s / 1e6) }
+    else if s >= 1e3 { format!("{:.1} KB", s / 1e3) }
+    else { format!("{} B", sz) }
+}
+fn fmt_date(d: i64) -> String {
+    format!("{:04}-{:02}-{:02}", d / 10000, (d / 100) % 100, d % 100)
+}
+
+/// Small helper: a centered "empty state" paragraph in `area`.
+fn empty_state(frame: &mut Frame, area: Rect, title: &str, lines: &[&str]) {
+    let mut body: Vec<Line> = vec![Line::from("")];
+    for (i, l) in lines.iter().enumerate() {
+        let style = if i == 0 { Style::default().fg(Color::White).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Cyan) };
+        body.push(Line::from(Span::styled(format!("  {}", l), style)));
+    }
+    let p = Paragraph::new(body).block(Block::default().borders(Borders::ALL).title(format!(" {} ", title)));
+    frame.render_widget(p, area);
+}
+
+fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(tname) = app.current_target_name() else {
+        empty_state(frame, area, "Output", &["No target selected.", "Add a target on the Targets tab (press 1) first."]);
+        return;
+    };
+    // Split: a one-line sub-view selector on top, the view below.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    let vlabel = |v: OutputView, txt: &str| -> Span {
+        if app.output_view == v { Span::styled(format!(" {} ", txt), selected_style()) }
+        else { Span::styled(format!(" {} ", txt), Style::default().fg(Color::Gray)) }
+    };
+    let bar = Paragraph::new(Line::from(vec![
+        Span::styled(format!("target: {}  ", tname), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        vlabel(OutputView::History, "h History"), Span::raw(" "),
+        vlabel(OutputView::Detail, "d Detail"), Span::raw(" "),
+        vlabel(OutputView::Treemap, "t Treemap"),
+    ]));
+    frame.render_widget(bar, rows[0]);
+
+    match app.output_view {
+        OutputView::History => draw_out_history(frame, app, rows[1]),
+        OutputView::Detail => draw_out_detail(frame, app, rows[1]),
+        OutputView::Treemap => draw_out_treemap(frame, app, rows[1]),
+    }
+}
+
+fn draw_out_history(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(db) = current_report_db(app) else {
+        empty_state(frame, area, "History", &["No report yet.", "Press r to scan this target first."]);
+        return;
+    };
+    let snaps = crate::query_history(&db, 60);
+    if snaps.is_empty() {
+        empty_state(frame, area, "History", &["No history in this report.", "Press r to scan this target."]);
+        return;
+    }
+    let mut items: Vec<ListItem> = Vec::new();
+    for s in &snaps {
+        let pct = if s.total > 0 { s.used as f64 / s.total as f64 * 100.0 } else { 0.0 };
+        let head = format!("{}   used {} / {} ({:.1}%)   free {}",
+            fmt_date(s.scan_date), fmt_size(s.used), fmt_size(s.total), pct, fmt_size(s.available));
+        let mut lines = vec![Line::from(Span::styled(head, Style::default().fg(Color::White)))];
+        for (name, size) in s.top_users.iter().take(5) {
+            lines.push(Line::from(Span::styled(format!("      {:<16} {}", name, fmt_size(*size)), Style::default().fg(Color::DarkGray))));
+        }
+        items.push(ListItem::new(lines));
+    }
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(format!(" History ({} snapshots) ", snaps.len())))
+        .highlight_style(selected_style());
+    let mut st = ListState::default();
+    st.select(Some(app.hist_sel.min(snaps.len().saturating_sub(1))));
+    frame.render_stateful_widget(list, area, &mut st);
+}
+
+fn draw_out_detail(frame: &mut Frame, app: &App, area: Rect) {
+    let users = app.current_target_users();
+    if users.is_empty() {
+        empty_state(frame, area, "Detail", &["This target has no users configured.", "Add teams/users on the Teams & Users tab."]);
+        return;
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(22), Constraint::Min(0)])
+        .split(area);
+    // Left: user list.
+    let uitems: Vec<ListItem> = users.iter().map(|u| ListItem::new(u.clone())).collect();
+    let ulist = List::new(uitems)
+        .block(Block::default().borders(Borders::ALL).title(" Users "))
+        .highlight_style(selected_style());
+    let mut us = ListState::default();
+    us.select(Some(app.detail_sel.min(users.len().saturating_sub(1))));
+    frame.render_stateful_widget(ulist, cols[0], &mut us);
+
+    // Right: detail for the selected user.
+    let uname = &users[app.detail_sel.min(users.len() - 1)];
+    let Some(db) = current_report_db(app) else {
+        empty_state(frame, cols[1], "Detail", &["No report yet.", "Press r to scan this target."]);
+        return;
+    };
+    match crate::query_user_detail(&db, uname, 15) {
+        Some(d) => {
+            let mut lines = vec![
+                Line::from(Span::styled(format!("{}  (uid {})", uname, d.uid), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+                Line::from(format!("files {}   dirs {}   size {}", d.total_files, d.total_dirs, fmt_size(d.total_size))),
+                Line::from(""),
+                Line::from(Span::styled("Top directories:", Style::default().fg(Color::Yellow))),
+            ];
+            for (sz, p) in d.top_dirs.iter().take(8) { lines.push(Line::from(format!("  {:>9}  {}", fmt_size(*sz), p))); }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("Top files:", Style::default().fg(Color::Yellow))));
+            for (sz, p) in d.top_files.iter().take(8) { lines.push(Line::from(format!("  {:>9}  {}", fmt_size(*sz), p))); }
+            let para = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(format!(" Detail — {} ", uname)));
+            frame.render_widget(para, cols[1]);
+        }
+        None => empty_state(frame, cols[1], "Detail", &[&format!("No data for user '{}'.", uname), "This user may have no files in the last scan."]),
+    }
+}
+
+fn draw_out_treemap(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(_db) = current_report_db(app) else {
+        empty_state(frame, area, "Treemap", &["No report yet.", "Press r to scan this target first."]);
+        return;
+    };
+    let children = load_tm_children(app);
+    // Breadcrumb of the current path.
+    let mut crumb = String::from("/");
+    crumb.push_str(&app.tm_stack.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>().join("/"));
+    if children.is_empty() {
+        empty_state(frame, area, "Treemap", &["No treemap data.", "Scan with tree_map enabled (Scan/Sync tab) first."]);
+        return;
+    }
+    let maxsz = children.iter().map(|c| c.size).max().unwrap_or(1).max(1);
+    let items: Vec<ListItem> = children.iter().map(|c| {
+        let barlen = ((c.size as f64 / maxsz as f64) * 12.0).round() as usize;
+        let bar: String = std::iter::repeat('█').take(barlen).chain(std::iter::repeat('·').take(12 - barlen)).collect();
+        ListItem::new(format!("{:>9}  [{}]  {:<28}  {} files", fmt_size(c.size), bar, c.name, c.file_count))
+    }).collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(format!(" Treemap — {} ", crumb)))
+        .highlight_style(selected_style());
+    let mut st = ListState::default();
+    st.select(Some(app.tm_sel.min(children.len().saturating_sub(1))));
+    frame.render_stateful_widget(list, area, &mut st);
 }
 
 fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
