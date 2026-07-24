@@ -706,6 +706,115 @@ fn apply_targets_file(cfg: &mut Config, file: &str, dry_run: bool, merge: bool) 
 
 /// Print per-day usage history from each target's report.db (hist_* tables).
 /// `days` limits how many recent snapshots to show; `json` emits machine output.
+/// One history snapshot for a target, with its top users. Shared by the CLI
+/// `history` command and the config-TUI Output tab.
+pub struct HistorySnapshot {
+    pub scan_date: i64,
+    pub path: String,
+    pub total: i64,
+    pub used: i64,
+    pub available: i64,
+    pub top_users: Vec<(String, i64)>,
+}
+
+/// Per-user detail for one target. Shared by the CLI `detail` command and the
+/// config-TUI Output tab.
+pub struct UserDetail {
+    pub uid: i64,
+    pub total_files: i64,
+    pub total_dirs: i64,
+    pub total_size: i64,
+    pub top_dirs: Vec<(i64, String)>,
+    pub top_files: Vec<(i64, String)>,
+}
+
+/// One directory node in the treemap. Shared by the TUI treemap browser.
+pub struct TreeEntry {
+    pub id: i64,
+    pub name: String,
+    pub size: i64,
+    pub file_count: i64,
+}
+
+/// Resolve a target's report.db path: `<out>/<target>/report.db` if it exists.
+pub fn resolve_report_db(out: &str, target: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(out).join(target).join("report.db");
+    if p.exists() { Some(p) } else { None }
+}
+
+/// Query up to `days` newest snapshots (with top users) from a target's
+/// report.db. Empty vec if the DB is missing or has no history.
+pub fn query_history(db: &std::path::Path, days: i64) -> Vec<HistorySnapshot> {
+    let Ok(conn) = rusqlite::Connection::open(db) else { return Vec::new() };
+    let snaps: Vec<(i64, i64, String, i64, i64, i64)> = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT id, scan_date, path, total, used, available \
+             FROM hist_snapshots ORDER BY scan_date DESC LIMIT ?1",
+        ) else { return Vec::new() };
+        stmt.query_map(rusqlite::params![days.max(1)], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?))
+        }).map(|rows| rows.flatten().collect()).unwrap_or_default()
+    };
+    snaps.into_iter().map(|(id, scan_date, path, total, used, available)| {
+        HistorySnapshot { scan_date, path, total, used, available, top_users: top_users_for_snapshot(&conn, id) }
+    }).collect()
+}
+
+/// Query one user's detail (totals + top dirs/files) from a report.db.
+pub fn query_user_detail(db: &std::path::Path, username: &str, top: usize) -> Option<UserDetail> {
+    let conn = rusqlite::Connection::open(db).ok()?;
+    let prefix = detail_prefix(&conn);
+    let sql = format!("SELECT uid, total_files, total_dirs, total_size FROM {}users WHERE username = ?1", prefix);
+    let mut stmt = conn.prepare(&sql).ok()?;
+    let (uid, total_files, total_dirs, total_size) = stmt.query_row([username], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
+    }).ok()?;
+    let top_dirs = query_top(&conn, &format!(
+        "SELECT d.size, d.path FROM {}dirs d WHERE d.uid = ?1 ORDER BY d.size DESC LIMIT ?2", prefix), uid, top);
+    let top_files = query_top(&conn, &format!(
+        "SELECT f.size, n.name FROM {}files f JOIN {}file_names n ON f.name_id = n.id \
+         WHERE f.uid = ?1 ORDER BY f.size DESC LIMIT ?2", prefix, prefix), uid, top);
+    Some(UserDetail { uid, total_files, total_dirs, total_size, top_dirs, top_files })
+}
+
+/// Detect the treemap table prefix, or None if this report.db has no treemap.
+pub fn treemap_prefix(conn: &rusqlite::Connection) -> Option<&'static str> {
+    if conn.prepare("SELECT 1 FROM treemap_dirs LIMIT 1").is_ok() { Some("treemap_") }
+    else if conn.prepare("SELECT 1 FROM dirs LIMIT 1").is_ok() { Some("") }
+    else { None }
+}
+
+/// Root directory id of the treemap (the node with no parent).
+pub fn treemap_root(conn: &rusqlite::Connection, tp: &str) -> Option<i64> {
+    conn.query_row(&format!("SELECT id FROM {}dirs WHERE parent_id IS NULL LIMIT 1", tp), [], |r| r.get(0)).ok()
+}
+
+/// Direct children of a directory node, largest first, capped at `limit`.
+pub fn treemap_children(conn: &rusqlite::Connection, tp: &str, dir_id: i64, limit: usize) -> Vec<TreeEntry> {
+    conn.prepare(&format!(
+        "SELECT d.id, n.name, d.total_size, d.file_count FROM {}dirs d \
+         JOIN {}names n ON d.name_id = n.id WHERE d.parent_id = ?1 \
+         ORDER BY d.total_size DESC LIMIT ?2", tp, tp))
+        .and_then(|mut s| {
+            s.query_map(rusqlite::params![dir_id, limit as i64], |r| {
+                Ok(TreeEntry { id: r.get(0)?, name: r.get(1)?, size: r.get(2)?, file_count: r.get(3)? })
+            }).map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default()
+}
+
+/// Name + total size of a treemap node.
+pub fn treemap_node(conn: &rusqlite::Connection, tp: &str, dir_id: i64) -> (String, i64) {
+    let name = conn.query_row(
+        &format!("SELECT COALESCE(n.name, '<root>') FROM {}dirs d LEFT JOIN {}names n ON d.name_id = n.id WHERE d.id = ?1", tp, tp),
+        rusqlite::params![dir_id], |r| r.get::<_, String>(0)).unwrap_or_else(|_| "<root>".into());
+    let size = conn.query_row(
+        &format!("SELECT total_size FROM {}dirs WHERE id = ?1", tp),
+        rusqlite::params![dir_id], |r| r.get::<_, i64>(0)).unwrap_or(0);
+    (name, size)
+}
+
 fn show_history(out: &str, target: Option<&str>, days: i64, json: bool) {
     let Ok(entries) = std::fs::read_dir(out) else {
         eprintln!("Cannot read output dir '{}'", out);

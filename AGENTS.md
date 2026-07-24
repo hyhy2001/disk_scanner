@@ -11,12 +11,12 @@ make clean
 ## Interactive config TUI
 
 Run `duscan` with **no subcommand** to open the interactive configuration TUI
-(four tabs: Targets, Teams & Users, Scan/Sync, Settings). It manages
+(five tabs: Targets, Teams & Users, Scan/Sync, Output, Settings). It manages
 targets/teams/users and writes every change straight to `duscan.toml` +
-`targets/*.toml` (save on each op). Keys: `↹`/`1`/`2`/`3`/`4` switch tabs, `↑↓`
-move, `[`/`]` switch target (on Teams & Scan/Sync tabs), `a` add, `e` edit, `d`
-delete, `u` add users (supports `alice,bob` and `@file`), `x` remove user,
-path inputs support `Tab` directory completion, `q`/`Esc` quit.
+`targets/*.toml` (save on each op). Keys: `↹`/`1`..`5` switch tabs, `↑↓`
+move, `[`/`]` switch target (on Teams, Scan/Sync & Output tabs), `a` add, `e`
+edit, `d` delete, `u` add users (supports `alice,bob` and `@file`), `x` remove
+user, path inputs support `Tab` directory completion, `q`/`Esc` quit.
 
 **Run a scan from the TUI:** `r` scans the selected target, `R` scans all. The
 TUI hands the screen to the scan monitor, then returns when the scan finishes.
@@ -25,6 +25,13 @@ TUI hands the screen to the scan monitor, then returns when the scan finishes.
 `tree_map`, `level`, `workers`, and `sync_host`/`sync_dest_dir`/`sync_user`. When
 `sync_host` is set, that target's output is rsync'd to the remote automatically
 after each scan. These are also stored in `targets/<name>.toml`.
+
+**Output tab** — view a target's scan results without leaving the TUI. Three
+sub-views switched with `h`/`d`/`t`: **History** (per-day usage snapshots + top
+users), **Detail** (pick a user → totals + top dirs/files), and **Treemap** (an
+ncdu-style directory browser: `↑↓` move, `Enter` descend into a sub-directory,
+`Backspace` go up, sized bars per entry). `[`/`]` switch target. Reads each
+target's `report.db`; empty states point you to press `r` to scan first.
 
 `duscan run` remains a separate read-only scan monitor.
 
