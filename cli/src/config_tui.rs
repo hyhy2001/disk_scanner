@@ -475,7 +475,9 @@ fn opt_i64_str(v: Option<i64>) -> String {
 /// report.db path of the currently selected target, if it exists on disk.
 fn current_report_db(app: &App) -> Option<std::path::PathBuf> {
     let name = app.current_target_name()?;
-    crate::resolve_report_db(&app.cfg.output_dir, &name)
+    // Resolve a relative output_dir against the binary dir (same as the CLI
+    // readers), so the TUI finds reports regardless of the launch cwd.
+    crate::resolve_report_db(&app.cfg.resolved_output_dir(), &name)
 }
 
 /// Users recorded in the current target's report.db (every uid the scan saw),

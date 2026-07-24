@@ -244,34 +244,41 @@ fn sanitize_stem(name: &str) -> String {
 }
 
 impl Config {
-    pub fn path() -> PathBuf {
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let mut p = cwd.join("duscan.toml");
-        if p.exists() {
-            return p;
-        }
-        p = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("duscan")
-            .join("config.toml");
-        if p.exists() {
-            return p;
-        }
-        // Default: next to binary
-        if let Ok(exe) = std::env::current_exe() {
-            let sibling = exe.parent().unwrap_or(&cwd).join("duscan.toml");
-            if sibling.exists() {
-                return sibling;
-            }
-        }
-        cwd.join("duscan.toml")
+    /// Directory the running binary lives in. This is the single anchor for all
+    /// config: `duscan.toml` and `targets/` are always read/written here,
+    /// independent of the current working directory — so `cron` (which runs from
+    /// $HOME or /) always finds the same config as an interactive shell.
+    /// Falls back to cwd only if the executable path cannot be resolved.
+    pub fn base_dir() -> PathBuf {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
     }
 
-    /// Directory holding the per-target files, alongside `duscan.toml`.
+    /// Config file path: always `<binary dir>/duscan.toml`.
+    pub fn path() -> PathBuf {
+        Self::base_dir().join("duscan.toml")
+    }
+
+    /// Directory holding the per-target files: always `<binary dir>/targets`.
     pub fn targets_dir() -> PathBuf {
-        let p = Self::path();
-        let parent = p.parent().map(|x| x.to_path_buf()).unwrap_or_default();
-        parent.join("targets")
+        Self::base_dir().join("targets")
+    }
+
+    /// The configured `output_dir` resolved to an absolute path: a relative
+    /// value is anchored to the binary dir (same anchor as the config), so cron
+    /// — which runs from $HOME or / — writes reports next to the config rather
+    /// than scattering them under its cwd. An absolute `output_dir` is returned
+    /// unchanged. The stored string is left untouched (so `save()` round-trips
+    /// the user's original value); only readers that resolve paths call this.
+    pub fn resolved_output_dir(&self) -> String {
+        let od = std::path::Path::new(&self.output_dir);
+        if od.is_absolute() {
+            self.output_dir.clone()
+        } else {
+            Self::base_dir().join(od).to_string_lossy().into_owned()
+        }
     }
 
     /// Load global settings from `duscan.toml` and assemble `targets` from every
@@ -575,6 +582,24 @@ mod tests {
         assert_eq!(back.export_dir.as_deref(), Some("exp"));
         assert_eq!(back.webhook_url.as_deref(), Some("https://x/hook"));
         assert_eq!(back.sync_pass, Some(true));
+    }
+
+    /// resolved_output_dir passes absolute paths through unchanged and anchors
+    /// relative ones under the binary dir (so it never stays cwd-relative).
+    #[test]
+    fn resolved_output_dir_absolute_vs_relative() {
+        let mut cfg = Config::default();
+
+        cfg.output_dir = "/data/reports".into();
+        assert_eq!(cfg.resolved_output_dir(), "/data/reports");
+
+        cfg.output_dir = "reports".into();
+        let resolved = cfg.resolved_output_dir();
+        assert!(std::path::Path::new(&resolved).is_absolute(),
+            "relative output_dir must resolve to an absolute path, got {}", resolved);
+        assert!(resolved.ends_with("reports"));
+        // Anchored to the binary dir, not the current working directory.
+        assert_eq!(resolved, Config::base_dir().join("reports").to_string_lossy());
     }
 
     /// sanitize_stem neutralizes path separators, dots, and control chars so a

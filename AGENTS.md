@@ -91,7 +91,16 @@ purge_time = 90
   users = ["carol"]
 ```
 
-Config layout (TOML, auto-created next to binary or in current dir):
+**Config location is always next to the binary.** `duscan.toml` + `targets/` are
+read/written from the directory containing the `duscan` executable, independent
+of the current working directory (no cwd or `~/.config` lookup). This makes cron
+reliable: a job running from `$HOME` or `/` finds the same config as an
+interactive shell. A **relative** `output_dir` (default `"reports"`) is likewise
+anchored to the binary dir, so reports land next to the binary — not under cron's
+cwd. An **absolute** `output_dir`, or an explicit `--output-dir`, is used as-is.
+So a cron entry is just: `0 2 * * * /path/to/duscan run --target <name>`.
+
+Config layout (TOML, auto-created next to the binary):
 
 ```
 duscan.toml            # global settings only: output_dir, workers, max_parallel_devices, nfs_parallel
