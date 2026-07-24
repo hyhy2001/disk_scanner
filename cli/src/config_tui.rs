@@ -113,6 +113,11 @@ struct App {
     tm_stack: Vec<(i64, String)>,
     /// Selected child index in the current treemap node.
     tm_sel: usize,
+    /// Live filter string for long lists (user columns + treemap). Empty = no
+    /// filter. Reset whenever the view/target/tab changes.
+    filter: String,
+    /// True while `/` filter-input mode is active (keystrokes edit `filter`).
+    filtering: bool,
 }
 
 impl App {
@@ -134,7 +139,22 @@ impl App {
             detail_sel: 0,
             tm_stack: Vec::new(),
             tm_sel: 0,
+            filter: String::new(),
+            filtering: false,
         }
+    }
+
+    /// Clear any active filter (called when the view/target/tab context changes
+    /// so a stale filter never hides a fresh list).
+    fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.filtering = false;
+    }
+
+    /// Case-insensitive substring match against the current filter (always true
+    /// when the filter is empty).
+    fn matches_filter(&self, s: &str) -> bool {
+        self.filter.is_empty() || s.to_lowercase().contains(&self.filter.to_lowercase())
     }
 
     /// Name of the currently selected target, if any.
@@ -155,6 +175,11 @@ impl App {
         t.users.iter().filter(|u| u.team_id == tm.team_id).map(|u| u.name.clone()).collect()
     }
 
+    /// `current_team_users` narrowed by the active filter.
+    fn filtered_team_users(&self) -> Vec<String> {
+        self.current_team_users().into_iter().filter(|u| self.matches_filter(u)).collect()
+    }
+
     /// Clamp all selection indices so they stay within the current data after
     /// add/remove operations change list lengths.
     fn clamp_selections(&mut self) {
@@ -162,12 +187,14 @@ impl App {
         if self.target_sel >= ntargets { self.target_sel = ntargets.saturating_sub(1); }
         let nteams = self.cfg.targets.get(self.target_sel).map(|t| t.teams.len()).unwrap_or(0);
         if self.team_sel >= nteams { self.team_sel = nteams.saturating_sub(1); }
-        let nusers = self.current_team_users().len();
+        // Clamp against the filtered lists so a shrunken view never leaves the
+        // selection past the end.
+        let nusers = self.filtered_team_users().len();
         if self.user_sel >= nusers { self.user_sel = nusers.saturating_sub(1); }
         if self.settings_sel > 3 { self.settings_sel = 3; }
         if self.scansync_sel > 8 { self.scansync_sel = 8; }
-        // Detail lists users from report.db (team + Other), not config.
-        let ntusers = current_report_users(self).len();
+        // Detail/Perm/Inode list users from report.db (team + Other), filtered.
+        let ntusers = filtered_report_users(self).len();
         if ntusers > 0 && self.detail_sel >= ntusers { self.detail_sel = ntusers - 1; }
     }
 }
@@ -252,17 +279,28 @@ fn is_path_input(kind: &InputKind) -> bool {
 }
 
 fn handle_browse_key(app: &mut App, key: event::KeyEvent) {
+    // While a filter is being typed, global keys (q/Esc/digits/Tab) must NOT
+    // fire — they are text for the filter. Route straight to the tab handler,
+    // which owns the filter-input state.
+    if app.filtering {
+        match app.tab {
+            Tab::TeamsUsers => browse_teams_users(app, key),
+            Tab::Output => browse_output(app, key),
+            _ => app.filtering = false, // no filter on other tabs; drop the flag
+        }
+        return;
+    }
     // Global keys.
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => { app.quit = true; return; }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => { app.quit = true; return; }
-        KeyCode::Tab | KeyCode::Char('\t') => { app.tab = next_tab(app.tab); return; }
-        KeyCode::BackTab => { app.tab = prev_tab(app.tab); return; }
-        KeyCode::Char('1') => { app.tab = Tab::Targets; return; }
-        KeyCode::Char('2') => { app.tab = Tab::TeamsUsers; return; }
-        KeyCode::Char('3') => { app.tab = Tab::ScanSync; return; }
-        KeyCode::Char('4') => { app.tab = Tab::Output; return; }
-        KeyCode::Char('5') => { app.tab = Tab::Settings; return; }
+        KeyCode::Tab | KeyCode::Char('\t') => { app.tab = next_tab(app.tab); app.clear_filter(); return; }
+        KeyCode::BackTab => { app.tab = prev_tab(app.tab); app.clear_filter(); return; }
+        KeyCode::Char('1') => { app.tab = Tab::Targets; app.clear_filter(); return; }
+        KeyCode::Char('2') => { app.tab = Tab::TeamsUsers; app.clear_filter(); return; }
+        KeyCode::Char('3') => { app.tab = Tab::ScanSync; app.clear_filter(); return; }
+        KeyCode::Char('4') => { app.tab = Tab::Output; app.clear_filter(); return; }
+        KeyCode::Char('5') => { app.tab = Tab::Settings; app.clear_filter(); return; }
         // r = scan selected target; R = scan all. Treemap navigation uses
         // arrows/Enter/Backspace so r/R don't clash on the Output tab.
         KeyCode::Char('r') => {
@@ -350,27 +388,40 @@ fn browse_teams_users(app: &mut App, key: event::KeyEvent) {
         app.status = "No target selected — add one on the Targets tab first.".into();
         return;
     }
+    // ── Filter-input mode: keystrokes edit the user filter. ──
+    if app.filtering {
+        match key.code {
+            KeyCode::Esc => { app.clear_filter(); }
+            KeyCode::Enter => { app.filtering = false; }
+            KeyCode::Backspace => { app.filter.pop(); app.user_sel = 0; }
+            KeyCode::Char(c) => { app.filter.push(c); app.user_sel = 0; }
+            _ => {}
+        }
+        return;
+    }
     let nteams = app.cfg.targets.get(app.target_sel).map(|t| t.teams.len()).unwrap_or(0);
-    let nusers = app.current_team_users().len();
+    let nusers = app.filtered_team_users().len();
     match key.code {
         // [ / ] switch which target this tab operates on, without leaving the tab.
         KeyCode::Char('[') => {
             if app.target_sel > 0 {
                 app.target_sel -= 1;
-                app.team_sel = 0; app.user_sel = 0;
+                app.team_sel = 0; app.user_sel = 0; app.clear_filter();
                 app.status = format!("Target: {}", app.current_target_name().unwrap_or_default());
             }
         }
         KeyCode::Char(']') => {
             if app.target_sel + 1 < app.cfg.targets.len() {
                 app.target_sel += 1;
-                app.team_sel = 0; app.user_sel = 0;
+                app.team_sel = 0; app.user_sel = 0; app.clear_filter();
                 app.status = format!("Target: {}", app.current_target_name().unwrap_or_default());
             }
         }
-        // Teams: k/j move team selection. Users: ←→ move user selection.
-        KeyCode::Up | KeyCode::Char('k') => { if app.team_sel > 0 { app.team_sel -= 1; app.user_sel = 0; } }
-        KeyCode::Down | KeyCode::Char('j') => { if app.team_sel + 1 < nteams { app.team_sel += 1; app.user_sel = 0; } }
+        // Start filtering the user list.
+        KeyCode::Char('/') => { app.filtering = true; app.user_sel = 0; }
+        // Teams: k/j move team selection (resets user filter). Users: ←→ move.
+        KeyCode::Up | KeyCode::Char('k') => { if app.team_sel > 0 { app.team_sel -= 1; app.user_sel = 0; app.clear_filter(); } }
+        KeyCode::Down | KeyCode::Char('j') => { if app.team_sel + 1 < nteams { app.team_sel += 1; app.user_sel = 0; app.clear_filter(); } }
         KeyCode::Left => { if app.user_sel > 0 { app.user_sel -= 1; } }
         KeyCode::Right => { if app.user_sel + 1 < nusers { app.user_sel += 1; } }
         KeyCode::Char('a') => begin_input(app, InputKind::NewTeam, "New team name:", ""),
@@ -391,7 +442,7 @@ fn browse_teams_users(app: &mut App, key: event::KeyEvent) {
             }
         }
         KeyCode::Char('x') => {
-            let users = app.current_team_users();
+            let users = app.filtered_team_users();
             if let Some(uname) = users.get(app.user_sel).cloned() {
                 app.mode = Mode::Confirm {
                     action: ConfirmAction::DeleteUser(uname.clone()),
@@ -491,6 +542,12 @@ fn current_report_users(app: &App) -> Vec<crate::ReportUser> {
     }
 }
 
+/// `current_report_users` narrowed by the active filter (by username). Used by
+/// Detail/Perm/Inode so navigation + rendering agree on the same visible set.
+fn filtered_report_users(app: &App) -> Vec<crate::ReportUser> {
+    current_report_users(app).into_iter().filter(|u| app.matches_filter(&u.username)).collect()
+}
+
 /// Export usage txt for the current target from the Output/Detail view.
 /// `only_user = Some(u)` exports just that user; `None` exports every user.
 /// Destination mirrors the CLI layout: `<export_dir>/<target>/` where
@@ -525,7 +582,9 @@ fn load_tm_children(app: &App) -> Vec<crate::TreeEntry> {
         Some((id, _)) => *id,
         None => match crate::treemap_root(&conn, tp) { Some(r) => r, None => return Vec::new() },
     };
-    crate::treemap_children(&conn, tp, node, 500)
+    let all = crate::treemap_children(&conn, tp, node, 500);
+    // Apply the active filter (by entry name) so nav + render see the same set.
+    all.into_iter().filter(|e| app.matches_filter(&e.name)).collect()
 }
 
 /// Reset treemap navigation to the root of the current target.
@@ -535,26 +594,39 @@ fn reset_treemap(app: &mut App) {
 }
 
 fn browse_output(app: &mut App, key: event::KeyEvent) {
-    // Switch target with [ ] (resets treemap nav + selections).
+    // ── Filter-input mode: keystrokes edit the filter, not the view. ──
+    // Only the searchable views (Detail/Perm/Inode/Treemap) can be filtering.
+    if app.filtering {
+        match key.code {
+            KeyCode::Esc => { app.clear_filter(); }
+            KeyCode::Enter => { app.filtering = false; } // keep the filter, leave input mode
+            KeyCode::Backspace => { app.filter.pop(); app.detail_sel = 0; app.tm_sel = 0; }
+            KeyCode::Char(c) => { app.filter.push(c); app.detail_sel = 0; app.tm_sel = 0; }
+            _ => {}
+        }
+        return;
+    }
+
+    // Switch target with [ ] (resets treemap nav + selections + filter).
     match key.code {
         KeyCode::Char('[') => {
             if app.target_sel > 0 { app.target_sel -= 1; app.team_sel = 0; app.user_sel = 0;
-                app.hist_sel = 0; app.detail_sel = 0; reset_treemap(app);
+                app.hist_sel = 0; app.detail_sel = 0; reset_treemap(app); app.clear_filter();
                 app.status = format!("Target: {}", app.current_target_name().unwrap_or_default()); }
             return;
         }
         KeyCode::Char(']') => {
             if app.target_sel + 1 < app.cfg.targets.len() { app.target_sel += 1; app.team_sel = 0; app.user_sel = 0;
-                app.hist_sel = 0; app.detail_sel = 0; reset_treemap(app);
+                app.hist_sel = 0; app.detail_sel = 0; reset_treemap(app); app.clear_filter();
                 app.status = format!("Target: {}", app.current_target_name().unwrap_or_default()); }
             return;
         }
-        // Switch sub-view.
-        KeyCode::Char('h') => { app.output_view = OutputView::History; app.hist_sel = 0; return; }
-        KeyCode::Char('d') => { app.output_view = OutputView::Detail; app.detail_sel = 0; return; }
-        KeyCode::Char('p') => { app.output_view = OutputView::Permission; app.detail_sel = 0; return; }
-        KeyCode::Char('i') => { app.output_view = OutputView::Inode; app.detail_sel = 0; return; }
-        KeyCode::Char('t') => { app.output_view = OutputView::Treemap; reset_treemap(app); return; }
+        // Switch sub-view (each resets the filter — it's list-specific).
+        KeyCode::Char('h') => { app.output_view = OutputView::History; app.hist_sel = 0; app.clear_filter(); return; }
+        KeyCode::Char('d') => { app.output_view = OutputView::Detail; app.detail_sel = 0; app.clear_filter(); return; }
+        KeyCode::Char('p') => { app.output_view = OutputView::Permission; app.detail_sel = 0; app.clear_filter(); return; }
+        KeyCode::Char('i') => { app.output_view = OutputView::Inode; app.detail_sel = 0; app.clear_filter(); return; }
+        KeyCode::Char('t') => { app.output_view = OutputView::Treemap; reset_treemap(app); app.clear_filter(); return; }
         _ => {}
     }
     match app.output_view {
@@ -566,12 +638,12 @@ fn browse_output(app: &mut App, key: event::KeyEvent) {
                 _ => {}
             }
         }
-        // Detail / Permission / Inode all navigate the same report.db user list.
+        // Detail / Permission / Inode all navigate the same (filtered) user list.
         OutputView::Detail | OutputView::Permission | OutputView::Inode => {
-            // Users come from report.db (every scanned uid, incl. "Other"), not config.
-            let report_users = current_report_users(app);
+            let report_users = filtered_report_users(app);
             let nusers = report_users.len();
             match key.code {
+                KeyCode::Char('/') => { app.filtering = true; app.detail_sel = 0; }
                 KeyCode::Up | KeyCode::Char('k') => { if app.detail_sel > 0 { app.detail_sel -= 1; } }
                 KeyCode::Down | KeyCode::Char('j') => { if app.detail_sel + 1 < nusers { app.detail_sel += 1; } }
                 // Export usage txt (Detail only): `x` selected user, `X` all users.
@@ -588,6 +660,7 @@ fn browse_output(app: &mut App, key: event::KeyEvent) {
         OutputView::Treemap => {
             let children = load_tm_children(app);
             match key.code {
+                KeyCode::Char('/') => { app.filtering = true; app.tm_sel = 0; }
                 KeyCode::Up | KeyCode::Char('k') => { if app.tm_sel > 0 { app.tm_sel -= 1; } }
                 KeyCode::Down | KeyCode::Char('j') => { if app.tm_sel + 1 < children.len() { app.tm_sel += 1; } }
                 // Enter: descend into the selected child (only if it has children).
@@ -595,6 +668,7 @@ fn browse_output(app: &mut App, key: event::KeyEvent) {
                     if let Some(entry) = children.get(app.tm_sel) {
                         app.tm_stack.push((entry.id, entry.name.clone()));
                         app.tm_sel = 0;
+                        app.clear_filter(); // filter is per-node
                         // If the new node has no children, pop back (it's a leaf dir).
                         if load_tm_children(app).is_empty() {
                             app.tm_stack.pop();
@@ -603,7 +677,7 @@ fn browse_output(app: &mut App, key: event::KeyEvent) {
                     }
                 }
                 KeyCode::Backspace | KeyCode::Left => {
-                    if app.tm_stack.pop().is_some() { app.tm_sel = 0; }
+                    if app.tm_stack.pop().is_some() { app.tm_sel = 0; app.clear_filter(); }
                 }
                 _ => {}
             }
@@ -645,46 +719,71 @@ fn handle_input_key(app: &mut App, key: event::KeyEvent) {
 
 /// Tab-complete a directory path in the input box. Fills the longest common
 /// prefix of matching sub-directories and, when several match, records them in
-/// `completions` for display. No-op for non-path inputs.
+/// `completions` for display. No-op for inputs that aren't a path (or, for
+/// AddUsers, aren't currently typing an `@file` token).
 fn try_complete_path(app: &mut App) {
     let Mode::Input { kind, buf, completions, .. } = &mut app.mode else { return };
-    if !is_path_input(kind) { return; }
 
-    // Split buf into the directory to list and the partial name being typed.
-    let (dir, prefix) = match buf.rfind('/') {
-        Some(i) => (buf[..=i].to_string(), buf[i + 1..].to_string()),
-        None => (String::new(), buf.clone()),
+    // Determine the region of `buf` that is a path to complete, and whether
+    // files (not just directories) are valid candidates.
+    //   - path inputs: the whole buffer, directories only.
+    //   - AddUsers: only when the last comma-token starts with `@`; the path is
+    //     after that `@`, and files are valid (an `@file` points at a file).
+    let (region_start, allow_files): (usize, bool) = if is_path_input(kind) {
+        (0, false)
+    } else if matches!(kind, InputKind::AddUsers { .. }) {
+        let tok_start = buf.rfind(',').map(|i| i + 1).unwrap_or(0);
+        // Skip leading whitespace in the token.
+        let tok = &buf[tok_start..];
+        let ws = tok.len() - tok.trim_start().len();
+        match buf[tok_start + ws..].strip_prefix('@') {
+            Some(_) => (tok_start + ws + 1, true), // path starts just after '@'
+            None => { completions.clear(); return; }
+        }
+    } else {
+        return;
+    };
+
+    let region = buf[region_start..].to_string();
+
+    // Split the path region into the directory to list and the partial name.
+    let (dir, prefix) = match region.rfind('/') {
+        Some(i) => (region[..=i].to_string(), region[i + 1..].to_string()),
+        None => (String::new(), region.clone()),
     };
     let list_dir = if dir.is_empty() { ".".to_string() } else { dir.clone() };
 
-    // Collect matching sub-directories (directories only).
+    // Collect matching entries: directories always, files too when allow_files.
     let mut names: Vec<String> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&list_dir) {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
             if !name.starts_with(&prefix) { continue; }
-            // Directory check follows symlinks (metadata) but falls back to file_type.
             let is_dir = e.metadata().map(|m| m.is_dir())
                 .or_else(|_| e.file_type().map(|t| t.is_dir()))
                 .unwrap_or(false);
-            if is_dir { names.push(name); }
+            if is_dir || allow_files { names.push(if is_dir { format!("{}/", name) } else { name }); }
         }
     }
     names.sort();
 
+    let head = buf[..region_start].to_string();
     if names.is_empty() {
         completions.clear();
-        app.status = format!("no directory matches '{}'", buf);
+        app.status = format!("no match for '{}'", region);
         return;
     }
     if names.len() == 1 {
-        *buf = format!("{}{}/", dir, names[0]);
+        // A single dir match ends in '/'; a single file match is complete as-is.
+        *buf = format!("{}{}{}", head, dir, names[0]);
         completions.clear();
         return;
     }
-    // Multiple: fill longest common prefix, then show the list.
-    let lcp = longest_common_prefix(&names);
-    *buf = format!("{}{}", dir, lcp);
+    // Multiple: fill longest common prefix (strip any trailing '/' the entries
+    // carry so the lcp doesn't glue a slash mid-name), then show the list.
+    let bare: Vec<String> = names.iter().map(|n| n.trim_end_matches('/').to_string()).collect();
+    let lcp = longest_common_prefix(&bare);
+    *buf = format!("{}{}{}", head, dir, lcp);
     *completions = names;
 }
 
@@ -703,14 +802,60 @@ fn longest_common_prefix(items: &[String]) -> String {
     first[..end].to_string()
 }
 
+/// Resolve a local path to an absolute one. Empty stays empty; an already
+/// absolute path is returned unchanged; a relative path is joined onto the
+/// current working directory (not canonicalized — the path may not exist yet,
+/// e.g. a scan target being created). Used for local path inputs so config
+/// stores unambiguous paths regardless of where duscan is later run.
+fn to_absolute(p: &str) -> String {
+    if p.is_empty() { return String::new(); }
+    let path = std::path::Path::new(p);
+    if path.is_absolute() {
+        return p.to_string();
+    }
+    std::path::absolute(path)
+        .map(|ab| ab.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| p.to_string())
+}
+
+/// Absolute-ify the `@file` tokens in an add-users buffer, leaving literal
+/// usernames untouched. `alice,@rel/list.txt,bob` → `alice,@/abs/rel/list.txt,bob`.
+fn abs_at_file_tokens(raw: &str) -> String {
+    raw.split(',')
+        .map(|tok| {
+            let t = tok.trim();
+            if let Some(rest) = t.strip_prefix('@') {
+                format!("@{}", to_absolute(rest))
+            } else {
+                t.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Apply the finished input line. Every mutating branch calls a `Config` method
 /// that persists immediately, so there is no separate "save" step.
 fn commit_input(app: &mut App) {
     // Take the kind + buffer out so we can borrow `app.cfg` mutably below.
-    let (kind, buf) = match std::mem::replace(&mut app.mode, Mode::Browse) {
+    let (kind, mut buf) = match std::mem::replace(&mut app.mode, Mode::Browse) {
         Mode::Input { kind, buf, .. } => (kind, buf.trim().to_string()),
         other => { app.mode = other; return; }
     };
+
+    // Local path inputs are stored absolute so config is unambiguous regardless
+    // of the cwd duscan later runs from. sync_dest_dir (a remote path) and
+    // output_dir (anchored to the binary dir) are deliberately left as-is.
+    match &kind {
+        InputKind::NewTargetPath { .. } | InputKind::EditPath | InputKind::SetExportDir => {
+            buf = to_absolute(&buf);
+        }
+        InputKind::AddUsers { .. } => {
+            buf = abs_at_file_tokens(&buf);
+        }
+        _ => {}
+    }
+
     let target = app.current_target_name();
 
     let result: Result<String, String> = match kind {
@@ -918,20 +1063,25 @@ fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn footer_hint(app: &App) -> &'static str {
+    // While typing a filter, show the filter-mode keys.
+    if app.filtering {
+        return "Type to filter · Enter keep · Esc clear · Backspace delete";
+    }
     match &app.mode {
         Mode::Input { kind, .. } if is_path_input(kind) => "Type value · Tab complete dir · Enter confirm · Esc cancel",
+        Mode::Input { kind, .. } if matches!(kind, InputKind::AddUsers { .. }) => "Type users (alice,bob or @file) · Tab complete @file · Enter confirm · Esc cancel",
         Mode::Input { .. } => "Type value · Enter confirm · Esc cancel",
         Mode::Confirm { .. } => "y confirm · any other key cancel",
         Mode::Browse => match app.tab {
             Tab::Targets => "↑↓ move · a add · e path · s end-scan · p purge · d delete · r scan · R scan-all · ↹ tab · q quit",
-            Tab::TeamsUsers => "[ ] target · ↑↓ team · ←→ user · a add-team · d del-team · u add-users · x del-user · r/R scan · q quit",
+            Tab::TeamsUsers => "[ ] target · ↑↓ team · ←→ user · / search · a add-team · d del-team · u add-users · x del-user · q quit",
             Tab::ScanSync => "[ ] target · ↑↓ move · Enter/e edit · r scan this · R scan-all · ↹ tab · q quit",
             Tab::Output => match app.output_view {
                 OutputView::History => "[ ] target · h/d/p/i/t view · ↑↓ scroll · r/R scan · ↹ tab · q quit",
-                OutputView::Detail => "[ ] target · h/d/p/i/t view · ↑↓ user · x export · X export-all · r/R scan · q quit",
-                OutputView::Permission => "[ ] target · h/d/p/i/t view · ↑↓ user · perm issues · r/R scan · ↹ tab · q quit",
-                OutputView::Inode => "[ ] target · h/d/p/i/t view · ↑↓ user · file counts · r/R scan · ↹ tab · q quit",
-                OutputView::Treemap => "[ ] target · h/d/p/i/t view · ↑↓ move · Enter open · Bksp up · r/R scan · q quit",
+                OutputView::Detail => "[ ] target · h/d/p/i/t · / search · ↑↓ user · x export · X export-all · r/R scan · q quit",
+                OutputView::Permission => "[ ] target · h/d/p/i/t · / search · ↑↓ user · perm issues · r/R scan · q quit",
+                OutputView::Inode => "[ ] target · h/d/p/i/t · / search · ↑↓ user · inode counts · r/R scan · q quit",
+                OutputView::Treemap => "[ ] target · h/d/p/i/t · / search · ↑↓ move · Enter open · Bksp up · q quit",
             },
             Tab::Settings => "↑↓ move · Enter/e edit · r/R scan · ↹ tab · q quit",
         },
@@ -1009,9 +1159,10 @@ fn draw_teams_users(frame: &mut Frame, app: &App, area: Rect) {
     }
     frame.render_stateful_widget(teams, cols[0], &mut ts);
 
-    // Right: users of the selected team (or a hint if the team is empty).
-    let users = app.current_team_users();
-    let user_items: Vec<ListItem> = if users.is_empty() {
+    // Right: users of the selected team (filterable via `/`), or a hint if empty.
+    let total_users = app.current_team_users().len();
+    let users = app.filtered_team_users();
+    let user_items: Vec<ListItem> = if total_users == 0 {
         if has_teams {
             vec![ListItem::new(Span::styled("Press  u  to add users (alice,bob or @file)", Style::default().fg(Color::Cyan)))]
         } else {
@@ -1021,11 +1172,18 @@ fn draw_teams_users(frame: &mut Frame, app: &App, area: Rect) {
         users.iter().map(|u| ListItem::new(u.clone())).collect()
     };
     let team_label = app.current_team_name().unwrap_or_else(|| "-".into());
+    // Title reflects the filter (shown/total) while it's active.
+    let utitle = if app.filter.is_empty() && !app.filtering {
+        format!(" Users — team: {} ", team_label)
+    } else {
+        let cursor = if app.filtering { "_" } else { "" };
+        format!(" Users — team: {} ({}/{}) — /{}{} ", team_label, users.len(), total_users, app.filter, cursor)
+    };
     let ulist = List::new(user_items)
-        .block(Block::default().borders(Borders::ALL).title(format!(" Users — team: {} ", team_label)))
+        .block(Block::default().borders(Borders::ALL).title(utitle))
         .highlight_style(selected_style());
     let mut us = ListState::default();
-    if !users.is_empty() { us.select(Some(app.user_sel)); }
+    if !users.is_empty() { us.select(Some(app.user_sel.min(users.len() - 1))); }
     frame.render_stateful_widget(ulist, cols[1], &mut us);
 }
 
@@ -1115,54 +1273,19 @@ fn draw_out_history(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_out_detail(frame: &mut Frame, app: &App, area: Rect) {
-    // Users are read from report.db (every uid the scan saw). Users not in any
-    // configured team are shown under an "Other" bucket, matching legacy.
+    // Users are read from report.db (every uid the scan saw); unassigned users
+    // show under "Other". The list is filterable via `/`.
     let Some(db) = current_report_db(app) else {
         empty_state(frame, area, "Detail", &["No report yet.", "Press r to scan this target first."]);
         return;
     };
-    let users = crate::query_report_users(&db);
-    if users.is_empty() {
-        empty_state(frame, area, "Detail", &["No user data in this report.", "Press r to scan this target."]);
-        return;
-    }
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(24), Constraint::Min(0)])
-        .split(area);
-    // Left: user list — team users first, then an "Other" separator, then
-    // unassigned users tagged so it's clear they belong to no configured team.
-    let mut uitems: Vec<ListItem> = Vec::with_capacity(users.len());
-    let mut prev_other = false;
-    for u in &users {
-        if u.has_team {
-            uitems.push(ListItem::new(u.username.clone()));
-        } else {
-            if !prev_other {
-                // Header row for the Other group (rendered dim, non-selectable visually).
-                prev_other = true;
-            }
-            let label = format!("{}  (Other)", u.username);
-            uitems.push(ListItem::new(Span::styled(label, Style::default().fg(Color::DarkGray))));
-        }
-    }
-    let nteam = users.iter().filter(|u| u.has_team).count();
-    let nother = users.len() - nteam;
-    let title = if nother > 0 {
-        format!(" Users ({} team, {} other) ", nteam, nother)
-    } else {
-        format!(" Users ({}) ", nteam)
-    };
-    let ulist = List::new(uitems)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(selected_style());
-    let mut us = ListState::default();
-    us.select(Some(app.detail_sel.min(users.len().saturating_sub(1))));
-    frame.render_stateful_widget(ulist, cols[0], &mut us);
+    let total = current_report_users(app).len();
+    let filtered = filtered_report_users(app);
+    let Some((cols, uname_ref)) = draw_user_column(frame, app, area, "Detail", &filtered, total) else { return };
+    let uname = uname_ref.to_string();
 
     // Right: detail for the selected user.
-    let uname = &users[app.detail_sel.min(users.len() - 1)].username;
-    match crate::query_user_detail(&db, uname, 15) {
+    match crate::query_user_detail(&db, &uname, 15) {
         Some(d) => {
             let mut lines = vec![
                 Line::from(Span::styled(format!("{}  (uid {})", uname, d.uid), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
@@ -1182,17 +1305,20 @@ fn draw_out_detail(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Render the shared left-hand user column (team users then "Other") used by the
-/// Detail / Permission / Inode views. Returns the two-column split plus the
-/// resolved list of users, so the caller fills the right pane for the selected
-/// user. `None` when there is no report / no user data (an empty state is drawn).
+/// Detail / Permission / Inode views. `filtered` is the visible (possibly
+/// narrowed) user list; `total` is the unfiltered count for the title. Returns
+/// the two-column split plus the selected username, so the caller fills the
+/// right pane. `None` when there is nothing selectable (an empty state is drawn:
+/// "no report", or "no match" when a filter hides everything).
 fn draw_user_column<'a>(
     frame: &mut Frame,
     app: &App,
     area: Rect,
     view_title: &str,
-    users: &'a [crate::ReportUser],
+    filtered: &'a [crate::ReportUser],
+    total: usize,
 ) -> Option<(std::rc::Rc<[Rect]>, &'a str)> {
-    if users.is_empty() {
+    if total == 0 {
         empty_state(frame, area, view_title, &["No user data in this report.", "Press r to scan this target."]);
         return None;
     }
@@ -1200,22 +1326,39 @@ fn draw_user_column<'a>(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(24), Constraint::Min(0)])
         .split(area);
-    let uitems: Vec<ListItem> = users.iter().map(|u| {
+    let title = user_col_title(app, filtered.len(), total);
+    if filtered.is_empty() {
+        // Filter hid everything — keep the split so the right pane stays blank,
+        // and show the (still-typing) filter in the title.
+        let empty = List::new(Vec::<ListItem>::new())
+            .block(Block::default().borders(Borders::ALL).title(title));
+        frame.render_widget(empty, cols[0]);
+        empty_state(frame, cols[1], view_title, &[&format!("No user matches '{}'.", app.filter), "Esc to clear the filter."]);
+        return None;
+    }
+    let uitems: Vec<ListItem> = filtered.iter().map(|u| {
         if u.has_team { ListItem::new(u.username.clone()) }
         else { ListItem::new(Span::styled(format!("{}  (Other)", u.username), Style::default().fg(Color::DarkGray))) }
     }).collect();
-    let nteam = users.iter().filter(|u| u.has_team).count();
-    let nother = users.len() - nteam;
-    let title = if nother > 0 { format!(" Users ({} team, {} other) ", nteam, nother) }
-                else { format!(" Users ({}) ", nteam) };
     let ulist = List::new(uitems)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(selected_style());
-    let sel = app.detail_sel.min(users.len() - 1);
+    let sel = app.detail_sel.min(filtered.len() - 1);
     let mut us = ListState::default();
     us.select(Some(sel));
     frame.render_stateful_widget(ulist, cols[0], &mut us);
-    Some((cols, users[sel].username.as_str()))
+    Some((cols, filtered[sel].username.as_str()))
+}
+
+/// Title for the user column, showing the filter (and shown/total counts) when
+/// a filter is active, else just the total.
+fn user_col_title(app: &App, shown: usize, total: usize) -> String {
+    if app.filter.is_empty() && !app.filtering {
+        format!(" Users ({}) ", total)
+    } else {
+        let cursor = if app.filtering { "_" } else { "" };
+        format!(" Users ({}/{}) — /{}{} ", shown, total, app.filter, cursor)
+    }
 }
 
 fn draw_out_permission(frame: &mut Frame, app: &App, area: Rect) {
@@ -1223,8 +1366,9 @@ fn draw_out_permission(frame: &mut Frame, app: &App, area: Rect) {
         empty_state(frame, area, "Permission", &["No report yet.", "Press r to scan this target first."]);
         return;
     };
-    let users = crate::query_report_users(&db);
-    let Some((cols, uname)) = draw_user_column(frame, app, area, "Permission", &users) else { return };
+    let total_users = current_report_users(app).len();
+    let filtered = filtered_report_users(app);
+    let Some((cols, uname)) = draw_user_column(frame, app, area, "Permission", &filtered, total_users) else { return };
 
     let (total, issues) = crate::query_user_permissions(&db, uname, 200);
     if total == 0 {
@@ -1250,8 +1394,9 @@ fn draw_out_inode(frame: &mut Frame, app: &App, area: Rect) {
         empty_state(frame, area, "Inode", &["No report yet.", "Press r to scan this target first."]);
         return;
     };
-    let users = crate::query_report_users(&db);
-    let Some((cols, uname)) = draw_user_column(frame, app, area, "Inode", &users) else { return };
+    let total_users = current_report_users(app).len();
+    let filtered = filtered_report_users(app);
+    let Some((cols, uname)) = draw_user_column(frame, app, area, "Inode", &filtered, total_users) else { return };
 
     let (total_files, total_dirs, dirs) = crate::query_user_inode(&db, uname, 100);
     if dirs.is_empty() {
@@ -1259,8 +1404,10 @@ fn draw_out_inode(frame: &mut Frame, app: &App, area: Rect) {
             &[&format!("No directory data for '{}'.", uname), "This user may have no files in the last scan."]);
         return;
     }
+    // One inode per file + one per directory the user owns.
+    let inodes = total_files + total_dirs;
     let mut lines = vec![
-        Line::from(Span::styled(format!("{}  —  {} files in {} dirs", uname, total_files, total_dirs),
+        Line::from(Span::styled(format!("{}  —  {} inodes ({} files + {} dirs)", uname, inodes, total_files, total_dirs),
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
         Line::from(Span::styled(format!("{:>9}  {:>9}  {}", "Files", "Size", "Directory"), Style::default().fg(Color::Yellow))),
     ];
@@ -1281,8 +1428,13 @@ fn draw_out_treemap(frame: &mut Frame, app: &App, area: Rect) {
     // Breadcrumb of the current path.
     let mut crumb = String::from("/");
     crumb.push_str(&app.tm_stack.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>().join("/"));
+    // Distinguish "no treemap data at all" from "filter hid everything".
     if children.is_empty() {
-        empty_state(frame, area, "Treemap", &["No treemap data.", "Scan with tree_map enabled (Scan/Sync tab) first."]);
+        if app.filter.is_empty() && !app.filtering {
+            empty_state(frame, area, "Treemap", &["No treemap data.", "Scan with tree_map enabled (Scan/Sync tab) first."]);
+        } else {
+            empty_state(frame, area, "Treemap", &[&format!("No entry matches '{}'.", app.filter), "Esc to clear the filter."]);
+        }
         return;
     }
     let maxsz = children.iter().map(|c| c.size).max().unwrap_or(1).max(1);
@@ -1291,8 +1443,15 @@ fn draw_out_treemap(frame: &mut Frame, app: &App, area: Rect) {
         let bar: String = std::iter::repeat('█').take(barlen).chain(std::iter::repeat('·').take(12 - barlen)).collect();
         ListItem::new(format!("{:>9}  [{}]  {:<28}  {} files", fmt_size(c.size), bar, c.name, c.file_count))
     }).collect();
+    // Title shows the filter while active.
+    let title = if app.filter.is_empty() && !app.filtering {
+        format!(" Treemap — {} ", crumb)
+    } else {
+        let cursor = if app.filtering { "_" } else { "" };
+        format!(" Treemap — {} — /{}{} ", crumb, app.filter, cursor)
+    };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(format!(" Treemap — {} ", crumb)))
+        .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(selected_style());
     let mut st = ListState::default();
     st.select(Some(app.tm_sel.min(children.len().saturating_sub(1))));

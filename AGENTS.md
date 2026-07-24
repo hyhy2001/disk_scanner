@@ -16,7 +16,10 @@ targets/teams/users and writes every change straight to `duscan.toml` +
 `targets/*.toml` (save on each op). Keys: `↹`/`1`..`5` switch tabs, `↑↓`
 move, `[`/`]` switch target (on Teams, Scan/Sync & Output tabs), `a` add, `e`
 edit, `d` delete, `u` add users (supports `alice,bob` and `@file`), `x` remove
-user, path inputs support `Tab` directory completion, `q`/`Esc` quit.
+user, `q`/`Esc` quit. Local path inputs (scan path, `export_dir`) and the `@file`
+token in add-users support `Tab` completion and are stored as absolute paths;
+`sync_dest_dir` (remote path) and `output_dir` (anchored to the binary dir) are
+left as typed. `/` filters long lists (see the Output tab notes below).
 
 **Run a scan from the TUI:** `r` scans the selected target, `R` scans all. The
 TUI hands the screen to the scan monitor, then returns when the scan finishes.
@@ -33,10 +36,12 @@ after each scan. These are also stored in `targets/<name>.toml`.
 sub-views switched with `h`/`d`/`p`/`i`/`t`: **History** (per-day usage snapshots
 + top users), **Detail** (pick a user → totals + top dirs/files; `x` exports the
 selected user's usage txt, `X` exports every user), **Perm** (`p` — the selected
-user's permission issues: Type/Error/Path), **Inode** (`i` — the user's per-dir
-file-count breakdown, sorted by file count), and **Treemap** (an
-ncdu-style directory browser: `↑↓` move, `Enter` descend into a sub-directory,
-`Backspace` go up, sized bars per entry). `[`/`]` switch target. Reads each
+user's permission issues: Type/Error/Path), **Inode** (`i` — the user's inode
+count = files + dirs, plus a per-dir file-count breakdown sorted by file count),
+and **Treemap** (an ncdu-style directory browser: `↑↓` move, `Enter` descend into
+a sub-directory, `Backspace` go up, sized bars per entry). `[`/`]` switch target.
+Press `/` to filter long lists live (Detail/Perm/Inode user column, Treemap
+entries, and the Teams&Users user column) — type to narrow, `Esc` clears. Reads each
 target's `report.db`; empty states point you to press `r` to scan first.
 
 `duscan run` remains a separate read-only scan monitor.
