@@ -463,7 +463,7 @@ fn draw(frame: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(3), // tab bar
             Constraint::Min(0),    // body
-            Constraint::Length(3), // footer/status
+            Constraint::Length(4), // footer: status + key hint (2 lines + border)
         ])
         .split(area);
 
@@ -517,6 +517,17 @@ fn selected_style() -> Style {
 }
 
 fn draw_targets(frame: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default().borders(Borders::ALL).title(format!(" Targets ({}) ", app.cfg.targets.len()));
+    if app.cfg.targets.is_empty() {
+        let hint = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled("  No targets yet.", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(Span::styled("  Press  a  to add your first target.", Style::default().fg(Color::Cyan))),
+        ]).block(block);
+        frame.render_widget(hint, area);
+        return;
+    }
     let items: Vec<ListItem> = app.cfg.targets.iter().map(|t| {
         let end = t.end_scan.clone().unwrap_or_else(|| "-".into());
         let purge = t.purge_time.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
@@ -527,7 +538,7 @@ fn draw_targets(frame: &mut Frame, app: &App, area: Rect) {
     }).collect();
 
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(format!(" Targets ({}) ", app.cfg.targets.len())))
+        .block(block)
         .highlight_style(selected_style());
     let mut state = ListState::default();
     if !app.cfg.targets.is_empty() { state.select(Some(app.target_sel)); }
@@ -535,19 +546,31 @@ fn draw_targets(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_teams_users(frame: &mut Frame, app: &App, area: Rect) {
+    // No target at all: guide the user back to the Targets tab.
+    if app.current_target_name().is_none() {
+        let hint = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled("  No target selected.", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(Span::styled("  Go to the Targets tab (press 1) and add a target first.", Style::default().fg(Color::Cyan))),
+        ]).block(Block::default().borders(Borders::ALL).title(" Teams & Users "));
+        frame.render_widget(hint, area);
+        return;
+    }
     let tname = app.current_target_name().unwrap_or_else(|| "(no target)".into());
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
-    // Left: teams of the current target.
+    // Left: teams of the current target (or a hint if there are none yet).
+    let has_teams = app.cfg.targets.get(app.target_sel).map(|t| !t.teams.is_empty()).unwrap_or(false);
     let team_items: Vec<ListItem> = match app.cfg.targets.get(app.target_sel) {
-        Some(t) => t.teams.iter().map(|tm| {
+        Some(t) if has_teams => t.teams.iter().map(|tm| {
             let count = t.users.iter().filter(|u| u.team_id == tm.team_id).count();
             ListItem::new(format!("{:<20} ({} users)", tm.name, count))
         }).collect(),
-        None => Vec::new(),
+        _ => vec![ListItem::new(Span::styled("Press  a  to add a team", Style::default().fg(Color::Cyan)))],
     };
     let teams = List::new(team_items)
         .block(Block::default().borders(Borders::ALL).title(format!(" Teams — target: {} ", tname)))
@@ -558,9 +581,17 @@ fn draw_teams_users(frame: &mut Frame, app: &App, area: Rect) {
     }
     frame.render_stateful_widget(teams, cols[0], &mut ts);
 
-    // Right: users of the selected team.
+    // Right: users of the selected team (or a hint if the team is empty).
     let users = app.current_team_users();
-    let user_items: Vec<ListItem> = users.iter().map(|u| ListItem::new(u.clone())).collect();
+    let user_items: Vec<ListItem> = if users.is_empty() {
+        if has_teams {
+            vec![ListItem::new(Span::styled("Press  u  to add users (alice,bob or @file)", Style::default().fg(Color::Cyan)))]
+        } else {
+            Vec::new()
+        }
+    } else {
+        users.iter().map(|u| ListItem::new(u.clone())).collect()
+    };
     let team_label = app.current_team_name().unwrap_or_else(|| "-".into());
     let ulist = List::new(user_items)
         .block(Block::default().borders(Borders::ALL).title(format!(" Users — team: {} ", team_label)))
