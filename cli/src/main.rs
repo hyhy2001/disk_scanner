@@ -847,6 +847,60 @@ pub fn query_report_users(db: &std::path::Path) -> Vec<ReportUser> {
     users
 }
 
+/// One permission issue row (Type / Error / Path). Shared by the TUI Output tab.
+pub struct PermIssue {
+    pub item_type: String,
+    pub error: String,
+    pub path: String,
+}
+
+/// A user's permission issues from a report.db (total + top rows). Returns
+/// `(total, rows)`; empty when the DB has no perm_issues table or none match.
+pub fn query_user_permissions(db: &std::path::Path, user: &str, top: usize) -> (i64, Vec<PermIssue>) {
+    let Ok(conn) = rusqlite::Connection::open(db) else { return (0, Vec::new()) };
+    if !has_perm_issues(&conn) { return (0, Vec::new()); }
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM perm_issues WHERE user = ?1",
+        rusqlite::params![user], |r| r.get(0)).unwrap_or(0);
+    let rows = {
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT item_type, error, path FROM perm_issues WHERE user = ?1 ORDER BY id LIMIT ?2")
+        else { return (total, Vec::new()); };
+        stmt.query_map(rusqlite::params![user, top as i64], |r| {
+            Ok(PermIssue { item_type: r.get(0)?, error: r.get(1)?, path: r.get(2)? })
+        }).map(|it| it.flatten().collect()).unwrap_or_default()
+    };
+    (total, rows)
+}
+
+/// A per-directory file-count row (files, size, path). Shared by the TUI Output tab.
+pub struct InodeDir {
+    pub files: i64,
+    pub size: i64,
+    pub path: String,
+}
+
+/// A user's per-directory file-count breakdown, sorted by file count desc.
+/// Returns `(total_files, total_dirs, rows)`; empty rows when the user is absent.
+pub fn query_user_inode(db: &std::path::Path, user: &str, top: usize) -> (i64, i64, Vec<InodeDir>) {
+    let Ok(conn) = rusqlite::Connection::open(db) else { return (0, 0, Vec::new()) };
+    let prefix = detail_prefix(&conn);
+    let sql = format!("SELECT uid, total_files, total_dirs FROM {}users WHERE username = ?1", prefix);
+    let (uid, tf, td): (i64, i64, i64) = match conn.query_row(
+        &sql, rusqlite::params![user], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))) {
+        Ok(v) => v, Err(_) => return (0, 0, Vec::new()),
+    };
+    let dsql = format!(
+        "SELECT files, size, path FROM {}dirs WHERE uid = ?1 ORDER BY files DESC, size DESC LIMIT ?2", prefix);
+    let rows = {
+        let Ok(mut stmt) = conn.prepare(&dsql) else { return (tf, td, Vec::new()); };
+        stmt.query_map(rusqlite::params![uid, top as i64], |r| {
+            Ok(InodeDir { files: r.get(0)?, size: r.get(1)?, path: r.get(2)? })
+        }).map(|it| it.flatten().collect()).unwrap_or_default()
+    };
+    (tf, td, rows)
+}
+
 /// Whether the merged report.db has the permission-issues table.
 fn has_perm_issues(conn: &rusqlite::Connection) -> bool {
     conn.prepare("SELECT 1 FROM perm_issues LIMIT 1").is_ok()
@@ -2332,4 +2386,85 @@ fn write_top_users_table(f: &mut std::fs::File, conn: &rusqlite::Connection, tot
         let _ = writeln!(f, "  {:<16} {:>10}  [{}] {:>5.1}%", name, fmt_size(size), barbuf, pct);
     }
     let _ = writeln!(f, "{}", "=".repeat(60));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fmt_size_thresholds() {
+        assert_eq!(fmt_size(0), "0 B");
+        assert_eq!(fmt_size(512), "512 B");
+        assert_eq!(fmt_size(1_500), "1.5 KB");
+        assert_eq!(fmt_size(2_000_000), "2.0 MB");
+        assert_eq!(fmt_size(3_000_000_000), "3.0 GB");
+    }
+
+    #[test]
+    fn fmt_date_pads() {
+        assert_eq!(fmt_date(20260724), "2026-07-24");
+        assert_eq!(fmt_date(20260101), "2026-01-01");
+    }
+
+    #[test]
+    fn compute_growth_basic() {
+        // Steady increase: abs = last - first, pct relative to first.
+        let g = compute_growth(&[1000, 3000, 8000]);
+        assert_eq!(g.abs, 7000);
+        assert_eq!(g.pct, Some(700.0));
+        assert_eq!(g.trend, "^");
+
+        // Steady decrease.
+        let g = compute_growth(&[9000, 6000, 2000]);
+        assert_eq!(g.abs, -7000);
+        assert_eq!(g.trend, "v");
+
+        // Single point: no growth.
+        let g = compute_growth(&[500]);
+        assert_eq!(g.abs, 0);
+        assert!(g.pct.is_none());
+        assert_eq!(g.trend, "-");
+    }
+
+    #[test]
+    fn compute_growth_zero_baseline_uses_first_nonzero() {
+        // Leading zeros: baseline is the first non-zero value (2000).
+        let g = compute_growth(&[0, 2000, 4000]);
+        assert_eq!(g.abs, 4000 - 2000);
+        assert_eq!(g.pct, Some(100.0));
+    }
+
+    #[test]
+    fn trend_indicator_rules() {
+        assert_eq!(trend_indicator(&[1, 2]), "-");            // <3 points
+        assert_eq!(trend_indicator(&[5, 5, 5]), "-");         // stable
+        assert_eq!(trend_indicator(&[1, 2, 3, 4]), "^");      // all up
+        assert_eq!(trend_indicator(&[4, 3, 2, 1]), "v");      // all down
+        assert_eq!(trend_indicator(&[1, 5, 2, 6]), "~");      // fluctuating
+    }
+
+    #[test]
+    fn parse_team_specs_basic_and_errors() {
+        let specs = parse_team_specs(&["dev=alice,bob".into(), "ops=carol".into()]).unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name, "dev");
+        assert_eq!(specs[0].users, vec!["alice".to_string(), "bob".to_string()]);
+        assert_eq!(specs[1].users, vec!["carol".to_string()]);
+
+        // Team with no users is allowed (empty user list).
+        let specs = parse_team_specs(&["empty".into()]).unwrap();
+        assert!(specs[0].users.is_empty());
+
+        // Duplicate team name is rejected.
+        assert!(parse_team_specs(&["dev=a".into(), "dev=b".into()]).is_err());
+        // Empty team name is rejected.
+        assert!(parse_team_specs(&["=a".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_team_specs_dedups_users() {
+        let specs = parse_team_specs(&["dev=alice,alice,bob".into()]).unwrap();
+        assert_eq!(specs[0].users, vec!["alice".to_string(), "bob".to_string()]);
+    }
 }

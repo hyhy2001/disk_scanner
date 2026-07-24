@@ -526,3 +526,102 @@ impl Config {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A TargetFile round-trips through target_from_file -> target_to_file with
+    /// team_ids assigned internally and users grouped back under their team.
+    #[test]
+    fn target_file_roundtrip_assigns_and_groups() {
+        let tf = TargetFile {
+            name: "backend".into(),
+            path: "/data/backend".into(),
+            teams: vec![
+                TeamFile { name: "dev".into(), users: vec!["alice".into(), "bob".into()] },
+                TeamFile { name: "ops".into(), users: vec!["carol".into()] },
+            ],
+            end_scan: Some("20270101".into()),
+            purge_time: Some(90),
+            tree_map: Some(true),
+            level: Some(4),
+            workers: None,
+            sync_host: Some("h".into()),
+            sync_dest_dir: None,
+            sync_user: None,
+            export_dir: Some("exp".into()),
+            webhook_url: Some("https://x/hook".into()),
+            sync_pass: Some(true),
+        };
+        let t = target_from_file(tf);
+        // team_ids assigned sequentially from 1; users attached to their team.
+        assert_eq!(t.teams.len(), 2);
+        assert_eq!(t.teams[0].team_id, 1);
+        assert_eq!(t.teams[1].team_id, 2);
+        let alice = t.users.iter().find(|u| u.name == "alice").unwrap();
+        assert_eq!(alice.team_id, 1);
+        let carol = t.users.iter().find(|u| u.name == "carol").unwrap();
+        assert_eq!(carol.team_id, 2);
+
+        // Collapse back: users regrouped under their team by team_id, fields kept.
+        let back = target_to_file(&t);
+        assert_eq!(back.name, "backend");
+        assert_eq!(back.teams.len(), 2);
+        assert_eq!(back.teams[0].users, vec!["alice".to_string(), "bob".to_string()]);
+        assert_eq!(back.teams[1].users, vec!["carol".to_string()]);
+        assert_eq!(back.tree_map, Some(true));
+        assert_eq!(back.level, Some(4));
+        assert_eq!(back.export_dir.as_deref(), Some("exp"));
+        assert_eq!(back.webhook_url.as_deref(), Some("https://x/hook"));
+        assert_eq!(back.sync_pass, Some(true));
+    }
+
+    /// sanitize_stem neutralizes path separators, dots, and control chars so a
+    /// target name can never escape the targets/ dir.
+    #[test]
+    fn sanitize_stem_blocks_traversal() {
+        assert_eq!(sanitize_stem("normal"), "normal");
+        assert_eq!(sanitize_stem("a/b"), "a_b");
+        assert_eq!(sanitize_stem("../etc"), "___etc");
+        assert_eq!(sanitize_stem("a\\b"), "a_b");
+        assert_eq!(sanitize_stem("with.dot"), "with_dot");
+    }
+
+    /// Replace (merge=false) makes teams/users exactly the spec; Merge (true)
+    /// adds without dropping existing.
+    #[test]
+    fn upsert_replace_vs_merge() {
+        let mut cfg = Config::default();
+        cfg.upsert_target_full(&TargetSpec {
+            name: "t".into(), path: "/p".into(),
+            teams: vec![TeamSpec { name: "dev".into(), users: vec!["alice".into()] }],
+            end_scan: None, purge_time: None,
+        }, false);
+        assert_eq!(cfg.targets[0].users.len(), 1);
+
+        // Merge: add ops+bob, keep dev+alice.
+        cfg.upsert_target_full(&TargetSpec {
+            name: "t".into(), path: "/p".into(),
+            teams: vec![TeamSpec { name: "ops".into(), users: vec!["bob".into()] }],
+            end_scan: None, purge_time: None,
+        }, true);
+        let t = &cfg.targets[0];
+        assert_eq!(t.teams.len(), 2);
+        assert!(t.users.iter().any(|u| u.name == "alice"));
+        assert!(t.users.iter().any(|u| u.name == "bob"));
+
+        // Replace: only frontend/carol remains.
+        cfg.upsert_target_full(&TargetSpec {
+            name: "t".into(), path: "/p2".into(),
+            teams: vec![TeamSpec { name: "frontend".into(), users: vec!["carol".into()] }],
+            end_scan: None, purge_time: None,
+        }, false);
+        let t = &cfg.targets[0];
+        assert_eq!(t.path, "/p2");
+        assert_eq!(t.teams.len(), 1);
+        assert_eq!(t.teams[0].name, "frontend");
+        assert_eq!(t.users.len(), 1);
+        assert_eq!(t.users[0].name, "carol");
+    }
+}

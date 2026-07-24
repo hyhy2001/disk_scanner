@@ -33,6 +33,8 @@ enum Tab {
 enum OutputView {
     History,
     Detail,
+    Permission,
+    Inode,
     Treemap,
 }
 
@@ -548,6 +550,8 @@ fn browse_output(app: &mut App, key: event::KeyEvent) {
         // Switch sub-view.
         KeyCode::Char('h') => { app.output_view = OutputView::History; app.hist_sel = 0; return; }
         KeyCode::Char('d') => { app.output_view = OutputView::Detail; app.detail_sel = 0; return; }
+        KeyCode::Char('p') => { app.output_view = OutputView::Permission; app.detail_sel = 0; return; }
+        KeyCode::Char('i') => { app.output_view = OutputView::Inode; app.detail_sel = 0; return; }
         KeyCode::Char('t') => { app.output_view = OutputView::Treemap; reset_treemap(app); return; }
         _ => {}
     }
@@ -560,21 +564,22 @@ fn browse_output(app: &mut App, key: event::KeyEvent) {
                 _ => {}
             }
         }
-        OutputView::Detail => {
+        // Detail / Permission / Inode all navigate the same report.db user list.
+        OutputView::Detail | OutputView::Permission | OutputView::Inode => {
             // Users come from report.db (every scanned uid, incl. "Other"), not config.
             let report_users = current_report_users(app);
             let nusers = report_users.len();
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => { if app.detail_sel > 0 { app.detail_sel -= 1; } }
                 KeyCode::Down | KeyCode::Char('j') => { if app.detail_sel + 1 < nusers { app.detail_sel += 1; } }
-                // Export usage txt: `x` selected user, `X` all users of this target.
-                KeyCode::Char('x') => {
+                // Export usage txt (Detail only): `x` selected user, `X` all users.
+                KeyCode::Char('x') if matches!(app.output_view, OutputView::Detail) => {
                     match report_users.get(app.detail_sel) {
                         Some(u) => { let name = u.username.clone(); export_from_output(app, Some(&name)); }
                         None => app.status = "No user selected to export.".into(),
                     }
                 }
-                KeyCode::Char('X') => export_from_output(app, None),
+                KeyCode::Char('X') if matches!(app.output_view, OutputView::Detail) => export_from_output(app, None),
                 _ => {}
             }
         }
@@ -920,9 +925,11 @@ fn footer_hint(app: &App) -> &'static str {
             Tab::TeamsUsers => "[ ] target · ↑↓ team · ←→ user · a add-team · d del-team · u add-users · x del-user · r/R scan · q quit",
             Tab::ScanSync => "[ ] target · ↑↓ move · Enter/e edit · r scan this · R scan-all · ↹ tab · q quit",
             Tab::Output => match app.output_view {
-                OutputView::History => "[ ] target · h/d/t view · ↑↓ scroll · r/R scan · ↹ tab · q quit",
-                OutputView::Detail => "[ ] target · h/d/t view · ↑↓ user · x export · X export-all · r/R scan · ↹ tab · q quit",
-                OutputView::Treemap => "[ ] target · h/d/t view · ↑↓ move · Enter open · Bksp up · r/R scan · q quit",
+                OutputView::History => "[ ] target · h/d/p/i/t view · ↑↓ scroll · r/R scan · ↹ tab · q quit",
+                OutputView::Detail => "[ ] target · h/d/p/i/t view · ↑↓ user · x export · X export-all · r/R scan · q quit",
+                OutputView::Permission => "[ ] target · h/d/p/i/t view · ↑↓ user · perm issues · r/R scan · ↹ tab · q quit",
+                OutputView::Inode => "[ ] target · h/d/p/i/t view · ↑↓ user · file counts · r/R scan · ↹ tab · q quit",
+                OutputView::Treemap => "[ ] target · h/d/p/i/t view · ↑↓ move · Enter open · Bksp up · r/R scan · q quit",
             },
             Tab::Settings => "↑↓ move · Enter/e edit · r/R scan · ↹ tab · q quit",
         },
@@ -1061,6 +1068,8 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(format!("target: {}  ", tname), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
         vlabel(OutputView::History, "h History"), Span::raw(" "),
         vlabel(OutputView::Detail, "d Detail"), Span::raw(" "),
+        vlabel(OutputView::Permission, "p Perm"), Span::raw(" "),
+        vlabel(OutputView::Inode, "i Inode"), Span::raw(" "),
         vlabel(OutputView::Treemap, "t Treemap"),
     ]));
     frame.render_widget(bar, rows[0]);
@@ -1068,6 +1077,8 @@ fn draw_output(frame: &mut Frame, app: &App, area: Rect) {
     match app.output_view {
         OutputView::History => draw_out_history(frame, app, rows[1]),
         OutputView::Detail => draw_out_detail(frame, app, rows[1]),
+        OutputView::Permission => draw_out_permission(frame, app, rows[1]),
+        OutputView::Inode => draw_out_inode(frame, app, rows[1]),
         OutputView::Treemap => draw_out_treemap(frame, app, rows[1]),
     }
 }
@@ -1166,6 +1177,97 @@ fn draw_out_detail(frame: &mut Frame, app: &App, area: Rect) {
         }
         None => empty_state(frame, cols[1], "Detail", &[&format!("No data for user '{}'.", uname), "This user may have no files in the last scan."]),
     }
+}
+
+/// Render the shared left-hand user column (team users then "Other") used by the
+/// Detail / Permission / Inode views. Returns the two-column split plus the
+/// resolved list of users, so the caller fills the right pane for the selected
+/// user. `None` when there is no report / no user data (an empty state is drawn).
+fn draw_user_column<'a>(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    view_title: &str,
+    users: &'a [crate::ReportUser],
+) -> Option<(std::rc::Rc<[Rect]>, &'a str)> {
+    if users.is_empty() {
+        empty_state(frame, area, view_title, &["No user data in this report.", "Press r to scan this target."]);
+        return None;
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(24), Constraint::Min(0)])
+        .split(area);
+    let uitems: Vec<ListItem> = users.iter().map(|u| {
+        if u.has_team { ListItem::new(u.username.clone()) }
+        else { ListItem::new(Span::styled(format!("{}  (Other)", u.username), Style::default().fg(Color::DarkGray))) }
+    }).collect();
+    let nteam = users.iter().filter(|u| u.has_team).count();
+    let nother = users.len() - nteam;
+    let title = if nother > 0 { format!(" Users ({} team, {} other) ", nteam, nother) }
+                else { format!(" Users ({}) ", nteam) };
+    let ulist = List::new(uitems)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(selected_style());
+    let sel = app.detail_sel.min(users.len() - 1);
+    let mut us = ListState::default();
+    us.select(Some(sel));
+    frame.render_stateful_widget(ulist, cols[0], &mut us);
+    Some((cols, users[sel].username.as_str()))
+}
+
+fn draw_out_permission(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(db) = current_report_db(app) else {
+        empty_state(frame, area, "Permission", &["No report yet.", "Press r to scan this target first."]);
+        return;
+    };
+    let users = crate::query_report_users(&db);
+    let Some((cols, uname)) = draw_user_column(frame, app, area, "Permission", &users) else { return };
+
+    let (total, issues) = crate::query_user_permissions(&db, uname, 200);
+    if total == 0 {
+        empty_state(frame, cols[1], "Permission",
+            &[&format!("No permission issues for '{}'.", uname), "The scan hit no unreadable paths for this user."]);
+        return;
+    }
+    let mut lines = vec![
+        Line::from(Span::styled(format!("{}  —  {} permission issue(s)", uname, total),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(format!("{:<8}  {:<20}  {}", "Type", "Error", "Path"), Style::default().fg(Color::Yellow))),
+    ];
+    for i in issues.iter() {
+        lines.push(Line::from(format!("{:<8}  {:<20}  {}", i.item_type, i.error, i.path)));
+    }
+    let para = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(format!(" Permission — {} ", uname)));
+    frame.render_widget(para, cols[1]);
+}
+
+fn draw_out_inode(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(db) = current_report_db(app) else {
+        empty_state(frame, area, "Inode", &["No report yet.", "Press r to scan this target first."]);
+        return;
+    };
+    let users = crate::query_report_users(&db);
+    let Some((cols, uname)) = draw_user_column(frame, app, area, "Inode", &users) else { return };
+
+    let (total_files, total_dirs, dirs) = crate::query_user_inode(&db, uname, 100);
+    if dirs.is_empty() {
+        empty_state(frame, cols[1], "Inode",
+            &[&format!("No directory data for '{}'.", uname), "This user may have no files in the last scan."]);
+        return;
+    }
+    let mut lines = vec![
+        Line::from(Span::styled(format!("{}  —  {} files in {} dirs", uname, total_files, total_dirs),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(format!("{:>9}  {:>9}  {}", "Files", "Size", "Directory"), Style::default().fg(Color::Yellow))),
+    ];
+    for d in dirs.iter() {
+        lines.push(Line::from(format!("{:>9}  {:>9}  {}", d.files, fmt_size(d.size), d.path)));
+    }
+    let para = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(format!(" Inode / file count — {} ", uname)));
+    frame.render_widget(para, cols[1]);
 }
 
 fn draw_out_treemap(frame: &mut Frame, app: &App, area: Rect) {

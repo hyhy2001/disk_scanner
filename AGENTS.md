@@ -29,10 +29,12 @@ TUI hands the screen to the scan monitor, then returns when the scan finishes.
 `sync_host` is set, that target's output is rsync'd to the remote automatically
 after each scan. These are also stored in `targets/<name>.toml`.
 
-**Output tab** — view a target's scan results without leaving the TUI. Three
-sub-views switched with `h`/`d`/`t`: **History** (per-day usage snapshots + top
-users), **Detail** (pick a user → totals + top dirs/files; `x` exports the
-selected user's usage txt, `X` exports every user), and **Treemap** (an
+**Output tab** — view a target's scan results without leaving the TUI. Five
+sub-views switched with `h`/`d`/`p`/`i`/`t`: **History** (per-day usage snapshots
++ top users), **Detail** (pick a user → totals + top dirs/files; `x` exports the
+selected user's usage txt, `X` exports every user), **Perm** (`p` — the selected
+user's permission issues: Type/Error/Path), **Inode** (`i` — the user's per-dir
+file-count breakdown, sorted by file count), and **Treemap** (an
 ncdu-style directory browser: `↑↓` move, `Enter` descend into a sub-directory,
 `Backspace` go up, sized bars per entry). `[`/`]` switch target. Reads each
 target's `report.db`; empty states point you to press `r` to scan first.
