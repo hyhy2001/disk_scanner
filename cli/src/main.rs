@@ -28,6 +28,9 @@ enum Command {
         level: usize,
         #[arg(long)]
         target: Vec<String>,
+        /// Emit core Phase 2/3 profiling + RSS diagnostics to the per-scan log.
+        #[arg(long)]
+        debug: bool,
     },
     List {
         #[arg(long)]
@@ -124,6 +127,9 @@ enum Command {
         dest_dir: String,
         #[arg(long)]
         user: Option<String>,
+        /// Use password auth via `sshpass -e` (reads password from SSHPASS env).
+        #[arg(long)]
+        pass: bool,
     },
     /// Show per-day usage history from report.db (hist_* tables).
     History {
@@ -469,8 +475,8 @@ fn main() {
                 }
             }
         }
-        Command::Run { output_dir, tree_map, workers, level, target } => {
-            run_scan(&mut cfg, output_dir.clone(), *tree_map, *workers, *level, target);
+        Command::Run { output_dir, tree_map, workers, level, target, debug } => {
+            run_scan(&mut cfg, output_dir.clone(), *tree_map, *workers, *level, target, *debug);
         }
         Command::Detail { user, output_dir, top, target, json, section, search } => {
             let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
@@ -637,9 +643,9 @@ fn main() {
             }
             if sent == 0 { eprintln!("No report.db found to notify under '{}'", out); }
         }
-        Command::Sync { output_dir, host, dest_dir, user } => {
+        Command::Sync { output_dir, host, dest_dir, user, pass } => {
             let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
-            match run_rsync(&out, host, dest_dir, user.as_deref()) {
+            match run_rsync(&out, host, dest_dir, user.as_deref(), *pass) {
                 Ok(remote) => println!("Synced '{}' -> {}", out, remote),
                 Err(e) => eprintln!("{}", e),
             }
@@ -1143,19 +1149,38 @@ pub fn read_user_list(path: &str) -> Result<Vec<String>, String> {
 /// the remote spec on success. Shared by the `sync` command and per-target
 /// auto-sync after a scan. `src_dir` is synced as its own contents (trailing
 /// slash), mirrored with --delete.
-pub fn run_rsync(src_dir: &str, host: &str, dest_dir: &str, user: Option<&str>) -> Result<String, String> {
+/// rsync a directory to a remote host over SSH. With `use_pass = false` (default)
+/// SSH runs in BatchMode (key auth, no prompts). With `use_pass = true` the rsync
+/// is wrapped in `sshpass -e`, which reads the password from the `SSHPASS` env
+/// var — the password is never passed on the command line or stored in config.
+/// Returns the resolved `user@host:dest` on success.
+pub fn run_rsync(src_dir: &str, host: &str, dest_dir: &str, user: Option<&str>, use_pass: bool) -> Result<String, String> {
     let remote = match user {
         Some(u) => format!("{}@{}:{}", u, host, dest_dir),
         None => format!("{}:{}", host, dest_dir),
     };
     let src = format!("{}/", src_dir.trim_end_matches('/'));
-    let status = std::process::Command::new("rsync")
-        .args(["-az", "--delete", "-e", "ssh -o BatchMode=yes", &src, &remote])
-        .status();
+    let status = if use_pass {
+        if std::env::var_os("SSHPASS").is_none() {
+            return Err("sync_pass is set but the SSHPASS env var is empty — export SSHPASS=<password> before running".into());
+        }
+        // sshpass -e rsync ... -e "ssh" : password auth, allow first-connect host key.
+        std::process::Command::new("sshpass")
+            .args(["-e", "rsync", "-az", "--delete", "-e",
+                   "ssh -o StrictHostKeyChecking=accept-new", &src, &remote])
+            .status()
+    } else {
+        std::process::Command::new("rsync")
+            .args(["-az", "--delete", "-e", "ssh -o BatchMode=yes", &src, &remote])
+            .status()
+    };
     match status {
         Ok(s) if s.success() => Ok(remote),
         Ok(s) => Err(format!("rsync exited with {}", s)),
-        Err(e) => Err(format!("rsync failed to start: {} (is rsync installed?)", e)),
+        Err(e) => Err(format!(
+            "{} failed to start: {} (is {} installed?)",
+            if use_pass { "sshpass" } else { "rsync" }, e,
+            if use_pass { "sshpass" } else { "rsync" })),
     }
 }
 
@@ -1227,6 +1252,8 @@ struct ViewJob {
     sync_host: Option<String>,
     sync_dest_dir: Option<String>,
     sync_user: Option<String>,
+    sync_pass: Option<bool>,
+    webhook_url: Option<String>,
 }
 
 /// Live per-view progress sink shared between a worker thread and the TUI.
@@ -1252,6 +1279,7 @@ fn run_scan(
     workers: Option<usize>,
     level: usize,
     target: &[String],
+    debug: bool,
 ) {
     let out = output_dir.unwrap_or(cfg.output_dir.clone());
     let budget = workers.unwrap_or_else(|| {
@@ -1306,6 +1334,8 @@ fn run_scan(
                     sync_host: view.sync_host.clone(),
                     sync_dest_dir: view.sync_dest_dir.clone(),
                     sync_user: view.sync_user.clone(),
+                    sync_pass: view.sync_pass,
+                    webhook_url: view.webhook_url.clone(),
                 });
             }
         }
@@ -1327,7 +1357,7 @@ fn run_scan(
 
     let max_parallel_devices = cfg.max_parallel_devices.max(0) as usize;
     std::fs::create_dir_all(&out).ok();
-    run_scan_tui(&out, tree_map, level, max_parallel_devices, group_jobs, view_names);
+    run_scan_tui(&out, tree_map, level, max_parallel_devices, group_jobs, view_names, debug);
 }
 
 /// RAII guard that owns the terminal for the TUI. It renders to `/dev/tty`
@@ -1429,6 +1459,7 @@ fn run_scan_tui(
     max_parallel_devices: usize,
     group_jobs: Vec<(usize, Vec<ViewJob>)>,
     view_names: Vec<String>,
+    debug: bool,
 ) {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
@@ -1493,7 +1524,7 @@ fn run_scan_tui(
                     Some(s) => s.clone(),
                     None => continue,
                 };
-                scan_one_view(&out, tree_map, level, group_workers, &job, &sink, &build_lock);
+                scan_one_view(&out, tree_map, level, group_workers, &job, &sink, &build_lock, debug);
                 sink.finished.store(true, Ordering::SeqCst);
             }
             // Release the device permit.
@@ -1623,6 +1654,7 @@ fn scan_one_view(
     job: &ViewJob,
     sink: &ViewProgress,
     build_lock: &std::sync::Arc<std::sync::Mutex<()>>,
+    debug: bool,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -1651,7 +1683,7 @@ fn scan_one_view(
     // Phase 1 — hand the engine our shared progress sink so the TUI sees live counts.
     let progress = sink.scan.clone();
     let phase1 = check_disk_core::scan_core::run_scan_core(
-        dir_str.clone(), vec![], None, Some(workers), false, "cli", None, Some(progress),
+        dir_str.clone(), vec![], None, Some(workers), debug, "cli", None, Some(progress),
     );
     // Ensure the done flag is set regardless of engine internals.
     sink.scan.done.store(true, Ordering::SeqCst);
@@ -1789,12 +1821,23 @@ fn scan_one_view(
             if let Some(dest) = job.sync_dest_dir.as_deref() {
                 set_phase("syncing");
                 let src = out_path.to_string_lossy().to_string();
-                match run_rsync(&src, host, dest, job.sync_user.as_deref()) {
+                let use_pass = job.sync_pass.unwrap_or(false);
+                match run_rsync(&src, host, dest, job.sync_user.as_deref(), use_pass) {
                     Ok(remote) => eprintln!("Synced '{}' -> {}", job.name, remote),
                     Err(e) => eprintln!("Sync error for '{}': {}", job.name, e),
                 }
             } else {
                 eprintln!("Sync skipped for '{}': sync_host set but sync_dest_dir missing", job.name);
+            }
+        }
+
+        // Per-target auto-notify: if this target declares a Teams webhook, send a
+        // summary card after merge so a cron `duscan run` notifies on its own.
+        if let Some(url) = job.webhook_url.as_deref() {
+            let db_path = out_path.join("report.db");
+            match send_teams_notification(url, &db_path, &job.name) {
+                Ok(_) => eprintln!("Notified '{}' -> Teams webhook", job.name),
+                Err(e) => eprintln!("Notify error for '{}': {}", job.name, e),
             }
         }
     }

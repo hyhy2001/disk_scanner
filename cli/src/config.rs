@@ -33,6 +33,15 @@ pub struct Target {
     // Per-target export directory for `export` (TUI + CLI); None = "exports".
     #[serde(default)]
     pub export_dir: Option<String>,
+    // Per-target MS Teams webhook: when set, a scan auto-sends a summary card
+    // after merge (so cron `duscan run` notifies without a separate step).
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    // Per-target sync auth: when true, rsync uses `sshpass -e` reading the
+    // password from the SSHPASS env var (no key setup). The password itself is
+    // NEVER stored here — only this opt-in flag.
+    #[serde(default)]
+    pub sync_pass: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +128,10 @@ pub struct TargetFile {
     pub sync_user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_pass: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +201,8 @@ fn target_from_file(tf: TargetFile) -> Target {
         sync_dest_dir: tf.sync_dest_dir,
         sync_user: tf.sync_user,
         export_dir: tf.export_dir,
+        webhook_url: tf.webhook_url,
+        sync_pass: tf.sync_pass,
     }
 }
 
@@ -215,6 +230,8 @@ fn target_to_file(t: &Target) -> TargetFile {
         sync_dest_dir: t.sync_dest_dir.clone(),
         sync_user: t.sync_user.clone(),
         export_dir: t.export_dir.clone(),
+        webhook_url: t.webhook_url.clone(),
+        sync_pass: t.sync_pass,
     }
 }
 

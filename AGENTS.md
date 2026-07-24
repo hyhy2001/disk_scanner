@@ -22,10 +22,12 @@ user, path inputs support `Tab` directory completion, `q`/`Esc` quit.
 TUI hands the screen to the scan monitor, then returns when the scan finishes.
 
 **Scan/Sync tab** — per-target overrides (empty = use the global default):
-`tree_map`, `level`, `workers`, `sync_host`/`sync_dest_dir`/`sync_user`, and
-`export_dir` (destination for the Output/Detail `x`/`X` export; empty = `exports`).
-When `sync_host` is set, that target's output is rsync'd to the remote
-automatically after each scan. These are also stored in `targets/<name>.toml`.
+`tree_map`, `level`, `workers`, `sync_host`/`sync_dest_dir`/`sync_user`,
+`export_dir` (destination for the Output/Detail `x`/`X` export; empty = `exports`),
+`webhook_url` (Teams card auto-sent after each scan), and `sync_pass` (rsync via
+`sshpass -e`, password read from the `SSHPASS` env — never stored). When
+`sync_host` is set, that target's output is rsync'd to the remote automatically
+after each scan. These are also stored in `targets/<name>.toml`.
 
 **Output tab** — view a target's scan results without leaving the TUI. Three
 sub-views switched with `h`/`d`/`t`: **History** (per-day usage snapshots + top
@@ -56,13 +58,16 @@ target's `report.db`; empty states point you to press `r` to scan first.
 ./duscan list [--target <name>] [--team <name>] [--json]
 
 # Scan + read (all reader commands fall back to output_dir from duscan.toml — no need to repeat --output-dir)
-./duscan run [--output-dir DIR] [--tree-map] [--workers N] [--level N] [--target <name>]
+./duscan run [--output-dir DIR] [--tree-map] [--workers N] [--level N] [--target <name>] [--debug]
+#   --debug: emit core Phase 1/2/3 profiling + RSS diagnostics (headless/piped stdout; TUI mode suppresses core stdout)
+#   per-target webhook_url auto-sends a Teams card after each scan (set on Scan/Sync tab) — no separate `notify` step for cron
 ./duscan detail --user <user> [--output-dir DIR] [--top N] [--target <name>] [--json]
 #   --type report (default: top dirs/files by size) | permission (perm_issues, filter with --search KW) | inode (per-dir file counts)
 ./duscan tree-show [--output-dir DIR] [--level N] [--limit N] [--path P] [--search KW] [--target <name>]
 ./duscan export --user <user> [--output-dir DIR] [--export-dir DIR] [--target <name>]   # -> <export-dir>/<target>/usage_dir_<u>.txt + usage_file_<u>.txt
 ./duscan notify --webhook-url URL [--output-dir DIR] [--target <name>]
-./duscan sync --host HOST --dest-dir DIR [--output-dir DIR] [--user USER]
+./duscan sync --host HOST --dest-dir DIR [--output-dir DIR] [--user USER] [--pass]
+#   --pass: password auth via `sshpass -e` (reads password from SSHPASS env; password never stored). Per-target: sync_pass=true.
 ./duscan history [--output-dir DIR] [--target <name>] [--days N] [--json]   # per-day usage trend from report.db hist_* tables
 ./duscan import-legacy --dir <configs_dir> [--force]                        # migrate legacy JSON configs -> duscan.toml
 ```
