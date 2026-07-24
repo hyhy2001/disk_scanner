@@ -1,4 +1,5 @@
 mod config;
+mod config_tui;
 mod scheduler;
 mod ui;
 
@@ -9,8 +10,9 @@ use scheduler::build_scan_plan;
 #[derive(Parser)]
 #[command(name = "duscan", version = "0.1.0")]
 struct Cli {
+    /// No subcommand → open the interactive config TUI.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(clap::Subcommand)]
@@ -330,7 +332,19 @@ fn main() {
     let cli = Cli::parse();
     let mut cfg = Config::load();
 
-    match &cli.command {
+    // No subcommand: launch the interactive config TUI.
+    let command = match &cli.command {
+        Some(c) => c,
+        None => {
+            if let Err(e) = config_tui::run(cfg) {
+                eprintln!("config TUI error: {}", e);
+                std::process::exit(1);
+            }
+            return;
+        }
+    };
+
+    match command {
         Command::AddTarget { name, path, end_scan, purge_time } => {
             match cfg.add_target(name, path, end_scan.clone(), *purge_time) {
                 Ok(()) => println!("Added target '{}' -> {}", name, path),
@@ -808,7 +822,7 @@ fn query_top(conn: &rusqlite::Connection, sql: &str, uid: i64, top: usize) -> Ve
 /// deserialize each one and collect them. Returns the written config path.
 /// Parse repeated `--team NAME=user1,user2` args into TeamSpecs. `NAME` alone
 /// (no `=`) is a team with no users. Empty user tokens are skipped.
-fn parse_team_specs(raw: &[String]) -> Result<Vec<config::TeamSpec>, String> {
+pub fn parse_team_specs(raw: &[String]) -> Result<Vec<config::TeamSpec>, String> {
     let mut specs: Vec<config::TeamSpec> = Vec::new();
     for item in raw {
         let (name, users_str) = match item.split_once('=') {
@@ -844,7 +858,7 @@ fn parse_team_specs(raw: &[String]) -> Result<Vec<config::TeamSpec>, String> {
 /// Read a username list from a text file: usernames are separated by any of
 /// newline, comma, or whitespace; blank lines and `#` comments are ignored.
 /// Used by `--team NAME=@file` so large teams don't have to be typed inline.
-fn read_user_list(path: &str) -> Result<Vec<String>, String> {
+pub fn read_user_list(path: &str) -> Result<Vec<String>, String> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("read user list '{}': {}", path, e))?;
     let mut out: Vec<String> = Vec::new();
