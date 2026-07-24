@@ -11,21 +11,46 @@ make clean
 ## Usage
 
 ```bash
-# Config CRUD
+# Config — one-shot (preferred): create/update a target with teams+users in one command
+./duscan set-target <name> <path> --team dev=alice,bob --team ops=carol [--end-scan YYYYMMDD] [--purge-time DAYS] [--merge]
+#   replace by default (config = the declaration); --merge adds without removing
+
+# Config — declarative file (targets.toml or .json with [[targets]] + teams{name,users})
+./duscan apply <file> [--dry-run] [--merge]   # file is source of truth; --dry-run shows the diff
+
+# Config — granular CRUD (still supported)
 ./duscan add-target <name> <path> [--end-scan YYYYMMDD] [--purge-time DAYS]
 ./duscan remove-target <name>
 ./duscan add-team <name> --target <target>
 ./duscan add-user <user> [user...] --team <team> --target <target>
 ./duscan remove-user <user> [user...] --target <target>
 ./duscan list [--target <name>] [--team <name>] [--json]
+
+# Scan + read (all reader commands fall back to output_dir from duscan.toml — no need to repeat --output-dir)
 ./duscan run [--output-dir DIR] [--tree-map] [--workers N] [--level N] [--target <name>]
-./duscan detail --user <user> --output-dir DIR [--top N] [--target <name>] [--json]
-./duscan tree-show --output-dir DIR [--level N] [--limit N] [--path P] [--search KW] [--target <name>]
-./duscan export --user <user> --output-dir DIR [--export-dir DIR] [--target <name>]   # -> <export-dir>/<target>/usage_dir_<u>.txt + usage_file_<u>.txt
-./duscan notify --webhook-url URL --output-dir DIR [--target <name>]
-./duscan sync --host HOST --dest-dir DIR --output-dir DIR [--user USER]
-./duscan history --output-dir DIR [--target <name>] [--days N] [--json]   # per-day usage trend from report.db hist_* tables
-./duscan import-legacy --dir <configs_dir> [--force]                      # migrate legacy JSON configs -> duscan.toml
+./duscan detail --user <user> [--output-dir DIR] [--top N] [--target <name>] [--json]
+./duscan tree-show [--output-dir DIR] [--level N] [--limit N] [--path P] [--search KW] [--target <name>]
+./duscan export --user <user> [--output-dir DIR] [--export-dir DIR] [--target <name>]   # -> <export-dir>/<target>/usage_dir_<u>.txt + usage_file_<u>.txt
+./duscan notify --webhook-url URL [--output-dir DIR] [--target <name>]
+./duscan sync --host HOST --dest-dir DIR [--output-dir DIR] [--user USER]
+./duscan history [--output-dir DIR] [--target <name>] [--days N] [--json]   # per-day usage trend from report.db hist_* tables
+./duscan import-legacy --dir <configs_dir> [--force]                        # migrate legacy JSON configs -> duscan.toml
+```
+
+Example `targets.toml` for `apply`:
+
+```toml
+[[targets]]
+name = "backend"
+path = "/data/backend"
+end_scan = "20270101"
+purge_time = 90
+  [[targets.teams]]
+  name = "dev"
+  users = ["alice", "bob"]
+  [[targets.teams]]
+  name = "ops"
+  users = ["carol"]
 ```
 
 Config file: `duscan.toml` (TOML, auto-created next to binary or in current dir).

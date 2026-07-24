@@ -43,6 +43,22 @@ enum Command {
         #[arg(long)]
         purge_time: Option<i64>,
     },
+    /// Create or update a target with its teams and users in one shot.
+    /// Repeat --team NAME=user1,user2 per team (empty user list allowed: --team NAME).
+    SetTarget {
+        name: String,
+        path: String,
+        /// team spec: "teamname=user1,user2" (repeatable)
+        #[arg(long = "team")]
+        teams: Vec<String>,
+        #[arg(long)]
+        end_scan: Option<String>,
+        #[arg(long)]
+        purge_time: Option<i64>,
+        /// Merge into existing teams/users instead of replacing them.
+        #[arg(long)]
+        merge: bool,
+    },
     RemoveTarget { name: String },
     AddTeam { name: String, #[arg(long)] target: String },
     AddUser { users: Vec<String>, #[arg(long)] team: String, #[arg(long)] target: String },
@@ -114,6 +130,44 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Apply a declarative targets file (.toml/.json) to the config.
+    /// By default the file is the source of truth (targets not listed are removed);
+    /// use --merge to only add/update. --dry-run prints the diff without writing.
+    Apply {
+        /// Path to a declarative targets file (.toml or .json).
+        file: String,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        merge: bool,
+    },
+}
+
+/// Declarative file schema for `apply`. Ergonomic shape: teams carry their
+/// member usernames directly (team_ids are assigned internally).
+#[derive(serde::Deserialize)]
+struct ApplyFile {
+    #[serde(default)]
+    targets: Vec<ApplyTarget>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApplyTarget {
+    name: String,
+    path: String,
+    #[serde(default)]
+    teams: Vec<ApplyTeam>,
+    #[serde(default)]
+    end_scan: Option<String>,
+    #[serde(default)]
+    purge_time: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+struct ApplyTeam {
+    name: String,
+    #[serde(default)]
+    users: Vec<String>,
 }
 
 fn fmt_size(sz: i64) -> String {
@@ -280,6 +334,32 @@ fn main() {
                 Err(e) => eprintln!("Error: {}", e),
             }
         }
+        Command::SetTarget { name, path, teams, end_scan, purge_time, merge } => {
+            match parse_team_specs(teams) {
+                Ok(team_specs) => {
+                    let existed = cfg.find_target(name).is_some();
+                    let spec = config::TargetSpec {
+                        name: name.clone(),
+                        path: path.clone(),
+                        teams: team_specs,
+                        end_scan: end_scan.clone(),
+                        purge_time: *purge_time,
+                    };
+                    cfg.upsert_target_full(&spec, *merge);
+                    match cfg.save() {
+                        Ok(()) => {
+                            let verb = if existed { "Updated" } else { "Created" };
+                            let nusers: usize = spec.teams.iter().map(|t| t.users.len()).sum();
+                            println!("{} target '{}' -> {} ({} teams, {} users, {})",
+                                verb, name, path, spec.teams.len(), nusers,
+                                if *merge { "merge" } else { "replace" });
+                        }
+                        Err(e) => eprintln!("Error: {}", e),
+                    }
+                }
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        }
         Command::RemoveTarget { name } => {
             match cfg.remove_target(name) {
                 Ok(()) => println!("Removed target '{}'", name),
@@ -366,7 +446,7 @@ fn main() {
             run_scan(&mut cfg, output_dir.clone(), *tree_map, *workers, *level, target);
         }
         Command::Detail { user, output_dir, top, target, json } => {
-            let out = output_dir.clone().unwrap_or_else(|| "reports".into());
+            let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
             let mut json_out: Vec<serde_json::Value> = Vec::new();
             for username in user {
                 let mut found = false;
@@ -426,7 +506,7 @@ fn main() {
             }
         }
         Command::TreeShow { output_dir, level, limit, path, search, target } => {
-            let out = output_dir.clone().unwrap_or_else(|| "reports".into());
+            let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
             if let Ok(entries) = std::fs::read_dir(&out) {
                 for entry in entries.flatten() {
                     let dir_path = entry.path();
@@ -465,7 +545,7 @@ fn main() {
             }
         }
         Command::Export { user, output_dir, export_dir, target } => {
-            let out = output_dir.clone().unwrap_or_else(|| "reports".into());
+            let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
             let exp = export_dir.clone().unwrap_or_else(|| "exports".into());
             std::fs::create_dir_all(&exp).ok();
             let want: std::collections::HashSet<&str> = user.iter().map(|s| s.as_str()).collect();
@@ -500,7 +580,7 @@ fn main() {
             }
         }
         Command::Notify { webhook_url, output_dir, target } => {
-            let out = output_dir.clone().unwrap_or_else(|| "reports".into());
+            let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
             let mut sent = 0;
             if let Ok(entries) = std::fs::read_dir(&out) {
                 for entry in entries.flatten() {
@@ -519,7 +599,7 @@ fn main() {
             if sent == 0 { eprintln!("No report.db found to notify under '{}'", out); }
         }
         Command::Sync { output_dir, host, dest_dir, user } => {
-            let out = output_dir.clone().unwrap_or_else(|| "reports".into());
+            let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
             let remote = match user {
                 Some(u) => format!("{}@{}:{}", u, host, dest_dir),
                 None => format!("{}:{}", host, dest_dir),
@@ -535,7 +615,7 @@ fn main() {
             }
         }
         Command::History { output_dir, target, days, json } => {
-            let out = output_dir.clone().unwrap_or_else(|| "reports".into());
+            let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
             show_history(&out, target.as_deref(), *days, *json);
         }
         Command::ImportLegacy { dir, force } => {
@@ -544,7 +624,76 @@ fn main() {
                 Err(e) => eprintln!("Import failed: {}", e),
             }
         }
+        Command::Apply { file, dry_run, merge } => {
+            if let Err(e) = apply_targets_file(&mut cfg, file, *dry_run, *merge) {
+                eprintln!("Apply failed: {}", e);
+            }
+        }
     }
+}
+
+/// Apply a declarative targets file to the config. Replace semantics by default
+/// (targets absent from the file are removed); `merge` only adds/updates.
+/// `dry_run` prints the diff and does not write.
+fn apply_targets_file(cfg: &mut Config, file: &str, dry_run: bool, merge: bool) -> Result<(), String> {
+    let text = std::fs::read_to_string(file).map_err(|e| format!("read {}: {}", file, e))?;
+    let parsed: ApplyFile = if file.ends_with(".json") {
+        serde_json::from_str(&text).map_err(|e| format!("parse JSON: {}", e))?
+    } else {
+        toml::from_str(&text).map_err(|e| format!("parse TOML: {}", e))?
+    };
+    if parsed.targets.is_empty() {
+        return Err("file declares no targets".into());
+    }
+
+    // Compute the diff for reporting.
+    let before: std::collections::HashSet<String> =
+        cfg.targets.iter().map(|t| t.name.clone()).collect();
+    let declared: std::collections::HashSet<String> =
+        parsed.targets.iter().map(|t| t.name.clone()).collect();
+
+    let added: Vec<&String> = declared.iter().filter(|n| !before.contains(*n)).collect();
+    let updated: Vec<&String> = declared.iter().filter(|n| before.contains(*n)).collect();
+    let removed: Vec<&String> = if merge {
+        Vec::new()
+    } else {
+        before.iter().filter(|n| !declared.contains(*n)).collect()
+    };
+
+    println!("Apply {} ({} mode):", file, if merge { "merge" } else { "replace" });
+    for n in &added { println!("  + add    {}", n); }
+    for n in &updated { println!("  ~ update {}", n); }
+    for n in &removed { println!("  - remove {}", n); }
+    if added.is_empty() && updated.is_empty() && removed.is_empty() {
+        println!("  (no changes)");
+    }
+
+    if dry_run {
+        println!("(dry-run: config not written)");
+        return Ok(());
+    }
+
+    // Replace mode: drop targets not present in the file.
+    if !merge {
+        cfg.targets.retain(|t| declared.contains(&t.name));
+    }
+    // Upsert every declared target (single save at the end).
+    for at in &parsed.targets {
+        let spec = config::TargetSpec {
+            name: at.name.clone(),
+            path: at.path.clone(),
+            teams: at.teams.iter().map(|tm| config::TeamSpec {
+                name: tm.name.clone(),
+                users: tm.users.clone(),
+            }).collect(),
+            end_scan: at.end_scan.clone(),
+            purge_time: at.purge_time,
+        };
+        cfg.upsert_target_full(&spec, merge);
+    }
+    cfg.save()?;
+    println!("Applied: {} target(s) now configured.", cfg.targets.len());
+    Ok(())
 }
 
 /// Print per-day usage history from each target's report.db (hist_* tables).
@@ -654,6 +803,32 @@ fn query_top(conn: &rusqlite::Connection, sql: &str, uid: i64, top: usize) -> Ve
 /// `duscan.toml`. Each legacy per-target JSON already matches the new
 /// `Target` shape (name/path/teams/users/end_scan/purge_time), so we just
 /// deserialize each one and collect them. Returns the written config path.
+/// Parse repeated `--team NAME=user1,user2` args into TeamSpecs. `NAME` alone
+/// (no `=`) is a team with no users. Empty user tokens are skipped.
+fn parse_team_specs(raw: &[String]) -> Result<Vec<config::TeamSpec>, String> {
+    let mut specs: Vec<config::TeamSpec> = Vec::new();
+    for item in raw {
+        let (name, users_str) = match item.split_once('=') {
+            Some((n, u)) => (n.trim(), u),
+            None => (item.trim(), ""),
+        };
+        if name.is_empty() {
+            return Err(format!("invalid --team '{}': empty team name", item));
+        }
+        if specs.iter().any(|s: &config::TeamSpec| s.name == name) {
+            return Err(format!("duplicate --team '{}'", name));
+        }
+        let users: Vec<String> = users_str
+            .split(',')
+            .map(|u| u.trim())
+            .filter(|u| !u.is_empty())
+            .map(|u| u.to_string())
+            .collect();
+        specs.push(config::TeamSpec { name: name.to_string(), users });
+    }
+    Ok(specs)
+}
+
 fn import_legacy_config(dir: &str, force: bool) -> Result<std::path::PathBuf, String> {
     let root = std::path::Path::new(dir);
     if !root.is_dir() {

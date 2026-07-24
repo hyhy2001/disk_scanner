@@ -29,6 +29,25 @@ pub struct User {
     pub team_id: i64,
 }
 
+/// A team plus its member usernames — the ergonomic shape used by `set-target`
+/// and `apply` (team_ids are assigned internally, callers never deal with them).
+#[derive(Debug, Clone, Default)]
+pub struct TeamSpec {
+    pub name: String,
+    pub users: Vec<String>,
+}
+
+/// A complete target declaration: everything needed to (re)build one `Target`
+/// in a single operation, so config is written once instead of per-field.
+#[derive(Debug, Clone, Default)]
+pub struct TargetSpec {
+    pub name: String,
+    pub path: String,
+    pub teams: Vec<TeamSpec>,
+    pub end_scan: Option<String>,
+    pub purge_time: Option<i64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_output_dir")]
@@ -176,5 +195,70 @@ impl Config {
             .ok_or_else(|| format!("Target '{}' not found", target_name))?;
         t.users.retain(|u| u.name != username);
         self.save()
+    }
+
+    /// Create or update one target from a complete `TargetSpec` in a single
+    /// operation. Does NOT save — the caller batches `save()` once after all
+    /// upserts, avoiding the "one file write per field" problem.
+    ///
+    /// `merge` controls team/user reconciliation on an existing target:
+    /// - `false` (Replace, default): teams/users become exactly what the spec
+    ///   declares — anything absent from the spec is dropped.
+    /// - `true` (Merge): spec teams/users are added on top; existing teams and
+    ///   users are preserved.
+    ///
+    /// `path`/`end_scan`/`purge_time` are always updated to the spec's values.
+    pub fn upsert_target_full(&mut self, spec: &TargetSpec, merge: bool) {
+        // Build the fresh teams/users the spec declares, assigning team_ids.
+        let mut new_teams: Vec<Team> = Vec::new();
+        let mut new_users: Vec<User> = Vec::new();
+        let mut next_id: i64 = 1;
+        for ts in &spec.teams {
+            let team_id = next_id;
+            next_id += 1;
+            new_teams.push(Team { name: ts.name.clone(), team_id });
+            for uname in &ts.users {
+                if !new_users.iter().any(|u: &User| u.name == *uname) {
+                    new_users.push(User { name: uname.clone(), team_id });
+                }
+            }
+        }
+
+        if let Some(existing) = self.find_target_mut(&spec.name) {
+            existing.path = spec.path.clone();
+            existing.end_scan = spec.end_scan.clone();
+            existing.purge_time = spec.purge_time;
+            if merge {
+                // Add teams that don't already exist (by name), reusing/allocating ids.
+                let mut max_id = existing.teams.iter().map(|t| t.team_id).max().unwrap_or(0);
+                for ts in &spec.teams {
+                    let team_id = match existing.teams.iter().find(|t| t.name == ts.name) {
+                        Some(t) => t.team_id,
+                        None => {
+                            max_id += 1;
+                            existing.teams.push(Team { name: ts.name.clone(), team_id: max_id });
+                            max_id
+                        }
+                    };
+                    for uname in &ts.users {
+                        if !existing.users.iter().any(|u| u.name == *uname) {
+                            existing.users.push(User { name: uname.clone(), team_id });
+                        }
+                    }
+                }
+            } else {
+                existing.teams = new_teams;
+                existing.users = new_users;
+            }
+        } else {
+            self.targets.push(Target {
+                name: spec.name.clone(),
+                path: spec.path.clone(),
+                teams: new_teams,
+                users: new_users,
+                end_scan: spec.end_scan.clone(),
+                purge_time: spec.purge_time,
+            });
+        }
     }
 }
