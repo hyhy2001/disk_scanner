@@ -617,18 +617,9 @@ fn main() {
         }
         Command::Sync { output_dir, host, dest_dir, user } => {
             let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
-            let remote = match user {
-                Some(u) => format!("{}@{}:{}", u, host, dest_dir),
-                None => format!("{}:{}", host, dest_dir),
-            };
-            let src = format!("{}/", out.trim_end_matches('/'));
-            let status = std::process::Command::new("rsync")
-                .args(["-az", "--delete", "-e", "ssh -o BatchMode=yes", &src, &remote])
-                .status();
-            match status {
-                Ok(s) if s.success() => println!("Synced '{}' -> {}", out, remote),
-                Ok(s) => eprintln!("rsync exited with {}", s),
-                Err(e) => eprintln!("rsync failed to start: {} (is rsync installed?)", e),
+            match run_rsync(&out, host, dest_dir, user.as_deref()) {
+                Ok(remote) => println!("Synced '{}' -> {}", out, remote),
+                Err(e) => eprintln!("{}", e),
             }
         }
         Command::History { output_dir, target, days, json } => {
@@ -874,6 +865,26 @@ pub fn read_user_list(path: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+/// rsync a directory to a remote host over SSH (BatchMode, no prompts). Returns
+/// the remote spec on success. Shared by the `sync` command and per-target
+/// auto-sync after a scan. `src_dir` is synced as its own contents (trailing
+/// slash), mirrored with --delete.
+pub fn run_rsync(src_dir: &str, host: &str, dest_dir: &str, user: Option<&str>) -> Result<String, String> {
+    let remote = match user {
+        Some(u) => format!("{}@{}:{}", u, host, dest_dir),
+        None => format!("{}:{}", host, dest_dir),
+    };
+    let src = format!("{}/", src_dir.trim_end_matches('/'));
+    let status = std::process::Command::new("rsync")
+        .args(["-az", "--delete", "-e", "ssh -o BatchMode=yes", &src, &remote])
+        .status();
+    match status {
+        Ok(s) if s.success() => Ok(remote),
+        Ok(s) => Err(format!("rsync exited with {}", s)),
+        Err(e) => Err(format!("rsync failed to start: {} (is rsync installed?)", e)),
+    }
+}
+
 fn import_legacy_config(dir: &str, force: bool) -> Result<std::path::PathBuf, String> {
     let root = std::path::Path::new(dir);
     if !root.is_dir() {
@@ -935,6 +946,13 @@ struct ViewJob {
     team_map: std::collections::HashMap<String, i64>,
     team_names: std::collections::HashMap<i64, String>,
     purge_time: Option<i64>,
+    // Per-target overrides (None = use the scan-wide default) + sync config.
+    tree_map: Option<bool>,
+    level: Option<i64>,
+    workers: Option<i64>,
+    sync_host: Option<String>,
+    sync_dest_dir: Option<String>,
+    sync_user: Option<String>,
 }
 
 /// Live per-view progress sink shared between a worker thread and the TUI.
@@ -1008,6 +1026,12 @@ fn run_scan(
                     team_map: view.team_map.clone(),
                     team_names: view.team_names.clone(),
                     purge_time: view.purge_time,
+                    tree_map: view.tree_map,
+                    level: view.level,
+                    workers: view.workers,
+                    sync_host: view.sync_host.clone(),
+                    sync_dest_dir: view.sync_dest_dir.clone(),
+                    sync_user: view.sync_user.clone(),
                 });
             }
         }
@@ -1319,14 +1343,19 @@ fn run_scan_tui(
 /// writes scan_status.json + a per-scan log. Never redirects stdout.
 fn scan_one_view(
     out: &str,
-    tree_map: bool,
-    level: usize,
+    default_tree_map: bool,
+    default_level: usize,
     group_workers: usize,
     job: &ViewJob,
     sink: &ViewProgress,
     build_lock: &std::sync::Arc<std::sync::Mutex<()>>,
 ) {
     use std::sync::atomic::Ordering;
+
+    // Per-target overrides fall back to the scan-wide defaults when unset.
+    let tree_map = job.tree_map.unwrap_or(default_tree_map);
+    let level = job.level.map(|l| l.max(0) as usize).unwrap_or(default_level);
+    let workers = job.workers.map(|w| w.max(1) as usize).unwrap_or(group_workers);
 
     let set_phase = |p: &str| {
         *sink.phase.lock().unwrap() = p.to_string();
@@ -1348,7 +1377,7 @@ fn scan_one_view(
     // Phase 1 — hand the engine our shared progress sink so the TUI sees live counts.
     let progress = sink.scan.clone();
     let phase1 = check_disk_core::scan_core::run_scan_core(
-        dir_str.clone(), vec![], None, Some(group_workers), false, "cli", None, Some(progress),
+        dir_str.clone(), vec![], None, Some(workers), false, "cli", None, Some(progress),
     );
     // Ensure the done flag is set regardless of engine internals.
     sink.scan.done.store(true, Ordering::SeqCst);
@@ -1477,6 +1506,24 @@ fn scan_one_view(
         result["permission_issues_count"].as_u64().unwrap_or(0),
         total, tree_map, merge_ok, phase2_start.elapsed().as_secs() as i64,
     );
+
+    // Per-target auto-sync: if this target declares a sync host, mirror its own
+    // output dir to the remote after a successful merge. Failures are logged but
+    // don't fail the scan.
+    if merge_ok {
+        if let Some(host) = job.sync_host.as_deref() {
+            if let Some(dest) = job.sync_dest_dir.as_deref() {
+                set_phase("syncing");
+                let src = out_path.to_string_lossy().to_string();
+                match run_rsync(&src, host, dest, job.sync_user.as_deref()) {
+                    Ok(remote) => eprintln!("Synced '{}' -> {}", job.name, remote),
+                    Err(e) => eprintln!("Sync error for '{}': {}", job.name, e),
+                }
+            } else {
+                eprintln!("Sync skipped for '{}': sync_host set but sync_dest_dir missing", job.name);
+            }
+        }
+    }
 
     set_phase("done");
     write_scan_status(&target_out, "done", false, run_started, timestamp, "Scan complete", "", tree_map);

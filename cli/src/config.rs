@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Target {
     pub name: String,
     pub path: String,
@@ -15,6 +15,21 @@ pub struct Target {
     pub end_scan: Option<String>,
     #[serde(default)]
     pub purge_time: Option<i64>,
+    // Per-target scan overrides; None = fall back to the global default.
+    #[serde(default)]
+    pub tree_map: Option<bool>,
+    #[serde(default)]
+    pub level: Option<i64>,
+    #[serde(default)]
+    pub workers: Option<i64>,
+    // Per-target sync target; when sync_host is set the scan auto-syncs this
+    // target's output dir after merge/history.
+    #[serde(default)]
+    pub sync_host: Option<String>,
+    #[serde(default)]
+    pub sync_dest_dir: Option<String>,
+    #[serde(default)]
+    pub sync_user: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +102,18 @@ pub struct TargetFile {
     pub end_scan: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purge_time: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_map: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_dest_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_user: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +176,12 @@ fn target_from_file(tf: TargetFile) -> Target {
         users,
         end_scan: tf.end_scan,
         purge_time: tf.purge_time,
+        tree_map: tf.tree_map,
+        level: tf.level,
+        workers: tf.workers,
+        sync_host: tf.sync_host,
+        sync_dest_dir: tf.sync_dest_dir,
+        sync_user: tf.sync_user,
     }
 }
 
@@ -169,6 +202,12 @@ fn target_to_file(t: &Target) -> TargetFile {
         teams,
         end_scan: t.end_scan.clone(),
         purge_time: t.purge_time,
+        tree_map: t.tree_map,
+        level: t.level,
+        workers: t.workers,
+        sync_host: t.sync_host.clone(),
+        sync_dest_dir: t.sync_dest_dir.clone(),
+        sync_user: t.sync_user.clone(),
     }
 }
 
@@ -336,10 +375,9 @@ impl Config {
         let target = Target {
             name: name.to_string(),
             path: path.to_string(),
-            teams: Vec::new(),
-            users: Vec::new(),
             end_scan,
             purge_time,
+            ..Default::default()
         };
         self.targets.push(target);
         self.save()
@@ -459,6 +497,7 @@ impl Config {
                 users: new_users,
                 end_scan: spec.end_scan.clone(),
                 purge_time: spec.purge_time,
+                ..Default::default()
             });
         }
     }

@@ -23,6 +23,7 @@ use crate::config::Config;
 enum Tab {
     Targets,
     TeamsUsers,
+    ScanSync,
     Settings,
 }
 
@@ -41,6 +42,12 @@ enum InputKind {
     SetWorkers,
     SetMaxParallel,
     SetNfsParallel,
+    // Per-target Scan/Sync tab fields.
+    SetTargetLevel,
+    SetTargetWorkers,
+    SetSyncHost,
+    SetSyncDest,
+    SetSyncUser,
 }
 
 /// Pending destructive action awaiting a yes/no confirmation.
@@ -73,10 +80,15 @@ struct App {
     user_sel: usize,
     /// Selected row on the Settings tab (0..4).
     settings_sel: usize,
+    /// Selected row on the Scan/Sync tab (0..5).
+    scansync_sel: usize,
     /// One-line status/error message shown in the footer.
     status: String,
     /// Set to true to exit the event loop.
     quit: bool,
+    /// When Some, the run loop should drop the TUI, scan these targets (empty =
+    /// all), then re-enter the TUI. Set by the r/R keys.
+    pending_scan: Option<Vec<String>>,
 }
 
 impl App {
@@ -89,8 +101,10 @@ impl App {
             team_sel: 0,
             user_sel: 0,
             settings_sel: 0,
-            status: "↹ switch tab · ↑↓ move · a add · e edit · d delete · q quit".into(),
+            scansync_sel: 0,
+            status: "↹ tab · ↑↓ move · a add · e edit · d delete · r scan · R scan-all · q quit".into(),
             quit: false,
+            pending_scan: None,
         }
     }
 
@@ -122,6 +136,7 @@ impl App {
         let nusers = self.current_team_users().len();
         if self.user_sel >= nusers { self.user_sel = nusers.saturating_sub(1); }
         if self.settings_sel > 3 { self.settings_sel = 3; }
+        if self.scansync_sel > 5 { self.scansync_sel = 5; }
     }
 }
 
@@ -157,14 +172,29 @@ pub fn run(cfg: Config) -> Result<(), String> {
         return Err("not a terminal — run `duscan` interactively, or use subcommands".into());
     }
 
-    let (_guard, mut terminal) = TermGuard::enter()?;
+    let mut guard_term = Some(TermGuard::enter()?);
     let mut app = App::new(cfg);
 
     while !app.quit {
-        terminal.draw(|f| draw(f, &app)).map_err(|e| format!("draw: {}", e))?;
+        {
+            let (_g, terminal) = guard_term.as_mut().unwrap();
+            terminal.draw(|f| draw(f, &app)).map_err(|e| format!("draw: {}", e))?;
+        }
         match event::read().map_err(|e| format!("read event: {}", e))? {
             Event::Key(key) if key.kind == event::KeyEventKind::Press => handle_key(&mut app, key),
             _ => {}
+        }
+
+        // A scan was requested: fully leave the config TUI (restore terminal),
+        // hand the screen to run_scan's own monitor, then re-enter the TUI and
+        // reload config from disk so any changes made during the scan show up.
+        if let Some(names) = app.pending_scan.take() {
+            drop(guard_term.take()); // restores terminal via TermGuard::drop
+            crate::run_scan(&mut app.cfg, None, false, None, 3, &names);
+            app.cfg = Config::load();
+            app.clamp_selections();
+            guard_term = Some(TermGuard::enter()?);
+            app.status = "Scan finished — back to config.".into();
         }
     }
     Ok(())
@@ -186,7 +216,7 @@ fn begin_input(app: &mut App, kind: InputKind, prompt: &str, initial: &str) {
 
 /// Whether Tab should offer directory completion for this input.
 fn is_path_input(kind: &InputKind) -> bool {
-    matches!(kind, InputKind::NewTargetPath { .. } | InputKind::EditPath | InputKind::SetOutputDir)
+    matches!(kind, InputKind::NewTargetPath { .. } | InputKind::EditPath | InputKind::SetOutputDir | InputKind::SetSyncDest)
 }
 
 fn handle_browse_key(app: &mut App, key: event::KeyEvent) {
@@ -198,21 +228,47 @@ fn handle_browse_key(app: &mut App, key: event::KeyEvent) {
         KeyCode::BackTab => { app.tab = prev_tab(app.tab); return; }
         KeyCode::Char('1') => { app.tab = Tab::Targets; return; }
         KeyCode::Char('2') => { app.tab = Tab::TeamsUsers; return; }
-        KeyCode::Char('3') => { app.tab = Tab::Settings; return; }
+        KeyCode::Char('3') => { app.tab = Tab::ScanSync; return; }
+        KeyCode::Char('4') => { app.tab = Tab::Settings; return; }
+        // r = scan the selected target; R = scan all targets. Requests a scan;
+        // the run loop drops the TUI, runs it, and re-enters.
+        KeyCode::Char('r') => {
+            match app.current_target_name() {
+                Some(n) => { app.pending_scan = Some(vec![n]); }
+                None => { app.status = "No target to scan — add one first.".into(); }
+            }
+            return;
+        }
+        KeyCode::Char('R') => {
+            if app.cfg.targets.is_empty() { app.status = "No targets to scan.".into(); }
+            else { app.pending_scan = Some(Vec::new()); } // empty = all
+            return;
+        }
         _ => {}
     }
     match app.tab {
         Tab::Targets => browse_targets(app, key),
         Tab::TeamsUsers => browse_teams_users(app, key),
+        Tab::ScanSync => browse_scansync(app, key),
         Tab::Settings => browse_settings(app, key),
     }
 }
 
 fn next_tab(t: Tab) -> Tab {
-    match t { Tab::Targets => Tab::TeamsUsers, Tab::TeamsUsers => Tab::Settings, Tab::Settings => Tab::Targets }
+    match t {
+        Tab::Targets => Tab::TeamsUsers,
+        Tab::TeamsUsers => Tab::ScanSync,
+        Tab::ScanSync => Tab::Settings,
+        Tab::Settings => Tab::Targets,
+    }
 }
 fn prev_tab(t: Tab) -> Tab {
-    match t { Tab::Targets => Tab::Settings, Tab::TeamsUsers => Tab::Targets, Tab::Settings => Tab::TeamsUsers }
+    match t {
+        Tab::Targets => Tab::Settings,
+        Tab::TeamsUsers => Tab::Targets,
+        Tab::ScanSync => Tab::TeamsUsers,
+        Tab::Settings => Tab::ScanSync,
+    }
 }
 
 fn browse_targets(app: &mut App, key: event::KeyEvent) {
@@ -309,6 +365,62 @@ fn browse_teams_users(app: &mut App, key: event::KeyEvent) {
         }
         _ => {}
     }
+}
+
+/// Scan/Sync tab: per-target overrides. Rows: 0 tree_map, 1 level, 2 workers,
+/// 3 sync_host, 4 sync_dest_dir, 5 sync_user.
+fn browse_scansync(app: &mut App, key: event::KeyEvent) {
+    if app.current_target_name().is_none() {
+        app.status = "No target selected — add one on the Targets tab first.".into();
+        return;
+    }
+    match key.code {
+        KeyCode::Char('[') => {
+            if app.target_sel > 0 { app.target_sel -= 1; app.team_sel = 0; app.user_sel = 0;
+                app.status = format!("Target: {}", app.current_target_name().unwrap_or_default()); }
+        }
+        KeyCode::Char(']') => {
+            if app.target_sel + 1 < app.cfg.targets.len() { app.target_sel += 1; app.team_sel = 0; app.user_sel = 0;
+                app.status = format!("Target: {}", app.current_target_name().unwrap_or_default()); }
+        }
+        KeyCode::Up | KeyCode::Char('k') => { if app.scansync_sel > 0 { app.scansync_sel -= 1; } }
+        KeyCode::Down | KeyCode::Char('j') => { if app.scansync_sel < 5 { app.scansync_sel += 1; } }
+        KeyCode::Enter | KeyCode::Char('e') => {
+            // Snapshot the fields we need so no immutable borrow of app.cfg is
+            // held across the mutable edit_current_target/begin_input calls.
+            let Some(t) = app.cfg.targets.get(app.target_sel) else { return };
+            let (tree_map, level, workers) = (t.tree_map, t.level, t.workers);
+            let (host, dest, user) = (
+                t.sync_host.clone().unwrap_or_default(),
+                t.sync_dest_dir.clone().unwrap_or_default(),
+                t.sync_user.clone().unwrap_or_default(),
+            );
+            match app.scansync_sel {
+                // tree_map: cycle unset → true → false → unset without a modal.
+                0 => {
+                    let next = match tree_map { None => Some(true), Some(true) => Some(false), Some(false) => None };
+                    match edit_current_target(app, |t| t.tree_map = next) {
+                        Ok(_) => app.status = format!("tree_map = {}", opt_bool_str(next)),
+                        Err(e) => app.status = format!("Error: {}", e),
+                    }
+                }
+                1 => begin_input(app, InputKind::SetTargetLevel, "level (empty=default):", &opt_i64_str(level)),
+                2 => begin_input(app, InputKind::SetTargetWorkers, "workers (empty=default):", &opt_i64_str(workers)),
+                3 => begin_input(app, InputKind::SetSyncHost, "sync host (empty=disable sync):", &host),
+                4 => begin_input(app, InputKind::SetSyncDest, "sync dest dir:", &dest),
+                5 => begin_input(app, InputKind::SetSyncUser, "sync user (empty=none):", &user),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+fn opt_bool_str(v: Option<bool>) -> String {
+    match v { None => "(default)".into(), Some(true) => "true".into(), Some(false) => "false".into() }
+}
+fn opt_i64_str(v: Option<i64>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_default()
 }
 
 fn browse_settings(app: &mut App, key: event::KeyEvent) {
@@ -464,6 +576,27 @@ fn commit_input(app: &mut App) {
             Ok(n) => { app.cfg.nfs_parallel = n.max(1); save_globals(app).map(|_| "nfs_parallel updated".into()) }
             Err(_) => Err("must be a number".into()),
         },
+        // Per-target Scan/Sync fields (empty clears to None = default/disabled).
+        InputKind::SetTargetLevel => match parse_opt_i64(&buf) {
+            Ok(v) => edit_current_target(app, |t| t.level = v).map(|n| format!("Updated level of '{}'", n)),
+            Err(e) => Err(e),
+        },
+        InputKind::SetTargetWorkers => match parse_opt_i64(&buf) {
+            Ok(v) => edit_current_target(app, |t| t.workers = v).map(|n| format!("Updated workers of '{}'", n)),
+            Err(e) => Err(e),
+        },
+        InputKind::SetSyncHost => {
+            let v = if buf.is_empty() { None } else { Some(buf.clone()) };
+            edit_current_target(app, |t| t.sync_host = v).map(|n| format!("Updated sync_host of '{}'", n))
+        }
+        InputKind::SetSyncDest => {
+            let v = if buf.is_empty() { None } else { Some(buf.clone()) };
+            edit_current_target(app, |t| t.sync_dest_dir = v).map(|n| format!("Updated sync_dest_dir of '{}'", n))
+        }
+        InputKind::SetSyncUser => {
+            let v = if buf.is_empty() { None } else { Some(buf.clone()) };
+            edit_current_target(app, |t| t.sync_user = v).map(|n| format!("Updated sync_user of '{}'", n))
+        }
     };
 
     app.clamp_selections();
@@ -551,8 +684,8 @@ fn draw(frame: &mut Frame, app: &App) {
         .split(area);
 
     // Tab bar with the active config path in the block title.
-    let titles = vec!["1 Targets", "2 Teams & Users", "3 Settings"];
-    let sel = match app.tab { Tab::Targets => 0, Tab::TeamsUsers => 1, Tab::Settings => 2 };
+    let titles = vec!["1 Targets", "2 Teams & Users", "3 Scan/Sync", "4 Settings"];
+    let sel = match app.tab { Tab::Targets => 0, Tab::TeamsUsers => 1, Tab::ScanSync => 2, Tab::Settings => 3 };
     let path = Config::path();
     let tabs = Tabs::new(titles)
         .select(sel)
@@ -563,6 +696,7 @@ fn draw(frame: &mut Frame, app: &App) {
     match app.tab {
         Tab::Targets => draw_targets(frame, app, chunks[1]),
         Tab::TeamsUsers => draw_teams_users(frame, app, chunks[1]),
+        Tab::ScanSync => draw_scansync(frame, app, chunks[1]),
         Tab::Settings => draw_settings(frame, app, chunks[1]),
     }
 
@@ -590,9 +724,10 @@ fn footer_hint(app: &App) -> &'static str {
         Mode::Input { .. } => "Type value · Enter confirm · Esc cancel",
         Mode::Confirm { .. } => "y confirm · any other key cancel",
         Mode::Browse => match app.tab {
-            Tab::Targets => "↑↓ move · a add · e path · s end-scan · p purge · d delete · Enter→teams · ↹ tab · q quit",
-            Tab::TeamsUsers => "[ ] target · ↑↓ team · ←→ user · a add-team · d del-team · u add-users · x del-user · ↹ tab · q quit",
-            Tab::Settings => "↑↓ move · Enter/e edit · ↹ tab · q quit",
+            Tab::Targets => "↑↓ move · a add · e path · s end-scan · p purge · d delete · r scan · R scan-all · ↹ tab · q quit",
+            Tab::TeamsUsers => "[ ] target · ↑↓ team · ←→ user · a add-team · d del-team · u add-users · x del-user · r/R scan · q quit",
+            Tab::ScanSync => "[ ] target · ↑↓ move · Enter/e edit · r scan this · R scan-all · ↹ tab · q quit",
+            Tab::Settings => "↑↓ move · Enter/e edit · r/R scan · ↹ tab · q quit",
         },
     }
 }
@@ -701,6 +836,36 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         .highlight_style(selected_style());
     let mut state = ListState::default();
     state.select(Some(app.settings_sel));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_scansync(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(t) = app.cfg.targets.get(app.target_sel) else {
+        let hint = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled("  No target selected.", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(Span::styled("  Add a target on the Targets tab (press 1) first.", Style::default().fg(Color::Cyan))),
+        ]).block(Block::default().borders(Borders::ALL).title(" Scan / Sync "));
+        frame.render_widget(hint, area);
+        return;
+    };
+    let target_label = format!("{} [{}/{}]  ([ ] switch)", t.name, app.target_sel + 1, app.cfg.targets.len());
+    let dash = |o: &Option<String>| o.clone().unwrap_or_else(|| "(none)".into());
+    let rows = [
+        format!("tree_map      = {}", opt_bool_str(t.tree_map)),
+        format!("level         = {}", t.level.map(|n| n.to_string()).unwrap_or_else(|| "(default)".into())),
+        format!("workers       = {}", t.workers.map(|n| n.to_string()).unwrap_or_else(|| "(default)".into())),
+        format!("sync_host     = {}", dash(&t.sync_host)),
+        format!("sync_dest_dir = {}", dash(&t.sync_dest_dir)),
+        format!("sync_user     = {}", dash(&t.sync_user)),
+    ];
+    let items: Vec<ListItem> = rows.iter().cloned().map(ListItem::new).collect();
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(format!(" Scan / Sync — target: {} ", target_label)))
+        .highlight_style(selected_style());
+    let mut state = ListState::default();
+    state.select(Some(app.scansync_sel));
     frame.render_stateful_widget(list, area, &mut state);
 }
 
