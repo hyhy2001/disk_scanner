@@ -46,6 +46,8 @@ pub struct TargetView {
     pub sync_host: Option<String>,
     pub sync_dest_dir: Option<String>,
     pub sync_user: Option<String>,
+    pub sync_pass: Option<bool>,
+    pub webhook_url: Option<String>,
 }
 
 /// Build a device-aware scan plan from config targets.
@@ -122,6 +124,8 @@ pub fn build_scan_plan(config: &Config, budget: usize) -> ScanPlan {
                     sync_host: t.sync_host.clone(),
                     sync_dest_dir: t.sync_dest_dir.clone(),
                     sync_user: t.sync_user.clone(),
+                    sync_pass: t.sync_pass,
+                    webhook_url: t.webhook_url.clone(),
                 }
             };
 

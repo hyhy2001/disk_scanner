@@ -58,6 +58,7 @@ enum InputKind {
     SetSyncDest,
     SetSyncUser,
     SetExportDir,
+    SetWebhookUrl,
 }
 
 /// Pending destructive action awaiting a yes/no confirmation.
@@ -162,7 +163,7 @@ impl App {
         let nusers = self.current_team_users().len();
         if self.user_sel >= nusers { self.user_sel = nusers.saturating_sub(1); }
         if self.settings_sel > 3 { self.settings_sel = 3; }
-        if self.scansync_sel > 6 { self.scansync_sel = 6; }
+        if self.scansync_sel > 8 { self.scansync_sel = 8; }
         // Detail lists users from report.db (team + Other), not config.
         let ntusers = current_report_users(self).len();
         if ntusers > 0 && self.detail_sel >= ntusers { self.detail_sel = ntusers - 1; }
@@ -219,7 +220,7 @@ pub fn run(cfg: Config) -> Result<(), String> {
         // reload config from disk so any changes made during the scan show up.
         if let Some(names) = app.pending_scan.take() {
             drop(guard_term.take()); // restores terminal via TermGuard::drop
-            crate::run_scan(&mut app.cfg, None, false, None, 3, &names);
+            crate::run_scan(&mut app.cfg, None, false, None, 3, &names, false);
             app.cfg = Config::load();
             app.clamp_selections();
             guard_term = Some(TermGuard::enter()?);
@@ -417,7 +418,7 @@ fn browse_scansync(app: &mut App, key: event::KeyEvent) {
                 app.status = format!("Target: {}", app.current_target_name().unwrap_or_default()); }
         }
         KeyCode::Up | KeyCode::Char('k') => { if app.scansync_sel > 0 { app.scansync_sel -= 1; } }
-        KeyCode::Down | KeyCode::Char('j') => { if app.scansync_sel < 6 { app.scansync_sel += 1; } }
+        KeyCode::Down | KeyCode::Char('j') => { if app.scansync_sel < 8 { app.scansync_sel += 1; } }
         KeyCode::Enter | KeyCode::Char('e') => {
             // Snapshot the fields we need so no immutable borrow of app.cfg is
             // held across the mutable edit_current_target/begin_input calls.
@@ -429,6 +430,8 @@ fn browse_scansync(app: &mut App, key: event::KeyEvent) {
                 t.sync_user.clone().unwrap_or_default(),
             );
             let export_dir = t.export_dir.clone().unwrap_or_default();
+            let webhook = t.webhook_url.clone().unwrap_or_default();
+            let sync_pass = t.sync_pass;
             match app.scansync_sel {
                 // tree_map: cycle unset → true → false → unset without a modal.
                 0 => {
@@ -444,6 +447,15 @@ fn browse_scansync(app: &mut App, key: event::KeyEvent) {
                 4 => begin_input(app, InputKind::SetSyncDest, "sync dest dir:", &dest),
                 5 => begin_input(app, InputKind::SetSyncUser, "sync user (empty=none):", &user),
                 6 => begin_input(app, InputKind::SetExportDir, "export dir (empty=exports):", &export_dir),
+                7 => begin_input(app, InputKind::SetWebhookUrl, "Teams webhook URL (empty=off):", &webhook),
+                // sync_pass: toggle unset → true → false → unset (no modal).
+                8 => {
+                    let next = match sync_pass { None => Some(true), Some(true) => Some(false), Some(false) => None };
+                    match edit_current_target(app, |t| t.sync_pass = next) {
+                        Ok(_) => app.status = format!("sync_pass = {} (password via SSHPASS env)", opt_bool_str(next)),
+                        Err(e) => app.status = format!("Error: {}", e),
+                    }
+                }
                 _ => {}
             }
         }
@@ -769,6 +781,10 @@ fn commit_input(app: &mut App) {
         InputKind::SetExportDir => {
             let v = if buf.is_empty() { None } else { Some(buf.clone()) };
             edit_current_target(app, |t| t.export_dir = v).map(|n| format!("Updated export_dir of '{}'", n))
+        }
+        InputKind::SetWebhookUrl => {
+            let v = if buf.is_empty() { None } else { Some(buf.clone()) };
+            edit_current_target(app, |t| t.webhook_url = v).map(|n| format!("Updated webhook_url of '{}'", n))
         }
     };
 
@@ -1216,6 +1232,8 @@ fn draw_scansync(frame: &mut Frame, app: &App, area: Rect) {
         format!("sync_dest_dir = {}", dash(&t.sync_dest_dir)),
         format!("sync_user     = {}", dash(&t.sync_user)),
         format!("export_dir    = {}", t.export_dir.clone().unwrap_or_else(|| "(exports)".into())),
+        format!("webhook_url   = {}", dash(&t.webhook_url)),
+        format!("sync_pass     = {}", opt_bool_str(t.sync_pass)),
     ];
     let items: Vec<ListItem> = rows.iter().cloned().map(ListItem::new).collect();
     let list = List::new(items)
