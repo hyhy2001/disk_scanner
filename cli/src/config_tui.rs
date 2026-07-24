@@ -54,7 +54,9 @@ enum ConfirmAction {
 /// Interaction mode: browsing, typing into the input box, or confirming.
 enum Mode {
     Browse,
-    Input { kind: InputKind, prompt: String, buf: String },
+    /// `completions` holds directory candidates shown below the box after a Tab
+    /// on a path input; empty when there is nothing to show.
+    Input { kind: InputKind, prompt: String, buf: String, completions: Vec<String> },
     Confirm { action: ConfirmAction, prompt: String },
 }
 
@@ -179,7 +181,12 @@ fn handle_key(app: &mut App, key: event::KeyEvent) {
 
 /// Begin collecting a line of input for `kind` with the given prompt.
 fn begin_input(app: &mut App, kind: InputKind, prompt: &str, initial: &str) {
-    app.mode = Mode::Input { kind, prompt: prompt.to_string(), buf: initial.to_string() };
+    app.mode = Mode::Input { kind, prompt: prompt.to_string(), buf: initial.to_string(), completions: Vec::new() };
+}
+
+/// Whether Tab should offer directory completion for this input.
+fn is_path_input(kind: &InputKind) -> bool {
+    matches!(kind, InputKind::NewTargetPath { .. } | InputKind::EditPath | InputKind::SetOutputDir)
 }
 
 fn handle_browse_key(app: &mut App, key: event::KeyEvent) {
@@ -325,14 +332,75 @@ fn handle_input_key(app: &mut App, key: event::KeyEvent) {
     match key.code {
         KeyCode::Esc => { app.mode = Mode::Browse; app.status = "Cancelled.".into(); }
         KeyCode::Enter => commit_input(app),
+        KeyCode::Tab => try_complete_path(app),
         KeyCode::Backspace => {
-            if let Mode::Input { buf, .. } = &mut app.mode { buf.pop(); }
+            if let Mode::Input { buf, completions, .. } = &mut app.mode { buf.pop(); completions.clear(); }
         }
         KeyCode::Char(c) => {
-            if let Mode::Input { buf, .. } = &mut app.mode { buf.push(c); }
+            if let Mode::Input { buf, completions, .. } = &mut app.mode { buf.push(c); completions.clear(); }
         }
         _ => {}
     }
+}
+
+/// Tab-complete a directory path in the input box. Fills the longest common
+/// prefix of matching sub-directories and, when several match, records them in
+/// `completions` for display. No-op for non-path inputs.
+fn try_complete_path(app: &mut App) {
+    let Mode::Input { kind, buf, completions, .. } = &mut app.mode else { return };
+    if !is_path_input(kind) { return; }
+
+    // Split buf into the directory to list and the partial name being typed.
+    let (dir, prefix) = match buf.rfind('/') {
+        Some(i) => (buf[..=i].to_string(), buf[i + 1..].to_string()),
+        None => (String::new(), buf.clone()),
+    };
+    let list_dir = if dir.is_empty() { ".".to_string() } else { dir.clone() };
+
+    // Collect matching sub-directories (directories only).
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&list_dir) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with(&prefix) { continue; }
+            // Directory check follows symlinks (metadata) but falls back to file_type.
+            let is_dir = e.metadata().map(|m| m.is_dir())
+                .or_else(|_| e.file_type().map(|t| t.is_dir()))
+                .unwrap_or(false);
+            if is_dir { names.push(name); }
+        }
+    }
+    names.sort();
+
+    if names.is_empty() {
+        completions.clear();
+        app.status = format!("no directory matches '{}'", buf);
+        return;
+    }
+    if names.len() == 1 {
+        *buf = format!("{}{}/", dir, names[0]);
+        completions.clear();
+        return;
+    }
+    // Multiple: fill longest common prefix, then show the list.
+    let lcp = longest_common_prefix(&names);
+    *buf = format!("{}{}", dir, lcp);
+    *completions = names;
+}
+
+/// Longest common prefix of a non-empty slice of strings (byte-wise; directory
+/// names are UTF-8 and we only extend the already-typed ASCII-ish prefix).
+fn longest_common_prefix(items: &[String]) -> String {
+    if items.is_empty() { return String::new(); }
+    let first = &items[0];
+    let mut end = first.len();
+    for s in &items[1..] {
+        let common = first.bytes().zip(s.bytes()).take_while(|(a, b)| a == b).count();
+        if common < end { end = common; }
+    }
+    // Back off to a char boundary so we never split a multibyte char.
+    while end > 0 && !first.is_char_boundary(end) { end -= 1; }
+    first[..end].to_string()
 }
 
 /// Apply the finished input line. Every mutating branch calls a `Config` method
@@ -509,14 +577,16 @@ fn draw(frame: &mut Frame, app: &App) {
 
     // Modal overlays.
     match &app.mode {
-        Mode::Input { prompt, buf, .. } => draw_input_modal(frame, area, prompt, buf),
+        Mode::Input { kind, prompt, buf, completions } =>
+            draw_input_modal(frame, area, prompt, buf, completions, is_path_input(kind)),
         Mode::Confirm { prompt, .. } => draw_confirm_modal(frame, area, prompt),
         Mode::Browse => {}
     }
 }
 
 fn footer_hint(app: &App) -> &'static str {
-    match app.mode {
+    match &app.mode {
+        Mode::Input { kind, .. } if is_path_input(kind) => "Type value · Tab complete dir · Enter confirm · Esc cancel",
         Mode::Input { .. } => "Type value · Enter confirm · Esc cancel",
         Mode::Confirm { .. } => "y confirm · any other key cancel",
         Mode::Browse => match app.tab {
@@ -641,15 +711,36 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     Rect { x, y, width: w.min(area.width), height: h.min(area.height) }
 }
 
-fn draw_input_modal(frame: &mut Frame, area: Rect, prompt: &str, buf: &str) {
+fn draw_input_modal(frame: &mut Frame, area: Rect, prompt: &str, buf: &str, completions: &[String], is_path: bool) {
+    const MAX_SHOWN: usize = 8;
     let w = area.width.min(70).max(20);
-    let rect = centered(area, w, 5);
-    frame.render_widget(Clear, rect);
-    let body = Paragraph::new(vec![
-        Line::from(Span::styled(prompt, Style::default().fg(Color::Cyan))),
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(prompt.to_string(), Style::default().fg(Color::Cyan))),
         Line::from(Span::styled(format!("{}▏", buf), Style::default().fg(Color::White))),
-    ])
-    .block(Block::default().borders(Borders::ALL).title(" Input ").border_style(Style::default().fg(Color::Cyan)));
+    ];
+    if is_path {
+        lines.push(Line::from(Span::styled("Tab to complete directory", Style::default().fg(Color::DarkGray))));
+    }
+    // Directory candidates after a Tab, capped with a "+N more" tail.
+    if !completions.is_empty() {
+        let shown = completions.len().min(MAX_SHOWN);
+        for name in &completions[..shown] {
+            lines.push(Line::from(Span::styled(format!("  {}/", name), Style::default().fg(Color::Green))));
+        }
+        if completions.len() > shown {
+            lines.push(Line::from(Span::styled(
+                format!("  …(+{} more)", completions.len() - shown),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    let h = (lines.len() as u16) + 2; // + borders
+    let rect = centered(area, w, h);
+    frame.render_widget(Clear, rect);
+    let body = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" Input ").border_style(Style::default().fg(Color::Cyan)));
     frame.render_widget(body, rect);
 }
 
