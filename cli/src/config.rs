@@ -30,6 +30,9 @@ pub struct Target {
     pub sync_dest_dir: Option<String>,
     #[serde(default)]
     pub sync_user: Option<String>,
+    // Per-target export directory for `export` (TUI + CLI); None = "exports".
+    #[serde(default)]
+    pub export_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +117,8 @@ pub struct TargetFile {
     pub sync_dest_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +187,7 @@ fn target_from_file(tf: TargetFile) -> Target {
         sync_host: tf.sync_host,
         sync_dest_dir: tf.sync_dest_dir,
         sync_user: tf.sync_user,
+        export_dir: tf.export_dir,
     }
 }
 
@@ -208,6 +214,7 @@ fn target_to_file(t: &Target) -> TargetFile {
         sync_host: t.sync_host.clone(),
         sync_dest_dir: t.sync_dest_dir.clone(),
         sync_user: t.sync_user.clone(),
+        export_dir: t.export_dir.clone(),
     }
 }
 

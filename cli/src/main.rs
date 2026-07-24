@@ -564,8 +564,6 @@ fn main() {
         Command::Export { user, output_dir, export_dir, target } => {
             let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
             let exp = export_dir.clone().unwrap_or_else(|| "exports".into());
-            std::fs::create_dir_all(&exp).ok();
-            let want: std::collections::HashSet<&str> = user.iter().map(|s| s.as_str()).collect();
 
             if let Ok(entries) = std::fs::read_dir(&out) {
                 for entry in entries.flatten() {
@@ -575,23 +573,18 @@ fn main() {
                     }
                     let db_path = entry.path().join("report.db");
                     if !db_path.exists() { continue; }
-                    let Ok(conn) = rusqlite::Connection::open(&db_path) else { continue };
-
-                    // username → uid map for the users we want (all if none specified)
-                    let mut stmt = match conn.prepare("SELECT uid, username FROM detail_users") {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let users: Vec<(i64, String)> = stmt
-                        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-                        .map(|rows| rows.flatten().collect())
-                        .unwrap_or_default();
-
                     let tgt_dir = std::path::Path::new(&exp).join(&tname);
-                    std::fs::create_dir_all(&tgt_dir).ok();
-                    for (uid, uname) in &users {
-                        if !want.is_empty() && !want.contains(uname.as_str()) { continue; }
-                        export_user_text(&conn, *uid, uname, &tgt_dir);
+                    // `--user` may name several users; None (empty) means all.
+                    let only: Vec<Option<&str>> = if user.is_empty() {
+                        vec![None]
+                    } else {
+                        user.iter().map(|u| Some(u.as_str())).collect()
+                    };
+                    for who in only {
+                        match export_target_users(&db_path, &tgt_dir, who) {
+                            Ok(n) => println!("Exported {} user(s) from '{}' -> {}", n, tname, tgt_dir.display()),
+                            Err(e) => eprintln!("Export '{}': {}", tname, e),
+                        }
                     }
                 }
             }
@@ -776,6 +769,36 @@ pub fn query_user_detail(db: &std::path::Path, username: &str, top: usize) -> Op
         "SELECT f.size, n.name FROM {}files f JOIN {}file_names n ON f.name_id = n.id \
          WHERE f.uid = ?1 ORDER BY f.size DESC LIMIT ?2", prefix, prefix), uid, top);
     Some(UserDetail { uid, total_files, total_dirs, total_size, top_dirs, top_files })
+}
+
+/// One user row for the Output/Detail list, read straight from the scan's
+/// report.db (every uid the scan saw), not from config. `has_team` is false
+/// when the user was not in any configured team — those are the "Other" users,
+/// matching legacy which buckets unassigned users under Other.
+pub struct ReportUser {
+    pub username: String,
+    pub size: i64,
+    pub has_team: bool,
+}
+
+/// All users recorded in a report.db, configured-team users first (largest
+/// first), then the unassigned "Other" users (largest first). Empty when the
+/// DB is missing or has no detail_users.
+pub fn query_report_users(db: &std::path::Path) -> Vec<ReportUser> {
+    let Ok(conn) = rusqlite::Connection::open(db) else { return Vec::new() };
+    let prefix = detail_prefix(&conn);
+    let sql = format!("SELECT username, total_size, team_id FROM {}users", prefix);
+    let Ok(mut stmt) = conn.prepare(&sql) else { return Vec::new() };
+    let rows = stmt.query_map([], |r| {
+        let username: String = r.get(0)?;
+        let size: i64 = r.get(1)?;
+        let team_id: String = r.get::<_, Option<String>>(2)?.unwrap_or_default();
+        Ok(ReportUser { username, size, has_team: !team_id.trim().is_empty() })
+    });
+    let mut users: Vec<ReportUser> = rows.map(|it| it.flatten().collect()).unwrap_or_default();
+    // Team users first, then Other; each group sorted by size desc.
+    users.sort_by(|a, b| b.has_team.cmp(&a.has_team).then(b.size.cmp(&a.size)));
+    users
 }
 
 /// Detect the treemap table prefix, or None if this report.db has no treemap.
@@ -1715,6 +1738,35 @@ fn print_tree(
 /// Write full per-user dir and file usage dumps (all rows, sorted by size desc)
 /// to `<export_dir>/usage_dir_<user>.txt` and `usage_file_<user>.txt`.
 /// `export_dir` is already scoped to a single target's subdirectory.
+/// Export usage text files for users in a target's report.db into `export_dir`.
+/// `only_user = Some(name)` exports just that user; None exports all. Returns the
+/// number of users exported. Shared by the CLI `export` command and the TUI.
+pub fn export_target_users(db: &std::path::Path, export_dir: &std::path::Path, only_user: Option<&str>) -> Result<usize, String> {
+    let conn = rusqlite::Connection::open(db).map_err(|e| format!("open {}: {}", db.display(), e))?;
+    let mut stmt = conn.prepare("SELECT uid, username FROM detail_users")
+        .map_err(|_| "no detail data in report.db — scan this target first".to_string())?;
+    let users: Vec<(i64, String)> = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    std::fs::create_dir_all(export_dir).map_err(|e| format!("mkdir {}: {}", export_dir.display(), e))?;
+    let mut n = 0;
+    for (uid, uname) in &users {
+        if let Some(want) = only_user {
+            if uname != want { continue; }
+        }
+        export_user_text(&conn, *uid, uname, export_dir);
+        n += 1;
+    }
+    if n == 0 {
+        return Err(match only_user {
+            Some(u) => format!("user '{}' not found in report.db", u),
+            None => "no users in report.db".to_string(),
+        });
+    }
+    Ok(n)
+}
+
 fn export_user_text(conn: &rusqlite::Connection, uid: i64, username: &str, export_dir: &std::path::Path) {
     use std::io::Write;
     let safe_user: String = username
