@@ -22,13 +22,15 @@ user, path inputs support `Tab` directory completion, `q`/`Esc` quit.
 TUI hands the screen to the scan monitor, then returns when the scan finishes.
 
 **Scan/Sync tab** — per-target overrides (empty = use the global default):
-`tree_map`, `level`, `workers`, and `sync_host`/`sync_dest_dir`/`sync_user`. When
-`sync_host` is set, that target's output is rsync'd to the remote automatically
-after each scan. These are also stored in `targets/<name>.toml`.
+`tree_map`, `level`, `workers`, `sync_host`/`sync_dest_dir`/`sync_user`, and
+`export_dir` (destination for the Output/Detail `x`/`X` export; empty = `exports`).
+When `sync_host` is set, that target's output is rsync'd to the remote
+automatically after each scan. These are also stored in `targets/<name>.toml`.
 
 **Output tab** — view a target's scan results without leaving the TUI. Three
 sub-views switched with `h`/`d`/`t`: **History** (per-day usage snapshots + top
-users), **Detail** (pick a user → totals + top dirs/files), and **Treemap** (an
+users), **Detail** (pick a user → totals + top dirs/files; `x` exports the
+selected user's usage txt, `X` exports every user), and **Treemap** (an
 ncdu-style directory browser: `↑↓` move, `Enter` descend into a sub-directory,
 `Backspace` go up, sized bars per entry). `[`/`]` switch target. Reads each
 target's `report.db`; empty states point you to press `r` to scan first.

@@ -57,6 +57,7 @@ enum InputKind {
     SetSyncHost,
     SetSyncDest,
     SetSyncUser,
+    SetExportDir,
 }
 
 /// Pending destructive action awaiting a yes/no confirmation.
@@ -168,7 +169,7 @@ impl App {
         let nusers = self.current_team_users().len();
         if self.user_sel >= nusers { self.user_sel = nusers.saturating_sub(1); }
         if self.settings_sel > 3 { self.settings_sel = 3; }
-        if self.scansync_sel > 5 { self.scansync_sel = 5; }
+        if self.scansync_sel > 6 { self.scansync_sel = 6; }
         let ntusers = self.current_target_users().len();
         if self.detail_sel >= ntusers { self.detail_sel = ntusers.saturating_sub(1); }
     }
@@ -250,7 +251,7 @@ fn begin_input(app: &mut App, kind: InputKind, prompt: &str, initial: &str) {
 
 /// Whether Tab should offer directory completion for this input.
 fn is_path_input(kind: &InputKind) -> bool {
-    matches!(kind, InputKind::NewTargetPath { .. } | InputKind::EditPath | InputKind::SetOutputDir | InputKind::SetSyncDest)
+    matches!(kind, InputKind::NewTargetPath { .. } | InputKind::EditPath | InputKind::SetOutputDir | InputKind::SetSyncDest | InputKind::SetExportDir)
 }
 
 fn handle_browse_key(app: &mut App, key: event::KeyEvent) {
@@ -422,7 +423,7 @@ fn browse_scansync(app: &mut App, key: event::KeyEvent) {
                 app.status = format!("Target: {}", app.current_target_name().unwrap_or_default()); }
         }
         KeyCode::Up | KeyCode::Char('k') => { if app.scansync_sel > 0 { app.scansync_sel -= 1; } }
-        KeyCode::Down | KeyCode::Char('j') => { if app.scansync_sel < 5 { app.scansync_sel += 1; } }
+        KeyCode::Down | KeyCode::Char('j') => { if app.scansync_sel < 6 { app.scansync_sel += 1; } }
         KeyCode::Enter | KeyCode::Char('e') => {
             // Snapshot the fields we need so no immutable borrow of app.cfg is
             // held across the mutable edit_current_target/begin_input calls.
@@ -433,6 +434,7 @@ fn browse_scansync(app: &mut App, key: event::KeyEvent) {
                 t.sync_dest_dir.clone().unwrap_or_default(),
                 t.sync_user.clone().unwrap_or_default(),
             );
+            let export_dir = t.export_dir.clone().unwrap_or_default();
             match app.scansync_sel {
                 // tree_map: cycle unset → true → false → unset without a modal.
                 0 => {
@@ -447,6 +449,7 @@ fn browse_scansync(app: &mut App, key: event::KeyEvent) {
                 3 => begin_input(app, InputKind::SetSyncHost, "sync host (empty=disable sync):", &host),
                 4 => begin_input(app, InputKind::SetSyncDest, "sync dest dir:", &dest),
                 5 => begin_input(app, InputKind::SetSyncUser, "sync user (empty=none):", &user),
+                6 => begin_input(app, InputKind::SetExportDir, "export dir (empty=exports):", &export_dir),
                 _ => {}
             }
         }
@@ -465,6 +468,29 @@ fn opt_i64_str(v: Option<i64>) -> String {
 fn current_report_db(app: &App) -> Option<std::path::PathBuf> {
     let name = app.current_target_name()?;
     crate::resolve_report_db(&app.cfg.output_dir, &name)
+}
+
+/// Export usage txt for the current target from the Output/Detail view.
+/// `only_user = Some(u)` exports just that user; `None` exports every user.
+/// Destination mirrors the CLI layout: `<export_dir>/<target>/` where
+/// `export_dir` is the target's per-target override or `exports` by default.
+fn export_from_output(app: &mut App, only_user: Option<&str>) {
+    let Some(name) = app.current_target_name() else {
+        app.status = "No target selected.".into();
+        return;
+    };
+    let Some(db) = current_report_db(app) else {
+        app.status = "No report yet — press r to scan this target first.".into();
+        return;
+    };
+    let base = app.cfg.targets.get(app.target_sel)
+        .and_then(|t| t.export_dir.clone())
+        .unwrap_or_else(|| "exports".into());
+    let dest = std::path::Path::new(&base).join(&name);
+    match crate::export_target_users(&db, &dest, only_user) {
+        Ok(n) => app.status = format!("Exported {} user(s) -> {}", n, dest.display()),
+        Err(e) => app.status = format!("Export failed: {}", e),
+    }
 }
 
 /// Load the treemap children of the node at the top of `tm_stack` (or root when
@@ -522,6 +548,15 @@ fn browse_output(app: &mut App, key: event::KeyEvent) {
             match key.code {
                 KeyCode::Up | KeyCode::Char('k') => { if app.detail_sel > 0 { app.detail_sel -= 1; } }
                 KeyCode::Down | KeyCode::Char('j') => { if app.detail_sel + 1 < nusers { app.detail_sel += 1; } }
+                // Export usage txt: `x` selected user, `X` all users of this target.
+                KeyCode::Char('x') => {
+                    let users = app.current_target_users();
+                    match users.get(app.detail_sel) {
+                        Some(u) => { let u = u.clone(); export_from_output(app, Some(&u)); }
+                        None => app.status = "No user selected to export.".into(),
+                    }
+                }
+                KeyCode::Char('X') => export_from_output(app, None),
                 _ => {}
             }
         }
@@ -725,6 +760,10 @@ fn commit_input(app: &mut App) {
             let v = if buf.is_empty() { None } else { Some(buf.clone()) };
             edit_current_target(app, |t| t.sync_user = v).map(|n| format!("Updated sync_user of '{}'", n))
         }
+        InputKind::SetExportDir => {
+            let v = if buf.is_empty() { None } else { Some(buf.clone()) };
+            edit_current_target(app, |t| t.export_dir = v).map(|n| format!("Updated export_dir of '{}'", n))
+        }
     };
 
     app.clamp_selections();
@@ -860,7 +899,7 @@ fn footer_hint(app: &App) -> &'static str {
             Tab::ScanSync => "[ ] target · ↑↓ move · Enter/e edit · r scan this · R scan-all · ↹ tab · q quit",
             Tab::Output => match app.output_view {
                 OutputView::History => "[ ] target · h/d/t view · ↑↓ scroll · r/R scan · ↹ tab · q quit",
-                OutputView::Detail => "[ ] target · h/d/t view · ↑↓ user · r/R scan · ↹ tab · q quit",
+                OutputView::Detail => "[ ] target · h/d/t view · ↑↓ user · x export · X export-all · r/R scan · ↹ tab · q quit",
                 OutputView::Treemap => "[ ] target · h/d/t view · ↑↓ move · Enter open · Bksp up · r/R scan · q quit",
             },
             Tab::Settings => "↑↓ move · Enter/e edit · r/R scan · ↹ tab · q quit",
@@ -1147,6 +1186,7 @@ fn draw_scansync(frame: &mut Frame, app: &App, area: Rect) {
         format!("sync_host     = {}", dash(&t.sync_host)),
         format!("sync_dest_dir = {}", dash(&t.sync_dest_dir)),
         format!("sync_user     = {}", dash(&t.sync_user)),
+        format!("export_dir    = {}", t.export_dir.clone().unwrap_or_else(|| "(exports)".into())),
     ];
     let items: Vec<ListItem> = rows.iter().cloned().map(ListItem::new).collect();
     let list = List::new(items)
