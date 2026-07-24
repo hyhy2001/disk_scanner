@@ -8,6 +8,15 @@ make static-build # → static binary
 make clean
 ```
 
+## Interactive config TUI
+
+Run `duscan` with **no subcommand** to open the interactive configuration TUI
+(three tabs: Targets, Teams & Users, Settings). It manages targets/teams/users
+and writes every change straight to `duscan.toml` + `targets/*.toml` (save on each
+op). Keys: `↹`/`1`/`2`/`3` switch tabs, `↑↓` move, `a` add, `e` edit, `d` delete,
+`u` add users (supports `alice,bob` and `@file`), `x` remove user, `q`/`Esc` quit.
+`duscan run` remains a separate read-only scan monitor.
+
 ## Usage
 
 ```bash

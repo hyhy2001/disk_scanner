@@ -384,6 +384,20 @@ impl Config {
         self.save()
     }
 
+    /// Remove a team from a target and drop every user that belonged to it.
+    /// Counterpart to `add_team`; used by the config TUI.
+    pub fn remove_team(&mut self, team_name: &str, target_name: &str) -> Result<(), String> {
+        let t = self.find_target_mut(target_name)
+            .ok_or_else(|| format!("Target '{}' not found", target_name))?;
+        let team_id = t.teams.iter()
+            .find(|tm| tm.name == team_name)
+            .ok_or_else(|| format!("Team '{}' not found in '{}'", team_name, target_name))?
+            .team_id;
+        t.teams.retain(|tm| tm.name != team_name);
+        t.users.retain(|u| u.team_id != team_id);
+        self.save()
+    }
+
     /// Create or update one target from a complete `TargetSpec` in a single
     /// operation. Does NOT save — the caller batches `save()` once after all
     /// upserts, avoiding the "one file write per field" problem.
