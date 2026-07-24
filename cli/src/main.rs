@@ -486,7 +486,7 @@ fn main() {
             run_scan(&mut cfg, output_dir.clone(), *tree_map, *workers, *level, target, *debug);
         }
         Command::Detail { user, output_dir, top, target, json, section, search } => {
-            let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
+            let out = output_dir.clone().unwrap_or_else(|| cfg.resolved_output_dir());
             let mut json_out: Vec<serde_json::Value> = Vec::new();
             for username in user {
                 let mut found = false;
@@ -565,7 +565,7 @@ fn main() {
             }
         }
         Command::TreeShow { output_dir, level, limit, path, search, target } => {
-            let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
+            let out = output_dir.clone().unwrap_or_else(|| cfg.resolved_output_dir());
             if let Ok(entries) = std::fs::read_dir(&out) {
                 for entry in entries.flatten() {
                     let dir_path = entry.path();
@@ -604,7 +604,7 @@ fn main() {
             }
         }
         Command::Export { user, output_dir, export_dir, target } => {
-            let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
+            let out = output_dir.clone().unwrap_or_else(|| cfg.resolved_output_dir());
             let exp = export_dir.clone().unwrap_or_else(|| "exports".into());
 
             if let Ok(entries) = std::fs::read_dir(&out) {
@@ -632,7 +632,7 @@ fn main() {
             }
         }
         Command::Notify { webhook_url, output_dir, target } => {
-            let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
+            let out = output_dir.clone().unwrap_or_else(|| cfg.resolved_output_dir());
             let mut sent = 0;
             if let Ok(entries) = std::fs::read_dir(&out) {
                 for entry in entries.flatten() {
@@ -651,14 +651,14 @@ fn main() {
             if sent == 0 { eprintln!("No report.db found to notify under '{}'", out); }
         }
         Command::Sync { output_dir, host, dest_dir, user, pass } => {
-            let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
+            let out = output_dir.clone().unwrap_or_else(|| cfg.resolved_output_dir());
             match run_rsync(&out, host, dest_dir, user.as_deref(), *pass) {
                 Ok(remote) => println!("Synced '{}' -> {}", out, remote),
                 Err(e) => eprintln!("{}", e),
             }
         }
         Command::History { output_dir, target, days, json, compare, top } => {
-            let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
+            let out = output_dir.clone().unwrap_or_else(|| cfg.resolved_output_dir());
             if *compare {
                 show_history_compare(&out, target.as_deref(), *days, *top, *json);
             } else {
@@ -1501,7 +1501,7 @@ fn run_scan(
     target: &[String],
     debug: bool,
 ) {
-    let out = output_dir.unwrap_or(cfg.output_dir.clone());
+    let out = output_dir.unwrap_or_else(|| cfg.resolved_output_dir());
     let budget = workers.unwrap_or_else(|| {
         std::thread::available_parallelism()
             .map(|n| n.get() * 2)
