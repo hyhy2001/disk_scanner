@@ -771,6 +771,36 @@ pub fn query_user_detail(db: &std::path::Path, username: &str, top: usize) -> Op
     Some(UserDetail { uid, total_files, total_dirs, total_size, top_dirs, top_files })
 }
 
+/// One user row for the Output/Detail list, read straight from the scan's
+/// report.db (every uid the scan saw), not from config. `has_team` is false
+/// when the user was not in any configured team — those are the "Other" users,
+/// matching legacy which buckets unassigned users under Other.
+pub struct ReportUser {
+    pub username: String,
+    pub size: i64,
+    pub has_team: bool,
+}
+
+/// All users recorded in a report.db, configured-team users first (largest
+/// first), then the unassigned "Other" users (largest first). Empty when the
+/// DB is missing or has no detail_users.
+pub fn query_report_users(db: &std::path::Path) -> Vec<ReportUser> {
+    let Ok(conn) = rusqlite::Connection::open(db) else { return Vec::new() };
+    let prefix = detail_prefix(&conn);
+    let sql = format!("SELECT username, total_size, team_id FROM {}users", prefix);
+    let Ok(mut stmt) = conn.prepare(&sql) else { return Vec::new() };
+    let rows = stmt.query_map([], |r| {
+        let username: String = r.get(0)?;
+        let size: i64 = r.get(1)?;
+        let team_id: String = r.get::<_, Option<String>>(2)?.unwrap_or_default();
+        Ok(ReportUser { username, size, has_team: !team_id.trim().is_empty() })
+    });
+    let mut users: Vec<ReportUser> = rows.map(|it| it.flatten().collect()).unwrap_or_default();
+    // Team users first, then Other; each group sorted by size desc.
+    users.sort_by(|a, b| b.has_team.cmp(&a.has_team).then(b.size.cmp(&a.size)));
+    users
+}
+
 /// Detect the treemap table prefix, or None if this report.db has no treemap.
 pub fn treemap_prefix(conn: &rusqlite::Connection) -> Option<&'static str> {
     if conn.prepare("SELECT 1 FROM treemap_dirs LIMIT 1").is_ok() { Some("treemap_") }
