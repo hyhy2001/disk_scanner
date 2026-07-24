@@ -22,7 +22,12 @@ token in add-users support `Tab` completion and are stored as absolute paths;
 left as typed. `/` filters long lists (see the Output tab notes below).
 
 **Run a scan from the TUI:** `r` scans the selected target, `R` scans all. The
-TUI hands the screen to the scan monitor, then returns when the scan finishes.
+scan runs **in-place** — the TUI stays open and a live "Scan jobs" panel appears
+above the footer showing each target's current stage (Scanning → Building detail
+→ Merging → History → Done) plus live file/dir counts. You can keep navigating
+the config while it runs; `q` quits the TUI (the scan keeps running in the
+background until its threads finish). Only one scan runs at a time (`r`/`R` are
+ignored while one is in flight). When it finishes the config reloads from disk.
 
 **Scan/Sync tab** — per-target overrides (empty = use the global default):
 `tree_map`, `level`, `workers`, `sync_host`/`sync_dest_dir`/`sync_user`,
@@ -136,7 +141,7 @@ name = "ops"
 users = ["carol"]
 ```
 
-Per-target output: `<output-dir>/<target>/` holds `report.db`, `permission_issues.db`, `scan_status.json`, and `logs/scan_<ts>.log` (one log per scan, legacy-style phase summary).
+Per-target output: `<output-dir>/<target>/` holds `report.db`, `scan_status.json`, and `logs/scan_<ts>.log` (one log per scan, legacy-style phase summary). Permission issues are **merged into `report.db`** (the `perm_issues` table, read by `detail --type permission` and the TUI Perm view); the intermediate `permission_issues.db` scratch file is deleted after the merge, so `report.db` is the single source of truth.
 
 ## Architecture
 

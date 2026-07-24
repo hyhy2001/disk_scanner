@@ -1477,14 +1477,45 @@ struct ViewJob {
 }
 
 /// Live per-view progress sink shared between a worker thread and the TUI.
-struct ViewProgress {
-    name: String,
-    scan: check_disk_core::scan_core::ScanProgress,
+pub(crate) struct ViewProgress {
+    pub name: String,
+    pub scan: check_disk_core::scan_core::ScanProgress,
     /// Current coarse phase label (scanning/building/treemap/merging/history/done/error).
-    phase: std::sync::Mutex<String>,
-    error: std::sync::Mutex<String>,
-    started: std::time::Instant,
-    finished: std::sync::atomic::AtomicBool,
+    pub phase: std::sync::Mutex<String>,
+    pub error: std::sync::Mutex<String>,
+    pub started: std::time::Instant,
+    pub finished: std::sync::atomic::AtomicBool,
+}
+
+/// A running (or completed) background scan: the per-view progress sinks the
+/// caller polls for live counts/phase, the worker join handles, and the shared
+/// abort flag. Returned by `spawn_scan_workers` so a caller that owns its own
+/// terminal (e.g. the config TUI) can render progress in-place without handing
+/// the screen to the standalone scan monitor.
+pub(crate) struct ScanRun {
+    pub progresses: Vec<std::sync::Arc<ViewProgress>>,
+    pub handles: Vec<std::thread::JoinHandle<()>>,
+    pub abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ScanRun {
+    /// True once every view's worker has finished (or errored).
+    pub fn all_finished(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.progresses.iter().all(|p| p.finished.load(Ordering::SeqCst))
+    }
+
+    /// Signal every worker to stop at the next safe checkpoint.
+    pub fn request_abort(&self) {
+        self.abort.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Join all worker threads (blocks until they exit).
+    pub fn join(&mut self) {
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
 }
 
 /// Set up the TUI, build the device-aware plan, and run each device group on
@@ -1501,81 +1532,12 @@ fn run_scan(
     target: &[String],
     debug: bool,
 ) {
-    let out = output_dir.unwrap_or_else(|| cfg.resolved_output_dir());
-    let budget = workers.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get() * 2)
-            .unwrap_or(8)
-            .min(32)
-    });
+    let (out, group_jobs, view_names, max_parallel_devices) =
+        match plan_scan_jobs(cfg, output_dir, workers, target) {
+            Some(v) => v,
+            None => return,
+        };
 
-    // Restrict to requested targets, if any.
-    if !target.is_empty() {
-        let want: std::collections::HashSet<&str> = target.iter().map(|s| s.as_str()).collect();
-        for m in target.iter().filter(|n| !cfg.targets.iter().any(|t| &t.name == *n)) {
-            eprintln!("Warning: target '{}' not found in config", m);
-        }
-        cfg.targets.retain(|t| want.contains(t.name.as_str()));
-        if cfg.targets.is_empty() {
-            eprintln!("No matching targets to scan.");
-            return;
-        }
-    }
-
-    let plan = build_scan_plan(cfg, budget);
-
-    // Flatten the plan into owned per-group job lists and a flat list of view
-    // names (in plan order) for the TUI. `end_scan` cutoff is enforced here:
-    // views past their end date are skipped with a warning.
-    let today = chrono::Local::now().format("%Y%m%d").to_string();
-    let mut group_jobs: Vec<(usize, Vec<ViewJob>)> = Vec::new();
-    let mut view_names: Vec<String> = Vec::new();
-    for group in &plan.groups {
-        let mut jobs: Vec<ViewJob> = Vec::new();
-        for root in &group.roots {
-            for view in &root.views {
-                if let Some(ref es) = view.end_scan {
-                    if today.as_str() > es.as_str() {
-                        eprintln!("Skipping target '{}': past end_scan {}", view.name, es);
-                        continue;
-                    }
-                }
-                view_names.push(view.name.clone());
-                jobs.push(ViewJob {
-                    name: view.name.clone(),
-                    scan_path: root.scan_path.to_string_lossy().to_string(),
-                    prefix: view.prefix.clone().map(|p| p.to_string_lossy().to_string()),
-                    team_map: view.team_map.clone(),
-                    team_names: view.team_names.clone(),
-                    purge_time: view.purge_time,
-                    tree_map: view.tree_map,
-                    level: view.level,
-                    workers: view.workers,
-                    sync_host: view.sync_host.clone(),
-                    sync_dest_dir: view.sync_dest_dir.clone(),
-                    sync_user: view.sync_user.clone(),
-                    sync_pass: view.sync_pass,
-                    webhook_url: view.webhook_url.clone(),
-                });
-            }
-        }
-        if !jobs.is_empty() {
-            // Diagnostic: confirms each device's class + worker allocation so it's
-            // clear local disks aren't wrongly capped as NFS.
-            let names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
-            eprintln!(
-                "Device group dev={} class={} workers={} targets=[{}]",
-                group.st_dev, group.dev_class, group.workers, names.join(", ")
-            );
-            group_jobs.push((group.workers, jobs));
-        }
-    }
-    if view_names.is_empty() {
-        eprintln!("No targets to scan (all skipped or empty).");
-        return;
-    }
-
-    let max_parallel_devices = cfg.max_parallel_devices.max(0) as usize;
     std::fs::create_dir_all(&out).ok();
     run_scan_tui(&out, tree_map, level, max_parallel_devices, group_jobs, view_names, debug);
 }
@@ -1669,21 +1631,27 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Own the terminal, spawn one worker thread per device group, and drive the
-/// live TUI: poll each view's ScanProgress ~7×/s, compute rate/mem, render, and
-/// watch for q / Ctrl+C to abort. Returns after all group threads join.
-fn run_scan_tui(
+/// Spawn the background scan: create one `ViewProgress` sink per view, then one
+/// worker thread per device group (roots within a group run sequentially). A
+/// counting semaphore caps concurrent device groups and a global build lock
+/// serializes the RAM-heavy Phase 2/3/merge/history so peak RSS stays at ~one
+/// pipeline while Phase 1 scans stay parallel.
+///
+/// This owns no terminal — it returns a `ScanRun` the caller polls for live
+/// progress. `run_scan_tui` drives it under the standalone monitor; the config
+/// TUI drives it in-place.
+pub(crate) fn spawn_scan_workers(
     out: &str,
     tree_map: bool,
     level: usize,
     max_parallel_devices: usize,
     group_jobs: Vec<(usize, Vec<ViewJob>)>,
-    view_names: Vec<String>,
+    view_names: &[String],
     debug: bool,
-) {
+) -> ScanRun {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     // Shared progress sinks, one per view, keyed by position in view_names.
     let progresses: Vec<Arc<ViewProgress>> = view_names
@@ -1704,7 +1672,6 @@ fn run_scan_tui(
         progresses.iter().map(|p| (p.name.clone(), p.clone())).collect();
 
     let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let app_state = Arc::new(Mutex::new(ui::AppState::new(&view_names)));
 
     // Optional cap on how many device groups scan concurrently (0 = unlimited).
     // A tiny counting semaphore built from a Mutex+Condvar: each group thread
@@ -1756,6 +1723,120 @@ fn run_scan_tui(
             }
         }));
     }
+
+    ScanRun { progresses, handles, abort }
+}
+
+/// Build the device-aware scan plan for `cfg` (restricted to `target` when
+/// non-empty) and return the flattened per-group job lists plus the flat list of
+/// view names in plan order. Shared by the standalone monitor (`run_scan`) and
+/// the config TUI's in-place scan. Returns `None` when there is nothing to scan
+/// (no matching targets, or all skipped by `end_scan`).
+pub(crate) fn plan_scan_jobs(
+    cfg: &mut Config,
+    output_dir: Option<String>,
+    workers: Option<usize>,
+    target: &[String],
+) -> Option<(String, Vec<(usize, Vec<ViewJob>)>, Vec<String>, usize)> {
+    let out = output_dir.unwrap_or_else(|| cfg.resolved_output_dir());
+    let budget = workers.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get() * 2)
+            .unwrap_or(8)
+            .min(32)
+    });
+
+    // Restrict to requested targets, if any.
+    if !target.is_empty() {
+        let want: std::collections::HashSet<&str> = target.iter().map(|s| s.as_str()).collect();
+        for m in target.iter().filter(|n| !cfg.targets.iter().any(|t| &t.name == *n)) {
+            eprintln!("Warning: target '{}' not found in config", m);
+        }
+        cfg.targets.retain(|t| want.contains(t.name.as_str()));
+        if cfg.targets.is_empty() {
+            eprintln!("No matching targets to scan.");
+            return None;
+        }
+    }
+
+    let plan = build_scan_plan(cfg, budget);
+
+    // Flatten the plan into owned per-group job lists and a flat list of view
+    // names (in plan order) for the TUI. `end_scan` cutoff is enforced here:
+    // views past their end date are skipped with a warning.
+    let today = chrono::Local::now().format("%Y%m%d").to_string();
+    let mut group_jobs: Vec<(usize, Vec<ViewJob>)> = Vec::new();
+    let mut view_names: Vec<String> = Vec::new();
+    for group in &plan.groups {
+        let mut jobs: Vec<ViewJob> = Vec::new();
+        for root in &group.roots {
+            for view in &root.views {
+                if let Some(ref es) = view.end_scan {
+                    if today.as_str() > es.as_str() {
+                        eprintln!("Skipping target '{}': past end_scan {}", view.name, es);
+                        continue;
+                    }
+                }
+                view_names.push(view.name.clone());
+                jobs.push(ViewJob {
+                    name: view.name.clone(),
+                    scan_path: root.scan_path.to_string_lossy().to_string(),
+                    prefix: view.prefix.clone().map(|p| p.to_string_lossy().to_string()),
+                    team_map: view.team_map.clone(),
+                    team_names: view.team_names.clone(),
+                    purge_time: view.purge_time,
+                    tree_map: view.tree_map,
+                    level: view.level,
+                    workers: view.workers,
+                    sync_host: view.sync_host.clone(),
+                    sync_dest_dir: view.sync_dest_dir.clone(),
+                    sync_user: view.sync_user.clone(),
+                    sync_pass: view.sync_pass,
+                    webhook_url: view.webhook_url.clone(),
+                });
+            }
+        }
+        if !jobs.is_empty() {
+            let names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
+            eprintln!(
+                "Device group dev={} class={} workers={} targets=[{}]",
+                group.st_dev, group.dev_class, group.workers, names.join(", ")
+            );
+            group_jobs.push((group.workers, jobs));
+        }
+    }
+    if view_names.is_empty() {
+        eprintln!("No targets to scan (all skipped or empty).");
+        return None;
+    }
+
+    let max_parallel_devices = cfg.max_parallel_devices.max(0) as usize;
+    Some((out, group_jobs, view_names, max_parallel_devices))
+}
+
+/// Own the terminal, spawn one worker thread per device group, and drive the
+/// live TUI: poll each view's ScanProgress ~7×/s, compute rate/mem, render, and
+/// watch for q / Ctrl+C to abort. Returns after all group threads join.
+fn run_scan_tui(
+    out: &str,
+    tree_map: bool,
+    level: usize,
+    max_parallel_devices: usize,
+    group_jobs: Vec<(usize, Vec<ViewJob>)>,
+    view_names: Vec<String>,
+    debug: bool,
+) {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    // Spawn the background scan workers (device-group threads + per-view sinks).
+    let run = spawn_scan_workers(out, tree_map, level, max_parallel_devices, group_jobs, &view_names, debug);
+    let progresses = run.progresses.clone();
+    let abort = run.abort.clone();
+    let handles = run.handles;
+
+    let app_state = Arc::new(Mutex::new(ui::AppState::new(&view_names)));
 
     // ── TUI poll loop (this thread owns the terminal) ──
     // The guard renders to /dev/tty and silences core stdout/stderr for the
@@ -2011,6 +2092,9 @@ fn scan_one_view(
         let _ = std::fs::remove_file(out_path.join("data_detail.db"));
         let _ = std::fs::remove_file(out_path.join("treemap.db"));
         let _ = std::fs::remove_file(out_path.join("report.tmp"));
+        // perm_issues has been merged into report.db; drop the scratch sidecar so
+        // the target dir holds a single source of truth (report.db + scan_status.json).
+        let _ = std::fs::remove_file(out_path.join("permission_issues.db"));
 
         set_phase("history");
         if let Err(e) = write_history_snapshot(

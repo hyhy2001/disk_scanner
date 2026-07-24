@@ -4,8 +4,6 @@
 //! `save()`, so `duscan.toml` + `targets/*.toml` stay current). This is separate
 //! from `ui.rs`, which is the read-only scan monitor.
 
-use std::io::Stdout;
-
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::ExecutableCommand;
@@ -99,9 +97,13 @@ struct App {
     status: String,
     /// Set to true to exit the event loop.
     quit: bool,
-    /// When Some, the run loop should drop the TUI, scan these targets (empty =
-    /// all), then re-enter the TUI. Set by the r/R keys.
+    /// When Some, the main loop should start an in-place scan of these targets
+    /// (empty = all) on the next tick. Set by the r/R keys; cleared once the
+    /// scan is launched into `scan`.
     pending_scan: Option<Vec<String>>,
+    /// The live in-place scan, if one is running. Its per-view `ViewProgress`
+    /// sinks are polled each tick to draw the scan-jobs panel; `None` when idle.
+    scan: Option<crate::ScanRun>,
     // ── Output tab state ──
     /// Which report view is shown on the Output tab.
     output_view: OutputView,
@@ -134,6 +136,7 @@ impl App {
             status: "↹ tab · ↑↓ move · a add · e edit · d delete · r scan · R scan-all · q quit".into(),
             quit: false,
             pending_scan: None,
+            scan: None,
             output_view: OutputView::History,
             hist_sel: 0,
             detail_sel: 0,
@@ -199,26 +202,71 @@ impl App {
     }
 }
 
-/// RAII terminal guard: enables raw mode + alternate screen on construction and
-/// restores both on drop (including panic), so a crash never wedges the user's
-/// terminal. Unlike the scan monitor's guard it renders on stdout and does not
-/// redirect fds — the config TUI produces no stray stdout.
-struct TermGuard;
+/// RAII terminal guard: enables raw mode + alternate screen and renders through
+/// `/dev/tty` (a dedicated fd), then redirects stdout+stderr (fd 1/2) to
+/// /dev/null for the whole session. This matters because running a scan in-place
+/// lets the core's Phase 2/3 `println!`/`eprintln!` noise fire while the TUI is
+/// up; routing the display through /dev/tty and silencing fd 1/2 keeps that
+/// noise off the screen. On drop — including panic — it restores fd 1/2, leaves
+/// the alternate screen, and disables raw mode, so a crash never wedges the
+/// user's terminal.
+struct TermGuard {
+    /// The /dev/tty handle the ratatui backend renders through.
+    tty: std::fs::File,
+    saved_stdout: libc::c_int,
+    saved_stderr: libc::c_int,
+}
 
 impl TermGuard {
-    fn enter() -> Result<(Self, Terminal<CrosstermBackend<Stdout>>), String> {
+    fn enter() -> Result<(Self, Terminal<CrosstermBackend<std::fs::File>>), String> {
+        use std::os::unix::io::AsRawFd;
+
+        // Render target: the controlling terminal, independent of fd 1/2.
+        let mut tty = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .map_err(|e| format!("/dev/tty: {}", e))?;
         enable_raw_mode().map_err(|e| format!("raw mode: {}", e))?;
-        let mut out = std::io::stdout();
-        out.execute(EnterAlternateScreen).map_err(|e| format!("alt screen: {}", e))?;
-        let backend = CrosstermBackend::new(out);
+        if let Err(e) = tty.execute(EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(format!("alt screen: {}", e));
+        }
+
+        // Suppress core stdout/stderr: save fd 1/2, point both at /dev/null.
+        let saved_stdout;
+        let saved_stderr;
+        unsafe {
+            saved_stdout = libc::dup(1);
+            saved_stderr = libc::dup(2);
+            if let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
+                let nfd = devnull.as_raw_fd();
+                libc::dup2(nfd, 1);
+                libc::dup2(nfd, 2);
+            }
+        }
+
+        let backend = CrosstermBackend::new(tty.try_clone().map_err(|e| format!("tty clone: {}", e))?);
         let terminal = Terminal::new(backend).map_err(|e| format!("terminal: {}", e))?;
-        Ok((TermGuard, terminal))
+        Ok((TermGuard { tty, saved_stdout, saved_stderr }, terminal))
     }
 }
 
 impl Drop for TermGuard {
     fn drop(&mut self) {
-        let _ = std::io::stdout().execute(LeaveAlternateScreen);
+        // Restore fd 1/2 first so LeaveAlternateScreen and later prints land on
+        // the real terminal.
+        unsafe {
+            if self.saved_stdout >= 0 {
+                libc::dup2(self.saved_stdout, 1);
+                libc::close(self.saved_stdout);
+            }
+            if self.saved_stderr >= 0 {
+                libc::dup2(self.saved_stderr, 2);
+                libc::close(self.saved_stderr);
+            }
+        }
+        let _ = self.tty.execute(LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 }
@@ -231,32 +279,77 @@ pub fn run(cfg: Config) -> Result<(), String> {
         return Err("not a terminal — run `duscan` interactively, or use subcommands".into());
     }
 
-    let mut guard_term = Some(TermGuard::enter()?);
+    let (_guard, mut terminal) = TermGuard::enter()?;
     let mut app = App::new(cfg);
 
+    // Event loop. When no scan is running we block on `event::read()` so an idle
+    // TUI costs nothing; while a scan runs we switch to a short poll so the
+    // scan-jobs panel refreshes ~7×/s and keystrokes stay responsive.
     while !app.quit {
-        {
-            let (_g, terminal) = guard_term.as_mut().unwrap();
-            terminal.draw(|f| draw(f, &app)).map_err(|e| format!("draw: {}", e))?;
-        }
-        match event::read().map_err(|e| format!("read event: {}", e))? {
-            Event::Key(key) if key.kind == event::KeyEventKind::Press => handle_key(&mut app, key),
-            _ => {}
+        terminal.draw(|f| draw(f, &app)).map_err(|e| format!("draw: {}", e))?;
+
+        let scanning = app.scan.is_some();
+        let got_event = if scanning {
+            event::poll(std::time::Duration::from_millis(150)).map_err(|e| format!("poll: {}", e))?
+        } else {
+            true
+        };
+        if got_event {
+            match event::read().map_err(|e| format!("read event: {}", e))? {
+                Event::Key(key) if key.kind == event::KeyEventKind::Press => handle_key(&mut app, key),
+                _ => {}
+            }
         }
 
-        // A scan was requested: fully leave the config TUI (restore terminal),
-        // hand the screen to run_scan's own monitor, then re-enter the TUI and
-        // reload config from disk so any changes made during the scan show up.
+        // A scan was requested: launch the workers in-place (they run in the
+        // background; the TUI keeps rendering and polling their progress).
         if let Some(names) = app.pending_scan.take() {
-            drop(guard_term.take()); // restores terminal via TermGuard::drop
-            crate::run_scan(&mut app.cfg, None, false, None, 3, &names, false);
-            app.cfg = Config::load();
-            app.clamp_selections();
-            guard_term = Some(TermGuard::enter()?);
-            app.status = "Scan finished — back to config.".into();
+            start_scan(&mut app, &names);
+        }
+
+        // Poll the running scan; when every worker has finished, join, reload
+        // config from disk (so any changes made during the scan show up), and
+        // clear the scan handle.
+        if let Some(run) = app.scan.as_ref() {
+            if run.all_finished() {
+                if let Some(mut run) = app.scan.take() {
+                    run.join();
+                }
+                app.cfg = Config::load();
+                app.clamp_selections();
+                app.status = "Scan finished — back to config.".into();
+            }
         }
     }
+
+    // If the user quits mid-scan, tell the workers to stop and wait for them so
+    // no thread is left writing into a half-torn-down process.
+    if let Some(mut run) = app.scan.take() {
+        run.request_abort();
+        run.join();
+    }
     Ok(())
+}
+
+/// Launch an in-place scan of `names` (empty = all targets). Builds the plan
+/// from a clone of the live config (so the scan sees the on-disk targets), then
+/// spawns the background workers into `app.scan`. Displayed by the scan-jobs
+/// panel; polled by the main loop until finished.
+fn start_scan(app: &mut App, names: &[String]) {
+    let mut cfg = app.cfg.clone();
+    match crate::plan_scan_jobs(&mut cfg, None, None, names) {
+        Some((out, group_jobs, view_names, max_parallel_devices)) => {
+            std::fs::create_dir_all(&out).ok();
+            let run = crate::spawn_scan_workers(
+                &out, false, 3, max_parallel_devices, group_jobs, &view_names, false,
+            );
+            app.status = format!("Scanning {} target(s)… (q to quit; scan keeps running)", view_names.len());
+            app.scan = Some(run);
+        }
+        None => {
+            app.status = "Nothing to scan (no matching targets, or all past end_scan).".into();
+        }
+    }
 }
 
 /// Dispatch a key press based on the current mode.
@@ -302,17 +395,28 @@ fn handle_browse_key(app: &mut App, key: event::KeyEvent) {
         KeyCode::Char('4') => { app.tab = Tab::Output; app.clear_filter(); return; }
         KeyCode::Char('5') => { app.tab = Tab::Settings; app.clear_filter(); return; }
         // r = scan selected target; R = scan all. Treemap navigation uses
-        // arrows/Enter/Backspace so r/R don't clash on the Output tab.
+        // arrows/Enter/Backspace so r/R don't clash on the Output tab. A scan
+        // already in flight blocks a new one so its worker threads aren't
+        // orphaned.
         KeyCode::Char('r') => {
-            match app.current_target_name() {
-                Some(n) => { app.pending_scan = Some(vec![n]); }
-                None => { app.status = "No target to scan — add one first.".into(); }
+            if app.scan.is_some() {
+                app.status = "A scan is already running — wait for it to finish.".into();
+            } else {
+                match app.current_target_name() {
+                    Some(n) => { app.pending_scan = Some(vec![n]); }
+                    None => { app.status = "No target to scan — add one first.".into(); }
+                }
             }
             return;
         }
         KeyCode::Char('R') => {
-            if app.cfg.targets.is_empty() { app.status = "No targets to scan.".into(); }
-            else { app.pending_scan = Some(Vec::new()); } // empty = all
+            if app.scan.is_some() {
+                app.status = "A scan is already running — wait for it to finish.".into();
+            } else if app.cfg.targets.is_empty() {
+                app.status = "No targets to scan.".into();
+            } else {
+                app.pending_scan = Some(Vec::new()); // empty = all
+            }
             return;
         }
         _ => {}
@@ -1015,14 +1119,28 @@ fn handle_confirm_key(app: &mut App, key: event::KeyEvent) {
 
 fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    // While a scan runs, reserve a strip above the footer for the live jobs
+    // panel (one row per target job + border). Cap it so many targets can't
+    // crowd out the body.
+    let scan_rows = match app.scan.as_ref() {
+        Some(run) => (run.progresses.len().min(8) as u16) + 2,
+        None => 0,
+    };
+    let mut constraints = vec![
+        Constraint::Length(3), // tab bar
+        Constraint::Min(0),    // body
+    ];
+    if scan_rows > 0 {
+        constraints.push(Constraint::Length(scan_rows)); // scan-jobs panel
+    }
+    constraints.push(Constraint::Length(4)); // footer: status + key hint
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // tab bar
-            Constraint::Min(0),    // body
-            Constraint::Length(4), // footer: status + key hint (2 lines + border)
-        ])
+        .constraints(constraints)
         .split(area);
+    // Footer is always the last chunk; the scan panel (if any) sits just above.
+    let footer_idx = chunks.len() - 1;
+    let scan_idx = if scan_rows > 0 { Some(footer_idx - 1) } else { None };
 
     // Tab bar with the active config path in the block title.
     let titles = vec!["1 Targets", "2 Teams & Users", "3 Scan/Sync", "4 Output", "5 Settings"];
@@ -1044,6 +1162,11 @@ fn draw(frame: &mut Frame, app: &App) {
         Tab::Settings => draw_settings(frame, app, chunks[1]),
     }
 
+    // Live scan-jobs panel (only while a scan is running).
+    if let Some(idx) = scan_idx {
+        draw_scan_jobs(frame, app, chunks[idx]);
+    }
+
     // Footer: status line + context hint.
     let hint = footer_hint(app);
     let footer = Paragraph::new(vec![
@@ -1051,7 +1174,7 @@ fn draw(frame: &mut Frame, app: &App) {
         Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
     ])
     .block(Block::default().borders(Borders::ALL));
-    frame.render_widget(footer, chunks[2]);
+    frame.render_widget(footer, chunks[footer_idx]);
 
     // Modal overlays.
     match &app.mode {
@@ -1059,6 +1182,82 @@ fn draw(frame: &mut Frame, app: &App) {
             draw_input_modal(frame, area, prompt, buf, completions, is_path_input(kind)),
         Mode::Confirm { prompt, .. } => draw_confirm_modal(frame, area, prompt),
         Mode::Browse => {}
+    }
+}
+
+/// Map a coarse scan phase label to a human-readable stage name + color.
+fn phase_display(phase: &str) -> (String, Color) {
+    match phase {
+        "waiting" => ("Waiting".into(), Color::DarkGray),
+        "queued" => ("Queued".into(), Color::DarkGray),
+        "scanning" => ("Scanning".into(), Color::Cyan),
+        "building" => ("Building detail".into(), Color::Yellow),
+        "treemap" => ("Building treemap".into(), Color::Yellow),
+        "merging" => ("Merging".into(), Color::Magenta),
+        "history" => ("History".into(), Color::Magenta),
+        "syncing" => ("Syncing".into(), Color::Blue),
+        "done" => ("Done".into(), Color::Green),
+        "error" => ("Error".into(), Color::Red),
+        other => (other.to_string(), Color::White),
+    }
+}
+
+/// Render the live scan-jobs panel: one row per target showing its current
+/// stage (Scanning / Building detail / Merging / …) plus live file+dir counts.
+fn draw_scan_jobs(frame: &mut Frame, app: &App, area: Rect) {
+    let run = match app.scan.as_ref() {
+        Some(r) => r,
+        None => return,
+    };
+    let mut rows: Vec<ListItem> = Vec::new();
+    for p in &run.progresses {
+        let (files, dirs, _size) = p.scan.snapshot();
+        let phase = p.phase.lock().map(|g| g.clone()).unwrap_or_default();
+        let err = p.error.lock().map(|g| g.clone()).unwrap_or_default();
+        let (label, color) = phase_display(&phase);
+        let detail = if phase == "error" && !err.is_empty() {
+            format!("  {}", err)
+        } else {
+            format!("  {} files · {} dirs", fmt_count(files), fmt_count(dirs))
+        };
+        rows.push(ListItem::new(Line::from(vec![
+            Span::styled(format!("{:<16}", truncate(&p.name, 16)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{:<18}", label), Style::default().fg(color)),
+            Span::styled(detail, Style::default().fg(Color::Gray)),
+        ])));
+    }
+    let done = run.all_finished();
+    let title = if done {
+        " Scan jobs — finished ".to_string()
+    } else {
+        " Scan jobs — running (q quits, scan keeps running) ".to_string()
+    };
+    let list = List::new(rows)
+        .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(list, area);
+}
+
+/// Thousands-separated count for the scan panel.
+fn fmt_count(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+/// Truncate `s` to `max` chars, adding an ellipsis when cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let keep = max.saturating_sub(1);
+        format!("{}…", s.chars().take(keep).collect::<String>())
     }
 }
 
