@@ -141,6 +141,13 @@ enum Command {
         days: i64,
         #[arg(long)]
         json: bool,
+        /// Show a per-user growth/trend table across the snapshots instead of the
+        /// per-day dump: columns are dates (old→new), plus Abs/%/Trend growth rows.
+        #[arg(long)]
+        compare: bool,
+        /// Max users in the compare table (ranked by absolute growth).
+        #[arg(long, default_value = "10")]
+        top: usize,
     },
     /// Import a legacy JSON config tree into duscan.toml.
     ImportLegacy {
@@ -650,9 +657,13 @@ fn main() {
                 Err(e) => eprintln!("{}", e),
             }
         }
-        Command::History { output_dir, target, days, json } => {
+        Command::History { output_dir, target, days, json, compare, top } => {
             let out = output_dir.clone().unwrap_or_else(|| cfg.output_dir.clone());
-            show_history(&out, target.as_deref(), *days, *json);
+            if *compare {
+                show_history_compare(&out, target.as_deref(), *days, *top, *json);
+            } else {
+                show_history(&out, target.as_deref(), *days, *json);
+            }
         }
         Command::ImportLegacy { dir, force } => {
             match import_legacy_config(dir, *force) {
@@ -1045,6 +1056,161 @@ fn show_history(out: &str, target: Option<&str>, days: i64, json: bool) {
     } else if !any {
         println!("No history found under '{}'.", out);
     }
+}
+
+/// Growth metrics for one user across a chronological series of usage values.
+/// Mirrors legacy report_comparison: abs = last − first-nonzero, pct relative to
+/// that first value, trend from consecutive-diff direction (needs ≥3 points).
+struct Growth {
+    abs: i64,
+    pct: Option<f64>,
+    trend: &'static str,
+}
+
+fn compute_growth(values: &[i64]) -> Growth {
+    if values.len() < 2 {
+        return Growth { abs: 0, pct: None, trend: "-" };
+    }
+    // First non-zero value is the baseline (legacy behavior).
+    let mut first = values[0];
+    if first == 0 {
+        if let Some(&v) = values.iter().find(|&&v| v > 0) { first = v; }
+    }
+    let last = *values.last().unwrap();
+    let abs = last - first;
+    let pct = if first > 0 { Some(abs as f64 / first as f64 * 100.0) } else { None };
+    Growth { abs, pct, trend: trend_indicator(values) }
+}
+
+/// Trend arrow from consecutive diffs: ^ mostly up, v mostly down, ~ mixed,
+/// - stable / too few points. Needs ≥3 points like legacy.
+fn trend_indicator(values: &[i64]) -> &'static str {
+    if values.len() < 3 { return "-"; }
+    if values.iter().all(|&v| v == values[0]) { return "-"; }
+    let diffs: Vec<i64> = values.windows(2).map(|w| w[1] - w[0]).collect();
+    let pos = diffs.iter().filter(|&&d| d > 0).count();
+    let neg = diffs.iter().filter(|&&d| d < 0).count();
+    let n = diffs.len() as f64;
+    if pos as f64 > n * 0.7 { "^" }
+    else if neg as f64 > n * 0.7 { "v" }
+    else { "~" }
+}
+
+/// `history --compare`: per-user growth/trend across the last `days` snapshots.
+/// Builds a transposed table — one row per user, one column per scan date
+/// (chronological), followed by Abs Growth / % Growth / Trend. Users are ranked
+/// by absolute growth and capped at `top`.
+fn show_history_compare(out: &str, target: Option<&str>, days: i64, top: usize, json: bool) {
+    let Ok(entries) = std::fs::read_dir(out) else {
+        eprintln!("Cannot read output dir '{}'", out);
+        return;
+    };
+    let mut any = false;
+    let mut json_targets: Vec<serde_json::Value> = Vec::new();
+
+    for entry in entries.flatten() {
+        let tname = entry.file_name().to_string_lossy().to_string();
+        if let Some(want) = target {
+            if tname != want { continue; }
+        }
+        let db_path = entry.path().join("report.db");
+        if !db_path.exists() { continue; }
+        let Ok(conn) = rusqlite::Connection::open(&db_path) else { continue };
+
+        // Dates oldest→newest (chronological) so growth reads left-to-right.
+        let dates: Vec<(i64, i64)> = {
+            let Ok(mut stmt) = conn.prepare(
+                "SELECT id, scan_date FROM (SELECT id, scan_date FROM hist_snapshots \
+                 ORDER BY scan_date DESC LIMIT ?1) ORDER BY scan_date ASC",
+            ) else { continue };
+            stmt.query_map(rusqlite::params![days.max(1)], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            }).map(|rows| rows.flatten().collect()).unwrap_or_default()
+        };
+        if dates.len() < 2 { continue; }
+
+        // Per-user usage series aligned to `dates` (0 where a user is absent
+        // that day). Collected user-first for easy growth computation.
+        let mut series: std::collections::BTreeMap<String, Vec<i64>> = std::collections::BTreeMap::new();
+        for (col, (snap_id, _)) in dates.iter().enumerate() {
+            let rows = {
+                let Ok(mut stmt) = conn.prepare(
+                    "SELECT name, size FROM hist_user_usage WHERE snapshot_id = ?1 AND kind = 'user'",
+                ) else { continue };
+                let v: Vec<(String, i64)> = stmt.query_map(rusqlite::params![snap_id], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                }).map(|rows| rows.flatten().collect()).unwrap_or_default();
+                v
+            };
+            for (name, size) in rows {
+                let e = series.entry(name).or_insert_with(|| vec![0; dates.len()]);
+                e[col] = size;
+            }
+        }
+        if series.is_empty() { continue; }
+        any = true;
+
+        // Rank users by absolute growth, keep top N.
+        let mut ranked: Vec<(String, Vec<i64>, Growth)> = series.into_iter()
+            .map(|(name, vals)| { let g = compute_growth(&vals); (name, vals, g) })
+            .collect();
+        ranked.sort_by(|a, b| b.2.abs.cmp(&a.2.abs));
+        ranked.truncate(top.max(1));
+
+        emit_history_compare(&tname, &dates, &ranked, json, &mut json_targets);
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!(json_targets)).unwrap_or_else(|_| "[]".into()));
+    } else if !any {
+        println!("No comparable history under '{}' (need ≥2 snapshots).", out);
+    }
+}
+
+/// Render one target's compare table (text) or push its JSON object.
+fn emit_history_compare(
+    tname: &str,
+    dates: &[(i64, i64)],
+    ranked: &[(String, Vec<i64>, Growth)],
+    json: bool,
+    json_targets: &mut Vec<serde_json::Value>,
+) {
+    if json {
+        let users: Vec<serde_json::Value> = ranked.iter().map(|(name, vals, g)| {
+            serde_json::json!({
+                "user": name,
+                "usage": dates.iter().zip(vals).map(|((_, d), v)|
+                    serde_json::json!({"date": d, "size": v})).collect::<Vec<_>>(),
+                "abs_growth": g.abs,
+                "pct_growth": g.pct,
+                "trend": g.trend,
+            })
+        }).collect();
+        json_targets.push(serde_json::json!({
+            "target": tname,
+            "dates": dates.iter().map(|(_, d)| *d).collect::<Vec<_>>(),
+            "users": users,
+        }));
+        return;
+    }
+
+    println!("\n=== History comparison: {} ({} snapshots) ===", tname, dates.len());
+    // Header: user column + one column per date + growth columns.
+    let uw = ranked.iter().map(|(n, _, _)| n.len()).max().unwrap_or(4).max(4);
+    print!("  {:<width$}", "User", width = uw);
+    for (_, d) in dates { print!("  {:>10}", fmt_date_short(*d)); }
+    println!("  {:>10}  {:>7}  {}", "Abs", "%", "Trend");
+    for (name, vals, g) in ranked {
+        print!("  {:<width$}", name, width = uw);
+        for v in vals { print!("  {:>10}", fmt_size(*v)); }
+        let pct = match g.pct { Some(p) => format!("{:+.1}%", p), None => "N/A".into() };
+        println!("  {:>10}  {:>7}  {}", fmt_size(g.abs), pct, g.trend);
+    }
+}
+
+/// yyyymmdd → MM-DD (compact column header).
+fn fmt_date_short(d: i64) -> String {
+    format!("{:02}-{:02}", (d / 100) % 100, d % 100)
 }
 
 /// Top users (kind='user') for a snapshot, largest first.
