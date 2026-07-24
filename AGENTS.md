@@ -69,6 +69,7 @@ target's `report.db`; empty states point you to press `r` to scan first.
 ./duscan sync --host HOST --dest-dir DIR [--output-dir DIR] [--user USER] [--pass]
 #   --pass: password auth via `sshpass -e` (reads password from SSHPASS env; password never stored). Per-target: sync_pass=true.
 ./duscan history [--output-dir DIR] [--target <name>] [--days N] [--json]   # per-day usage trend from report.db hist_* tables
+#   --compare [--top N]: per-user growth/trend table across snapshots (cols = dates old→new, + Abs/%/Trend: ^ up, v down, ~ mixed)
 ./duscan import-legacy --dir <configs_dir> [--force]                        # migrate legacy JSON configs -> duscan.toml
 ```
 
