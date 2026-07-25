@@ -25,6 +25,11 @@ pub struct ScanProgress {
     pub dirs: Arc<AtomicU64>,
     pub size: Arc<AtomicU64>,
     pub done: Arc<AtomicBool>,
+    /// Cooperative cancel flag. A consumer (e.g. the TUI on quit) sets this to
+    /// ask the parallel walk to stop promptly; walker threads check it per
+    /// directory entry and return `WalkState::Quit`, so cancellation takes
+    /// effect mid-scan instead of only between whole views.
+    pub cancel: Arc<AtomicBool>,
 }
 
 impl ScanProgress {
@@ -41,6 +46,14 @@ impl ScanProgress {
     }
     pub fn is_done(&self) -> bool {
         self.done.load(Ordering::SeqCst)
+    }
+    /// Ask the running walk to stop at the next entry check.
+    pub fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+    /// True once a cancel has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
     }
 }
 
@@ -419,6 +432,36 @@ mod mount_skip_tests {
         assert_eq!(hardlink_key(p, 42, 7, false), (42, 7));
         assert_eq!(hardlink_key(p, 0, 0, false), (0, 0));
     }
+
+    // A ScanProgress with its cancel flag pre-set makes the walk bail almost
+    // immediately: every entry closure returns WalkState::Quit on the first
+    // check, so a scan of a large tree (here /usr) completes in well under the
+    // time a full walk would take. Guards the TUI-quit responsiveness fix.
+    #[test]
+    fn cancel_flag_stops_walk_promptly() {
+        let dir = "/usr";
+        if !std::path::Path::new(dir).is_dir() {
+            return; // environment without /usr — skip rather than fail
+        }
+        let progress = ScanProgress::new();
+        progress.request_cancel(); // cancel before the walk even starts
+        assert!(progress.is_cancelled());
+
+        let start = std::time::Instant::now();
+        let res = run_scan_core(
+            dir.to_string(), vec![], None, Some(8), false, "cli", None, Some(progress.clone()),
+        );
+        let elapsed = start.elapsed();
+
+        // The call must succeed (cancellation is not an error) and return fast.
+        // A real /usr walk takes seconds; a pre-cancelled one must be far quicker.
+        assert!(res.is_ok(), "cancelled scan should still return Ok");
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "pre-cancelled walk took {:?}, expected it to bail promptly",
+            elapsed
+        );
+    }
 }
 
 
@@ -477,6 +520,7 @@ pub fn run_scan_core(
     let prog_dirs = sink.dirs.clone();
     let prog_size = sink.size.clone();
     let done = sink.done.clone();
+    let cancel = sink.cancel.clone();
     let prof_metadata_ns = Arc::new(AtomicU64::new(0));
     let prof_path_ns = Arc::new(AtomicU64::new(0));
     let prof_flush_ns = Arc::new(AtomicU64::new(0));
@@ -545,6 +589,7 @@ pub fn run_scan_core(
     let pd_clone = prog_dirs.clone();
     let ps_clone = prog_size.clone();
     let d_clone = done.clone();
+    let cancel_walk = cancel.clone();
     let dir_clone = directory.clone();
     let skips = skip_dirs.clone();
     let tmpdir_clone = tmpdir_str.clone();
@@ -584,7 +629,7 @@ pub fn run_scan_core(
     let foreign_mnt_logged: Arc<DashSet<u64>> = Arc::new(DashSet::new());
     let foreign_mnt_logged_clone = foreign_mnt_logged.clone();
 
-    let _walk_thread = thread::spawn(move || {
+    let walk_thread = thread::spawn(move || {
         // Ensure `done` flips to true even if the parallel walk panics —
         // otherwise the main progress loop spins forever waiting on a flag
         // that will never be set. RAII guard runs on every exit path.
@@ -653,8 +698,16 @@ pub fn run_scan_core(
                 let child_mount = child_mount_clone.clone();
                 let visited_dirs = visited_dirs_clone.clone();
                 let foreign_mnt_logged = foreign_mnt_logged_clone.clone();
+                let cancel = cancel_walk.clone();
 
                 Box::new(move |entry_res| {
+                    // Cooperative cancellation: the TUI (or any consumer) sets
+                    // the cancel flag on quit; bail out of the walk promptly so
+                    // teardown doesn't block for the rest of a large tree.
+                    if cancel.load(Ordering::Relaxed) {
+                        return WalkState::Quit;
+                    }
+
                     // --- Error entry: record as permission issue ---
                     let entry = match entry_res {
                         Ok(e) => e,
@@ -1043,6 +1096,20 @@ pub fn run_scan_core(
         }
     }
     // no trailing newline needed — println already adds one
+
+    // Join the walk thread now that `done` is set (the DoneGuard flips it on
+    // every exit path, including panic, so this returns promptly). Joining —
+    // rather than dropping the handle — means a panic inside the parallel walk
+    // surfaces here as an error instead of being silently swallowed, and the
+    // thread's resources are reclaimed before we read the shared stats.
+    if let Err(e) = walk_thread.join() {
+        let msg = e
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| e.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "scan walk thread panicked".to_string());
+        return Err(PyRuntimeError::new_err(format!("scan walk failed: {}", msg)));
+    }
 
     // --- Build return value ---
     let g = global_stats.lock().unwrap();
