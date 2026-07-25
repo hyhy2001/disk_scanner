@@ -225,6 +225,8 @@ __marimo__/
 # duscan build artifacts, local config, and scan output
 /duscan
 /duscan-static
+# project-local Rust toolchain installed by `make setup-env`
+/.rust/
 /duscan.toml
 /targets/
 /reports/

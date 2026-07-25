@@ -296,22 +296,32 @@ report different `st_dev`, which would inflate size).
 ## Build
 
 ```bash
+make setup-env      # install a project-local Rust toolchain into ./.rust (one-time)
 make build          # → ./duscan (release, dynamically linked, stripped)
 make static-build   # → ./duscan-static (fully static)
-make test           # cargo test -p duscan
+make test           # tests, via the local toolchain
 make install        # copy ./duscan to /usr/local/bin
-make clean
+make clean          # cargo clean + remove built binaries
+make clean-env      # remove the project-local toolchain in ./.rust
 ```
 
-Static build under the hood:
+**Self-contained toolchain.** `make setup-env` installs `rustup` + `cargo` into
+`./.rust` (with `CARGO_HOME=./.rust/cargo`, `RUSTUP_HOME=./.rust/rustup`) instead
+of `~/.cargo`. The whole build is then hermetic — toolchain, registry cache, and
+git deps all live under the project dir and never touch a system Rust install.
+Every `make` target runs cargo from that local toolchain. If you already have a
+global cargo on `PATH`, `make build` uses it as a fallback when `setup-env` hasn't
+been run. To drive the local toolchain from your own shell:
 
 ```bash
-RUSTFLAGS="-C target-feature=+crt-static" \
-  cargo build --release --target x86_64-unknown-linux-gnu -p duscan
+export CARGO_HOME=$PWD/.rust/cargo RUSTUP_HOME=$PWD/.rust/rustup
+export PATH=$PWD/.rust/cargo/bin:$PATH
 ```
 
+`RUST_VERSION` overrides the toolchain channel (default `stable`):
+`make setup-env RUST_VERSION=1.90.0`.
+
 - **OS:** Linux x86_64
-- **Toolchain:** stable Rust (edition 2021)
 - **For sync (optional):** `ssh` with key-based auth, or `sshpass` for `--pass`
 
 ---

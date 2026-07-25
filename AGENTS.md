@@ -3,10 +3,17 @@
 ## Quick commands
 
 ```bash
-make build       # → ./duscan
+make setup-env   # install a project-local Rust toolchain into ./.rust (one-time)
+make build       # → ./duscan (uses the local toolchain)
 make static-build # → static binary
-make clean
+make clean        # cargo clean + remove binaries
+make clean-env    # remove ./.rust toolchain
 ```
+
+`make setup-env` puts `rustup`/`cargo` under `./.rust` (`CARGO_HOME=./.rust/cargo`,
+`RUSTUP_HOME=./.rust/rustup`) so the build is hermetic — no `~/.cargo` dependency.
+All `make` targets run cargo from there; a global cargo is used only as a fallback
+when setup-env hasn't run. `./.rust/` is gitignored.
 
 ## Interactive config TUI
 
@@ -218,5 +225,7 @@ things keep it fast on NFS:
 
 ## Build notes
 
-- Release: `make build` → `./duscan` (dynamically linked)
-- Static: `RUSTFLAGS="-C target-feature=+crt-static" cargo build --release --target x86_64-unknown-linux-gnu -p duscan`
+- Toolchain: `make setup-env` (project-local rustup/cargo in `./.rust`; hermetic).
+- Release: `make build` → `./duscan` (dynamically linked, via local toolchain).
+- Static: `make static-build` → `./duscan-static`
+  (equivalent to `cargo rustc --release -p duscan -- -C target-feature=+crt-static`).
