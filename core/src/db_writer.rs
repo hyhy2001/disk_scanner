@@ -146,9 +146,12 @@ CREATE INDEX ix_dirs_uid_size_dir            ON dirs(uid, size DESC, id ASC);
 CREATE INDEX ix_file_names_name              ON file_names(name);
 ";
 
+// NOTE: application_id is NOT set here. `PRAGMA application_id` takes a signed
+// 32-bit value; the magic tag 0xC0DD15D2 exceeds i32::MAX as a positive decimal
+// literal, and SQLite silently clamps an out-of-range literal to 0. It is
+// stamped correctly (as the i32-reinterpreted MERGED_APP_ID) via stamp_db()
+// right after this DDL runs.
 const MERGED_DDL: &str = "
-PRAGMA application_id = 2685705682;  -- 0xC0DD15D2
-PRAGMA schema_version = 1;
 
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
@@ -273,7 +276,7 @@ CREATE INDEX IF NOT EXISTS ix_hist_user_snap
 /// Returns the connection with WAL mode, cache, and mmap configured.
 pub fn open_merged_db(merged_db_path: &Path) -> rusqlite::Result<Connection> {
     let exists = merged_db_path.exists();
-    let mut conn = Connection::open(merged_db_path)?;
+    let conn = Connection::open(merged_db_path)?;
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
@@ -284,6 +287,10 @@ pub fn open_merged_db(merged_db_path: &Path) -> rusqlite::Result<Connection> {
     )?;
     if !exists {
         conn.execute_batch(MERGED_DDL)?;
+        // Stamp the format magic correctly (the DDL can't, see MERGED_DDL note).
+        // pragma_update takes the value as i32, so the 0xC0DD15D2 bit pattern
+        // round-trips exactly instead of being clamped to 0.
+        conn.pragma_update(None, "application_id", MERGED_APP_ID)?;
     }
     Ok(conn)
 }
@@ -302,9 +309,6 @@ pub fn merge_into_single_db(
     let tmp = merged_db.with_extension("tmp");
 
     // Remove stale tmp from previous run if present
-    let _ = std::fs::remove_file(&tmp);
-
-    // Remove stale tmp if present
     let _ = std::fs::remove_file(&tmp);
 
     // Build schemas + pragmas

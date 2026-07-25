@@ -1679,9 +1679,16 @@ impl ScanRun {
         self.progresses.iter().all(|p| p.finished.load(Ordering::SeqCst))
     }
 
-    /// Signal every worker to stop at the next safe checkpoint.
+    /// Signal every worker to stop at the next safe checkpoint. Sets the
+    /// between-jobs abort flag AND each view's in-walk cancel flag, so an
+    /// already-running scan bails out mid-directory instead of only between
+    /// whole views — this keeps `join()` (and thus a TUI quit) from blocking
+    /// for the remainder of a large tree.
     pub fn request_abort(&self) {
         self.abort.store(true, std::sync::atomic::Ordering::SeqCst);
+        for p in &self.progresses {
+            p.scan.request_cancel();
+        }
     }
 
     /// Join all worker threads (blocks until they exit).
@@ -2192,6 +2199,13 @@ fn run_scan_tui(
                             && k.modifiers.contains(KeyModifiers::CONTROL));
                     if quit {
                         abort.store(true, Ordering::SeqCst);
+                        // The between-jobs `abort` flag only stops the *next*
+                        // queued view; also set each in-flight scan's cancel
+                        // flag so the running Phase-1 walk bails mid-directory
+                        // instead of finishing the whole tree + build first.
+                        for p in &progresses {
+                            p.scan.request_cancel();
+                        }
                         let mut s = app_state.lock().unwrap();
                         s.abort = true;
                     }
@@ -2354,6 +2368,34 @@ fn scan_one_view(
     let dirs = result["total_dirs"].as_u64().unwrap_or(0);
     let scanned_size = result["total_size"].as_u64().unwrap_or(0);
     let tmpdir = result["detail_tmpdir"].as_str().unwrap_or("").to_string();
+
+    // The Phase-1 engine persists its scratch shards (scan_t*.bin, diragg_*,
+    // perm_*, …) under `tmpdir` and detaches the TempDir, so nothing deletes it
+    // automatically. This guard removes that directory on every exit path from
+    // here on (cancel, Phase-2 error, or success), so repeated/cron'd scans no
+    // longer leak gigabytes of temp files. Only the Phase-2 build reads it, and
+    // that has finished (or been skipped) by the time this guard drops.
+    struct TmpdirGuard(String);
+    impl Drop for TmpdirGuard {
+        fn drop(&mut self) {
+            if !self.0.is_empty() {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+    let _tmpdir_guard = TmpdirGuard(tmpdir.clone());
+
+    // Cancellation only stops Phase 1's walk; the RAM-heavy Phase 2/3 build
+    // below would still run to completion on the partial data (blocking a TUI
+    // quit for the whole build). If a cancel was requested, stop here rather
+    // than building a report from a truncated scan. The TmpdirGuard above still
+    // removes the scratch shards on this early return.
+    if sink.scan.is_cancelled() {
+        set_phase("done");
+        write_scan_status(&target_out, "cancelled", false, run_started, run_started, "Scan cancelled", "", tree_map, files, dirs, scanned_size);
+        return;
+    }
+
     if tmpdir.is_empty() {
         set_phase("done");
         write_scan_status(&target_out, "done", false, run_started, run_started, "Scan complete", "", tree_map, files, dirs, scanned_size);
@@ -2615,10 +2657,13 @@ fn export_user_text(conn: &rusqlite::Connection, uid: i64, username: &str, expor
         .collect();
     let header = format!("{:<5} {:<20} {:>12}  {}\n{}\n", "Type", "User", "Size", "Path", "-".repeat(90));
 
-    // Dirs
+    // Dirs. Wrap in a BufWriter so a user with hundreds of thousands of rows
+    // becomes a few thousand block writes instead of one write() syscall per
+    // line (that per-line syscall storm is what made export take minutes).
     let dir_path = export_dir.join(format!("usage_dir_{}.txt", safe_user));
-    if let Ok(mut f) = std::fs::File::create(&dir_path) {
-        let _ = f.write_all(header.as_bytes());
+    if let Ok(f) = std::fs::File::create(&dir_path) {
+        let mut w = std::io::BufWriter::new(f);
+        let _ = w.write_all(header.as_bytes());
         if let Ok(mut stmt) = conn.prepare(
             "SELECT size, path FROM detail_dirs WHERE uid = ?1 ORDER BY size DESC",
         ) {
@@ -2626,16 +2671,18 @@ fn export_user_text(conn: &rusqlite::Connection, uid: i64, username: &str, expor
                 Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
             }) {
                 for row in rows.flatten() {
-                    let _ = writeln!(f, "{:<5} {:<20} {:>12}  {}", "dir", username, fmt_size(row.0), row.1);
+                    let _ = writeln!(w, "{:<5} {:<20} {:>12}  {}", "dir", username, fmt_size(row.0), row.1);
                 }
             }
         }
+        let _ = w.flush();
     }
 
-    // Files (join names + parent dir path)
+    // Files (join names + parent dir path). Same BufWriter treatment.
     let file_path = export_dir.join(format!("usage_file_{}.txt", safe_user));
-    if let Ok(mut f) = std::fs::File::create(&file_path) {
-        let _ = f.write_all(header.as_bytes());
+    if let Ok(f) = std::fs::File::create(&file_path) {
+        let mut w = std::io::BufWriter::new(f);
+        let _ = w.write_all(header.as_bytes());
         if let Ok(mut stmt) = conn.prepare(
             "SELECT fl.size, d.path, n.name \
              FROM detail_files fl \
@@ -2648,10 +2695,11 @@ fn export_user_text(conn: &rusqlite::Connection, uid: i64, username: &str, expor
             }) {
                 for row in rows.flatten() {
                     let full = format!("{}/{}", row.1.trim_end_matches('/'), row.2);
-                    let _ = writeln!(f, "{:<5} {:<20} {:>12}  {}", "file", username, fmt_size(row.0), full);
+                    let _ = writeln!(w, "{:<5} {:<20} {:>12}  {}", "file", username, fmt_size(row.0), full);
                 }
             }
         }
+        let _ = w.flush();
     }
 }
 

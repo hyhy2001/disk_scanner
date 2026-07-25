@@ -79,6 +79,34 @@ enum Mode {
 }
 
 /// Whole-app state: the live config plus cursor positions per tab.
+/// A txt export running on a background thread. The worker does the SQLite
+/// reads + file writes (potentially minutes on a large NFS report) and reports
+/// its outcome back through `done`; the event loop polls `done` each tick and
+/// swaps the result into the footer status, so export never blocks rendering or
+/// keystrokes. Mirrors the `ScanRun` background-work pattern.
+struct ExportRun {
+    /// Set by the worker when it exits, carrying the message to show in the
+    /// footer (either the "Exported N …" success line or an "Export failed: …").
+    done: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Join handle for the worker; joined once `done` is populated.
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ExportRun {
+    /// The finished status message, if the worker has exited; `None` while it is
+    /// still running.
+    fn take_result(&self) -> Option<String> {
+        self.done.lock().ok().and_then(|mut g| g.take())
+    }
+
+    /// Join the worker thread (it has already exited by the time this is called).
+    fn join(&mut self) {
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 struct App {
     cfg: Config,
     tab: Tab,
@@ -104,6 +132,10 @@ struct App {
     /// The live in-place scan, if one is running. Its per-view `ViewProgress`
     /// sinks are polled each tick to draw the scan-jobs panel; `None` when idle.
     scan: Option<crate::ScanRun>,
+    /// A running txt export, if any. Export I/O runs on a worker thread so the
+    /// event loop keeps drawing and reading keys while it works; polled each
+    /// tick and cleared once its thread signals `done`. `None` when idle.
+    export: Option<ExportRun>,
     // ── Output tab state ──
     /// Which report view is shown on the Output tab.
     output_view: OutputView,
@@ -137,6 +169,7 @@ impl App {
             quit: false,
             pending_scan: None,
             scan: None,
+            export: None,
             output_view: OutputView::History,
             hist_sel: 0,
             detail_sel: 0,
@@ -288,8 +321,10 @@ pub fn run(cfg: Config) -> Result<(), String> {
     while !app.quit {
         terminal.draw(|f| draw(f, &app)).map_err(|e| format!("draw: {}", e))?;
 
-        let scanning = app.scan.is_some();
-        let got_event = if scanning {
+        // Poll (rather than block) while a scan or export runs so the footer
+        // reflects their progress/outcome without waiting on a keystroke.
+        let busy = app.scan.is_some() || app.export.is_some();
+        let got_event = if busy {
             event::poll(std::time::Duration::from_millis(150)).map_err(|e| format!("poll: {}", e))?
         } else {
             true
@@ -320,12 +355,29 @@ pub fn run(cfg: Config) -> Result<(), String> {
                 app.status = "Scan finished — back to config.".into();
             }
         }
+
+        // Poll a running export; once its worker has posted a result, join it,
+        // clear the handle, and show the outcome in the footer.
+        if let Some(result) = app.export.as_ref().and_then(|e| e.take_result()) {
+            if let Some(mut run) = app.export.take() {
+                run.join();
+            }
+            app.status = result;
+        }
     }
 
-    // If the user quits mid-scan, tell the workers to stop and wait for them so
-    // no thread is left writing into a half-torn-down process.
+    // If the user quits mid-scan, signal the workers to cancel (both the
+    // between-jobs abort flag and the in-walk cancel flag) and wait for them so
+    // no thread is left writing into a half-torn-down process. Because the walk
+    // now checks the cancel flag per entry, this returns promptly instead of
+    // blocking until the rest of a large tree finishes.
     if let Some(mut run) = app.scan.take() {
         run.request_abort();
+        run.join();
+    }
+    // Wait for any in-flight export so we don't exit mid-write and leave a
+    // truncated txt file behind.
+    if let Some(mut run) = app.export.take() {
         run.join();
     }
     Ok(())
@@ -343,7 +395,7 @@ fn start_scan(app: &mut App, names: &[String]) {
             let run = crate::spawn_scan_workers(
                 &out, false, 3, max_parallel_devices, group_jobs, &view_names, false,
             );
-            app.status = format!("Scanning {} target(s)… (q to quit; scan keeps running)", view_names.len());
+            app.status = format!("Scanning {} target(s)… (q to quit — cancels the scan)", view_names.len());
             app.scan = Some(run);
         }
         None => {
@@ -657,6 +709,10 @@ fn filtered_report_users(app: &App) -> Vec<crate::ReportUser> {
 /// Destination mirrors the CLI layout: `<export_dir>/<target>/` where
 /// `export_dir` is the target's per-target override or `exports` by default.
 fn export_from_output(app: &mut App, only_user: Option<&str>) {
+    if app.export.is_some() {
+        app.status = "Export already in progress…".into();
+        return;
+    }
     let Some(name) = app.current_target_name() else {
         app.status = "No target selected.".into();
         return;
@@ -669,10 +725,27 @@ fn export_from_output(app: &mut App, only_user: Option<&str>) {
         .and_then(|t| t.export_dir.clone())
         .unwrap_or_else(|| "exports".into());
     let dest = std::path::Path::new(&base).join(&name);
-    match crate::export_target_users(&db, &dest, only_user) {
-        Ok(n) => app.status = format!("Exported {} user(s) -> {}", n, dest.display()),
-        Err(e) => app.status = format!("Export failed: {}", e),
-    }
+
+    // Run the SQLite reads + txt writes on a worker thread so the event loop
+    // keeps drawing and reading keys; the outcome is polled back each tick.
+    let only_user = only_user.map(str::to_owned);
+    let starting = match &only_user {
+        Some(u) => format!("Exporting {}…", u),
+        None => "Exporting all users…".into(),
+    };
+    let done = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let done_w = std::sync::Arc::clone(&done);
+    let handle = std::thread::spawn(move || {
+        let msg = match crate::export_target_users(&db, &dest, only_user.as_deref()) {
+            Ok(n) => format!("Exported {} user(s) -> {}", n, dest.display()),
+            Err(e) => format!("Export failed: {}", e),
+        };
+        if let Ok(mut g) = done_w.lock() {
+            *g = Some(msg);
+        }
+    });
+    app.export = Some(ExportRun { done, handle: Some(handle) });
+    app.status = starting;
 }
 
 /// Load the treemap children of the node at the top of `tm_stack` (or root when
@@ -1211,14 +1284,14 @@ fn draw_scan_jobs(frame: &mut Frame, app: &App, area: Rect) {
     };
     let mut rows: Vec<ListItem> = Vec::new();
     for p in &run.progresses {
-        let (files, dirs, _size) = p.scan.snapshot();
+        let (files, dirs, size) = p.scan.snapshot();
         let phase = p.phase.lock().map(|g| g.clone()).unwrap_or_default();
         let err = p.error.lock().map(|g| g.clone()).unwrap_or_default();
         let (label, color) = phase_display(&phase);
         let detail = if phase == "error" && !err.is_empty() {
             format!("  {}", err)
         } else {
-            format!("  {} files · {} dirs", fmt_count(files), fmt_count(dirs))
+            format!("  {} files · {} dirs · {}", fmt_count(files), fmt_count(dirs), crate::fmt_size(size as i64))
         };
         rows.push(ListItem::new(Line::from(vec![
             Span::styled(format!("{:<16}", truncate(&p.name, 16)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
@@ -1230,7 +1303,7 @@ fn draw_scan_jobs(frame: &mut Frame, app: &App, area: Rect) {
     let title = if done {
         " Scan jobs — finished ".to_string()
     } else {
-        " Scan jobs — running (q quits, scan keeps running) ".to_string()
+        " Scan jobs — running (q quits & cancels the scan) ".to_string()
     };
     let list = List::new(rows)
         .block(Block::default().borders(Borders::ALL).title(title));

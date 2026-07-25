@@ -1,4 +1,4 @@
-.PHONY: all build test clean clean-env static-build install setup-env require-cargo help
+.PHONY: all build test clean clean-env static-build install setup-env require-cargo require-zigbuild help
 
 # ─── Project-local, self-contained Rust toolchain ───────────────────────
 # `make setup-env` installs rustup + cargo into ./.rust (NOT ~/.cargo), so the
@@ -17,6 +17,20 @@ CARGO := $(shell if [ -x "$(CARGO_HOME)/bin/cargo" ]; then \
 	echo "$(CARGO_HOME)/bin/cargo"; else command -v cargo; fi)
 
 RELEASE_BIN = target/release/duscan
+
+# ─── Cross-target OS builds ─────────────────────────────────────────────
+# `make build OS=RHEL8` produces a binary that runs on RHEL8 (glibc 2.28).
+# The build host here ships a newer glibc, so a plain `make build` links
+# against symbols (up to GLIBC_2.39) that do not exist on RHEL8. We use
+# cargo-zigbuild to target glibc 2.28 explicitly: this keeps a real glibc
+# build (so the scanner's `statx` NFS hot-path still compiles, unlike musl)
+# while capping the required glibc at RHEL8's version.
+OS ?=
+ifeq ($(OS),RHEL8)
+RHEL8_TARGET     := x86_64-unknown-linux-gnu.2.28
+RHEL8_TARGET_DIR := x86_64-unknown-linux-gnu
+RHEL8_BIN        := target/$(RHEL8_TARGET_DIR)/release/duscan
+endif
 
 all: build
 
@@ -46,11 +60,33 @@ require-cargo:
 		exit 1; \
 	fi
 
+ifeq ($(OS),RHEL8)
+build: require-cargo require-zigbuild
+	$(CARGO) zigbuild --release -p duscan --target $(RHEL8_TARGET)
+	cp $(RHEL8_BIN) ./duscan
+	strip ./duscan
+	@echo "RHEL8 binary: ./duscan ($$(ls -lh duscan | awk '{print $$5}'))"
+	@echo "Max glibc required: $$(objdump -T ./duscan 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1) (RHEL8 provides 2.28)"
+else
 build: require-cargo
 	$(CARGO) build --release -p duscan
 	cp $(RELEASE_BIN) ./duscan
 	strip ./duscan
 	@echo "Binary: ./duscan ($$(ls -lh duscan | awk '{print $$5}'))"
+endif
+
+# Guard: cargo-zigbuild is required for the RHEL8 cross-glibc target.
+require-zigbuild:
+	@if ! command -v cargo-zigbuild >/dev/null 2>&1; then \
+		echo "cargo-zigbuild not found. Install it with:"; \
+		echo "  cargo install cargo-zigbuild   (and install 'zig' on PATH)"; \
+		exit 1; \
+	fi
+	@if ! command -v zig >/dev/null 2>&1; then \
+		echo "zig not found on PATH. cargo-zigbuild needs the zig compiler."; \
+		echo "  See https://ziglang.org/download/ or 'pip install ziglang'"; \
+		exit 1; \
+	fi
 
 static-build: require-cargo
 	$(CARGO) rustc --release -p duscan -- -C target-feature=+crt-static
@@ -76,6 +112,7 @@ help:
 	@echo "Targets:"
 	@echo "  make setup-env    Install a project-local Rust toolchain into ./.rust"
 	@echo "  make build        Release binary (dynamic), using the local toolchain"
+	@echo "  make build OS=RHEL8  Release binary for RHEL8 (glibc 2.28, via cargo-zigbuild)"
 	@echo "  make static-build Static binary (fully linked)"
 	@echo "  make test         Run tests"
 	@echo "  make clean        Clean build artifacts (cargo clean + binaries)"
