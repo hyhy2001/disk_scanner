@@ -70,9 +70,14 @@ target's `report.db`; empty states point you to press `r` to scan first.
 ./duscan list [--target <name>] [--team <name>] [--json]
 
 # Scan + read (all reader commands fall back to output_dir from duscan.toml — no need to repeat --output-dir)
-./duscan run [--output-dir DIR] [--tree-map] [--workers N] [--level N] [--target <name>] [--debug]
+./duscan run [--output-dir DIR] [--tree-map] [--workers N] [--level N] [--target <name>] [--debug] [--no-lsf]
 #   --debug: emit core Phase 1/2/3 profiling + RSS diagnostics (headless/piped stdout; TUI mode suppresses core stdout)
+#   --no-lsf: force a local scan even when [lsf] is enabled (see the LSF section below)
 #   per-target webhook_url auto-sends a Teams card after each scan (set on Scan/Sync tab) — no separate `notify` step for cron
+./duscan status [--output-dir DIR] [--target <name>] [--watch] [--json]
+#   reads each target's scan_status.json (stage/running/files/dirs/size/elapsed). Works for local,
+#   background, AND LSF-submitted scans (status file is on shared storage). --watch redraws every 2s;
+#   a scan whose heartbeat is >30s old is flagged "running (stale)" (e.g. a killed/dead LSF job).
 ./duscan detail --user <user> [--output-dir DIR] [--top N] [--target <name>] [--json]
 #   --type report (default: top dirs/files by size) | permission (perm_issues, filter with --search KW) | inode (per-dir file counts)
 ./duscan tree-show [--output-dir DIR] [--level N] [--limit N] [--path P] [--search KW] [--target <name>]
@@ -110,10 +115,43 @@ anchored to the binary dir, so reports land next to the binary — not under cro
 cwd. An **absolute** `output_dir`, or an explicit `--output-dir`, is used as-is.
 So a cron entry is just: `0 2 * * * /path/to/duscan run --target <name>`.
 
+## LSF batch submit (optional)
+
+On an LSF cluster, a scan should run on a compute node, not the login node. Add
+an `[lsf]` table to `duscan.toml` and a headless `duscan run` will **re-submit
+itself** as a batch job via the `bs` wrapper (a site-local `bsub`) instead of
+scanning in place:
+
+```toml
+[lsf]
+enabled = true      # master switch (default false = always scan locally)
+cmd = "bs"          # submit wrapper (default "bs")
+os = "RHEL8"        # -os <os>   (empty = omit)
+mem_mb = 20000      # -M <mem>   (0 = omit)
+queue = ""          # -q <queue> (empty = omit)
+extra_args = []     # extra raw args before the binary, e.g. ["-n", "4"]
+```
+
+With this, `duscan run --target backend` submits
+`bs -os RHEL8 -M 20000 /abs/path/duscan run --level 3 --target backend` and
+exits (fire-and-forget — track the job with `bjobs`/the per-scan log). The
+submitted job carries `DUSCAN_VIA_LSF=1` so it scans locally instead of
+re-submitting (no loop). Fallbacks: if `bs` isn't on `PATH`, duscan warns and
+scans locally; `--no-lsf` forces a local scan even when enabled. The config TUI
+`r`/`R` scan always runs in-place (interactive), never via LSF. So a cluster
+cron entry stays simple: `0 2 * * * /path/to/duscan run --target <name>`.
+
+**Tracking an LSF (or background) scan:** the compute-node job writes
+`scan_status.json` into each target dir (on shared storage) with a live
+heartbeat — stage + file/dir/size counts, refreshed ~every 2s during the walk.
+Poll it from anywhere with `duscan status --target <name> [--watch]`; you get
+near-live progress even though the scan runs in a different process. `bjobs`
+still shows the LSF-level job state.
+
 Config layout (TOML, auto-created next to the binary):
 
 ```
-duscan.toml            # global settings only: output_dir, workers, max_parallel_devices, nfs_parallel
+duscan.toml            # global settings only: output_dir, workers, max_parallel_devices, nfs_parallel, [lsf]
 targets/
 ├── backend.toml       # one target per file (ergonomic: teams carry users, no team_id)
 ├── frontend.toml
