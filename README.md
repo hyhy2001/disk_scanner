@@ -1,504 +1,327 @@
-# Check Disk
+# duscan
 
-> High-performance disk usage scanner for Linux, written in Rust + Python. Designed for filesystems with tens of millions of files, with bounded RAM, atomic remote sync, and a SQLite-backed report format.
+> High-performance disk-usage scanner for Linux, written in Rust. Built for
+> filesystems with tens of millions of files: parallel walk, bounded RAM,
+> per-target history, an interactive config/report TUI, optional LSF batch
+> submit, and atomic remote sync.
 
-`check_disk` walks a Linux filesystem in parallel, classifies usage by configured teams/users, and writes report artifacts (JSON summaries + SQLite detail/treemap databases) suitable for terminal inspection, remote dashboards, and per-user export.
-
----
-
-## Quick Start
-
-### 1. Initialize config
-
-```bash
-python3 disk_checker.py --init --dir /data/shared
-```
-
-### 2. Add teams and users
-
-```bash
-python3 disk_checker.py --add-team backend
-python3 disk_checker.py --add-user alice bob carol --team backend
-```
-
-### 3. Run a scan
-
-```bash
-python3 disk_checker.py --run --tree-map --output-dir /reports
-```
-
-### 4. View reports
-
-```bash
-# Summary report
-python3 disk_checker.py --show-report --files /reports/disk_usage_report.json
-
-# Per-user detail (dirs + files breakdown)
-python3 disk_checker.py --detail --user alice --output-dir /reports --top 20
-
-# Directory tree visualization
-python3 disk_checker.py --tree-show --output-dir /reports --user alice --level 3
-
-# Search for specific paths
-python3 disk_checker.py --detail --user alice --output-dir /reports --search backup
-python3 disk_checker.py --tree-show --output-dir /reports --search config --limit 20
-```
-
-### 5. Export per-user text reports
-
-```bash
-python3 scripts/export_user_reports.py \
-  --input-dir /reports \
-  --output-dir /reports/exports \
-  --workers 4
-```
+`duscan` walks a Linux filesystem in parallel, classifies usage by configured
+teams/users, and writes a single SQLite `report.db` per target (detail, treemap,
+history and permission tables) suitable for terminal inspection, per-user export,
+and remote dashboards.
 
 ---
 
-## Features
+## Quick start
 
-### Phase 1: Rust parallel filesystem scanner
+```bash
+make build          # → ./duscan (release, stripped)
+```
 
-- Uses `ignore::WalkBuilder` with work-stealing parallel traversal (default: `cpus × 4`, max 64 workers).
-- Skips critical pseudo-mounts (`proc`, `sys`, `dev`, `.snapshot`, `.zfs`, `.nfs`) automatically.
-- Cross-device check prevents descending into bind mounts or NFS sub-mounts.
-- Hard-link dedup (`DashSet<(ino, dev)>`) avoids double-counting cross-linked bytes.
-- Captures each directory's own inode owner (`st_uid`) during the walk — reused for the treemap's per-directory owner (real owner, not the top space consumer).
-- Streams events to per-thread binary `.bin` spill files (uncompressed, 16MB BufWriter) in a temp dir.
-- Panic-safe: `DoneGuard` RAII ensures the progress loop never spins forever.
+```bash
+# 1. Declare a target with its teams + users (one command)
+./duscan set-target backend /data/backend --team dev=alice,bob --team ops=carol
 
-### Phase 2: Rust SQLite report pipeline (split into 2 phases)
+# 2. Scan it
+./duscan run --target backend
 
-- **Phase 2 (detail)**: reads spill files via Rayon, builds `data_detail.db`:
-  - `data_detail.db`: 5 tables — `meta`, `users`, `file_names`, `dirs` (path pre-computed), `files` (ext inline). No FTS virtual tables. Keyset-pagination indexes for O(limit) cursor queries regardless of dataset size.
-  - Compact spill re-encoding (18 bytes/row, LZ4-compressed) eliminates path String allocations.
-  - `mallopt(M_MMAP_THRESHOLD=128KB)` reduces glibc heap fragmentation during build.
-  - `malloc_trim(0)` after large drops returns freed heap pages to OS.
-- **Phase 3 (treemap)**: loads persisted aggregates, builds `tree_map_data/treemap.db`:
-  - Filtered by `--level <N>` depth — dirs deeper than N are excluded from `treemap.db`.
-  - Runs independently — can be skipped or rerun without re-scanning.
-- `permission_issues.db` — indexed access-error log.
-- All databases built with `journal_mode=OFF` and atomically renamed into place.
+# 3. Read the results (no need to repeat --output-dir; falls back to duscan.toml)
+./duscan detail --user alice --target backend
+./duscan history --target backend --compare
+./duscan tree-show --target backend --level 3
+```
 
-### Scan completion summary
-
-- Prints final summary block with paths AND file sizes for each output:
-  - Summary report JSON
-  - Inode usage report JSON
-  - Detail DB
-  - TreeMap DB
-  - Permission DB
-- Total wall-clock pipeline elapsed time.
-
-### Atomic remote sync
-
-- Single-file sync uses `rsync -az` when available (atomic temp-file + rename built-in), falls back to `scp` if rsync is missing.
-- Snapshots files to a temp dir before transfer to avoid races with concurrent writers (e.g. heartbeat updating `scan_status.json`).
-- Per-directory sync uses tar | ssh tar with SSH ControlMaster multiplexing, atomic staging dir + rotate old + promote new.
-- `scan_status.json` syncs immediately (bypasses queue) so the dashboard sees live progress without waiting for big files.
-- Ctrl+C drains subprocesses, sweeps remote staging artifacts, pushes final heartbeat.
-
-### Heartbeat + status
-
-- `scan_status.json` updated atomically every 5s with stage, elapsed, running, message.
-- Synced to remote every 5s (and immediately on phase changes) when sync is enabled. Uses synchronous sync (bypass queue) so dashboard sees real-time progress.
-- Success log for `scan_status.json` is suppressed to reduce terminal noise; errors still printed.
+Or just run `./duscan` with **no subcommand** to open the interactive TUI
+(configure targets, scan, and browse reports without leaving the screen).
 
 ---
 
-## Requirements
+## Interactive TUI
 
-- **Python**: 3.7+ (uses dataclasses)
-- **OS**: Linux x86_64
-- **glibc**: bundled `.so` targets glibc 2.17+ (CentOS 7, RHEL 7+, Debian 9+, Ubuntu 14.04+)
-- **SQLite**: 3.7.x+
-- **For sync (optional)**: `ssh` with key-based auth, or `sshpass` for password auth
+Run `duscan` with no arguments to open the configuration TUI — five tabs:
+**Targets**, **Teams & Users**, **Scan/Sync**, **Output**, **Settings**. Every
+change is written straight to `duscan.toml` + `targets/*.toml` (saved per op).
 
-The Rust shared objects (`src/fast_scanner.abi3.so`, `src/export_rust.abi3.so`) ship in the repo. Rebuild after Rust changes:
+**Keys:** `↹`/`1`..`5` switch tabs, `↑↓` move, `[`/`]` switch target (Teams,
+Scan/Sync & Output tabs), `a` add, `e` edit, `d` delete, `u` add users (accepts
+`alice,bob` and `@file`), `x` remove user, `/` filter long lists, `q`/`Esc` quit.
+Local path inputs (scan path, `export_dir`, and the `@file` token) support `Tab`
+completion and are stored as absolute paths.
+
+**Run a scan in-place:** `r` scans the selected target, `R` scans all. The scan
+runs without leaving the TUI — a live "Scan jobs" panel shows each target's stage
+(Scanning → Building detail → Merging → History → Done) plus live file/dir counts.
+You can keep navigating while it runs; only one scan runs at a time. When it
+finishes the config reloads from disk.
+
+**Output tab** — browse a target's results in five sub-views (`h`/`d`/`p`/`i`/`t`):
+
+| Key | View | Shows |
+|---|---|---|
+| `h` | History | Per-day usage snapshots + top users |
+| `d` | Detail | Pick a user → totals + top dirs/files (`x` export one, `X` export all) |
+| `p` | Perm | The user's permission issues (Type / Error / Path) |
+| `i` | Inode | Inode count (files + dirs) + per-dir file-count breakdown |
+| `t` | Treemap | ncdu-style directory browser (`Enter` descend, `Backspace` up) |
+
+`/` filters long lists live in every view. Reads each target's `report.db`; empty
+states point you to press `r` to scan first.
+
+---
+
+## CLI reference
+
+All reader commands fall back to `output_dir` from `duscan.toml`, so `--output-dir`
+is optional once configured.
+
+### Config
 
 ```bash
-bash src/rust_scanner/build.sh         # glibc 2.17 (widest compat)
-bash src/rust_scanner/build.sh 2.28    # glibc 2.28
-bash src/rust_scanner/build.sh native  # host glibc only
-bash src/rust_exporter/build.sh
+# One-shot (preferred): create/update a target with teams + users
+./duscan set-target <name> <path> --team dev=alice,bob --team ops=carol \
+    [--end-scan YYYYMMDD] [--purge-time DAYS] [--merge]
+#   replace by default (config = the declaration); --merge adds without removing
+
+# Declarative file (targets.toml / .json as source of truth)
+./duscan apply <file> [--dry-run] [--merge]
+
+# Granular CRUD (still supported)
+./duscan add-target <name> <path> [--end-scan YYYYMMDD] [--purge-time DAYS]
+./duscan remove-target <name>
+./duscan add-team <name> --target <target>
+./duscan add-user <user> [user...] --team <team> --target <target>
+./duscan remove-user <user> [user...] --target <target>
+./duscan list [--target <name>] [--team <name>] [--json]
+./duscan import-legacy --dir <configs_dir> [--force]   # migrate legacy JSON configs
+```
+
+### Scan + read
+
+```bash
+./duscan run [--target <name>] [--tree-map] [--workers N] [--level N] [--debug] [--no-lsf]
+#   --debug: Phase 1/2/3 profiling + RSS diagnostics
+#   --no-lsf: force a local scan even when [lsf] is enabled
+#   per-target webhook_url auto-sends a Teams card after each scan (no separate step)
+
+./duscan status [--target <name>] [--watch] [--json]
+#   reads scan_status.json (stage/running/files/dirs/size/elapsed). Works for local,
+#   background, and LSF-submitted scans (status file is on shared storage).
+#   --watch redraws every 2s; a heartbeat >30s old is flagged "running (stale)".
+
+./duscan detail --user <user> [--target <name>] [--top N] [--json]
+#   --type report (default: top dirs/files) | permission (--search KW) | inode
+
+./duscan tree-show [--target <name>] [--level N] [--limit N] [--path P] [--search KW]
+./duscan export --user <user> [--target <name>] [--export-dir DIR]
+./duscan history [--target <name>] [--days N] [--json]
+#   --compare [--top N]: per-user growth/trend table across snapshots
+./duscan notify --webhook-url URL [--target <name>]
+./duscan sync --host HOST --dest-dir DIR [--user USER] [--pass]
+#   --pass: sshpass -e auth (password read from SSHPASS env; never stored)
 ```
 
 ---
 
 ## Configuration
 
-`disk_checker_config.json` is created by `--init`:
+Config lives **next to the binary** — `duscan.toml` + `targets/` are read/written
+from the directory containing the `duscan` executable, independent of the current
+working directory (no cwd or `~/.config` lookup). This makes cron reliable: a job
+running from `$HOME` or `/` finds the same config as an interactive shell.
 
-```json
-{
-  "directory": "/data/shared",
-  "output_file": "disk_usage_report.json",
-  "teams": [
-    { "name": "backend", "team_id": 1 }
-  ],
-  "users": [
-    { "name": "alice", "team_id": 1 },
-    { "name": "bob", "team_id": 1 }
-  ]
-}
+```
+duscan.toml            # globals: output_dir, workers, max_parallel_devices, nfs_parallel, [lsf]
+targets/
+├── backend.toml       # one target per file (teams carry users, no team_id)
+├── frontend.toml
+└── logs.toml
+```
+
+```toml
+# duscan.toml
+output_dir = "reports"        # relative → anchored to the binary dir; absolute → used as-is
+workers = "auto"
+max_parallel_devices = 0      # 0 = unlimited concurrent device groups
+nfs_parallel = 16             # walker-thread cap per NFS device (latency-bound)
+```
+
+```toml
+# targets/backend.toml — hand-editable, version-controllable
+name = "backend"
+path = "/data/backend"
+end_scan = "20270101"
+purge_time = 90
+
+[[teams]]
+name = "dev"
+users = ["alice", "bob"]
+
+[[teams]]
+name = "ops"
+users = ["carol"]
+```
+
+Per-target scan overrides (empty = global default) also live here: `tree_map`,
+`level`, `workers`, `sync_host`/`sync_dest_dir`/`sync_user`, `export_dir`,
+`webhook_url`, `sync_pass`. When `sync_host` is set, that target's output is
+rsync'd to the remote automatically after each scan. A cron entry is just:
+
+```cron
+0 2 * * * /path/to/duscan run --target backend
 ```
 
 ---
 
-## CLI Reference
+## LSF batch submit (optional)
 
-### Configuration Commands
+On an LSF cluster a scan should run on a compute node, not the login node. Add an
+`[lsf]` table and a headless `duscan run` will **re-submit itself** as a batch job
+via the `bs` wrapper (a site-local `bsub`) instead of scanning in place:
 
-| Command | Description |
-|---|---|
-| `--init --dir <path>` | Create config for a scan root. |
-| `--dir <path>` | Update scan directory in existing config. |
-| `--add-team <name>` | Add a team. |
-| `--add-user <u1> [u2 ...] --team <team>` | Add users to a team. |
-| `--remove-user <u1> [u2 ...]` | Remove users from config. |
-| `--list` | List all teams and users. |
-| `--list --team <name>` | List users in one team. |
-
-### Scanning Commands
-
-| Command | Description |
-|---|---|
-| `--run` | Run a full scan and generate reports. |
-| `--run --workers <N>` | Override worker count (default: `min(32, cpus × 2)`). |
-| `--run --debug` | Print Phase 1/2/3 timing + RSS diagnostics. |
-| `--run --output-dir <dir>` | Write all reports to a specific directory. |
-| `--run --output <path>` | Override full output file path for the summary report. |
-| `--run --prefix <name>` | Prefix generated report filenames. |
-| `--run --date` | Append `YYYYMMDD` to output filenames. |
-| `--run --tree-map` | Build `tree_map_data/treemap.db` (required for `--tree-show`). |
-| `--run --level <N>` | Maximum directory depth stored in `treemap.db` (default: 3). Dirs deeper than N are excluded. |
-| `--run --webhook-url <URL>` | POST a Microsoft Teams summary on completion. |
-
-### Sync Commands
-
-| Command | Description |
-|---|---|
-| `--sync --sync-user <U> --sync-host <H> --sync-dest-dir <D>` | Sync reports to remote over SSH. |
-| `--sync ... --sync-pass <pwd>` | Password auth via `sshpass`. |
-
-### Report Commands
-
-| Command | Description |
-|---|---|
-| `--show-report --files <f.json>` | Display a single summary report. |
-| `--show-report --files "disk_usage_*.json"` | Match multiple reports by wildcard. |
-| `--show-report --files <a.json> <b.json>` | Compare two reports (default: by growth). |
-| `--show-report --files ... --compare-by usage` | Compare by total usage. |
-| `--show-report --files ... --user <u1> [u2 ...]` | Filter displayed users. |
-| `--detail` | Per-user detail from `data_detail.db`. See below. |
-| `--tree-show` | ASCII directory tree from `treemap.db`. See below. |
-
-### Detail Options (for `--detail`)
-
-Requires `--user`. Reads from `--output-dir` (default: `.`).
-
-```bash
-python3 disk_checker.py --detail --user alice --output-dir /reports
+```toml
+[lsf]
+enabled = true      # master switch (default false = always scan locally)
+cmd = "bs"          # submit wrapper (default "bs")
+os = "RHEL8"        # -os <os>   (empty = omit)
+mem_mb = 20000      # -M <mem>   (0 = omit)
+queue = ""          # -q <queue> (empty = omit)
+extra_args = []     # extra raw args before the binary, e.g. ["-n", "4"]
 ```
 
-| Option | Default | Description |
-|---|---|---|
-| `--user <u1> [u2 ...]` | required | User(s) to display. |
-| `--output-dir <dir>` | `.` | Directory containing `detail_users/data_detail.db`. |
-| `--type <choice>` | `report` | Section to display (see below). |
-| `--top <N>` | 30 | Max rows per table. |
-| `--search <keyword>` | (none) | Filter entries whose basename contains keyword. |
+`duscan run --target backend` then submits
+`bs -os RHEL8 -M 20000 /abs/path/duscan run --level 3 --target backend` and exits
+(fire-and-forget). The submitted job carries `DUSCAN_VIA_LSF=1` so it scans
+locally instead of re-submitting (no loop). Fallbacks: if `bs` isn't on `PATH`,
+duscan warns and scans locally; `--no-lsf` forces a local scan even when enabled.
+The TUI `r`/`R` scan always runs in-place, never via LSF.
 
-**`--type` choices:**
-
-| Type | Displays |
-|---|---|
-| `report` (default) | Directory breakdown + largest files |
-| `dirs` | Directory breakdown only (sorted by size) |
-| `files` | Largest files only |
-| `inode` | Directory breakdown sorted by file count |
-| `permission` | Permission errors from `<output-dir>/permission_issues.db` |
-
-**Examples:**
-
-```bash
-# Default: dirs + files
-python3 disk_checker.py --detail --user alice --output-dir /reports
-
-# Only files, filter by keyword
-python3 disk_checker.py --detail --user alice --output-dir /reports --type files --search ".log"
-
-# Top 50 dirs
-python3 disk_checker.py --detail --user alice --output-dir /reports --type dirs --top 50
-
-# File count per directory (inode view)
-python3 disk_checker.py --detail --user alice --output-dir /reports --type inode
-
-# Permission errors
-python3 disk_checker.py --detail --user alice --output-dir /reports --type permission
-
-# Multiple users
-python3 disk_checker.py --detail --user alice bob --output-dir /reports --top 20
-```
-
-### Tree Options (for `--tree-show`)
-
-Requires `--run --tree-map` to have been run first.
-
-```bash
-python3 disk_checker.py --tree-show --output-dir /reports
-```
-
-| Option | Default | Description |
-|---|---|---|
-| `--output-dir <dir>` | `.` | Directory containing `tree_map_data/treemap.db`. |
-| `--user <u1> [u2 ...]` | (none) | Filter by user(s). Without `--user`, shows total dir sizes. |
-| `--level <N>` | 3 | Maximum tree depth. |
-| `--limit <N>` | 20 | Max results per level (or max flat list results when `--search`). |
-| `--path <PATH>` | scan root | Start tree from a specific path. |
-| `--search <keyword>` | (none) | Show flat list of dirs matching keyword, sorted by size. |
-
-**Examples:**
-
-```bash
-# Full tree (all users, total sizes)
-python3 disk_checker.py --tree-show --output-dir /reports --level 3 --limit 10
-
-# Tree for a specific user
-python3 disk_checker.py --tree-show --output-dir /reports --user alice --level 4
-
-# Search for matching dirs (flat list, sorted by size)
-python3 disk_checker.py --tree-show --output-dir /reports --search config --limit 20
-
-# Start from a specific path
-python3 disk_checker.py --tree-show --output-dir /reports --path /data/projects --level 2
-```
-
-**Sample output (with `--search`):**
-
-```
-============================================================
-TREE-SHOW (all users)
-============================================================
-Root path: /
-Search: 'config'
-Depth: 3  |  Limit: 10 per level
-
-  /www/server/panel/pyenv/lib/python3.12/config-3.12-x86_64-linux-gnu  [65 MB, 12 files]
-  /usr/lib/python3.12/config-3.12-x86_64-linux-gnu  [28 MB, 13 files]
-  /www/server/panel/config  [10 MB, 26 files]
-  ...
-
-  Total: 469 matching directories
-```
-
-### Per-user text export
-
-```bash
-python3 scripts/export_user_reports.py \
-  --input-dir /reports \
-  --output-dir /reports/exports \
-  --workers 4
-```
-
-Writes two `.txt` files per user:
-- `usage_dir_<user>.txt` — top directories by size
-- `usage_file_<user>.txt` — top files by size
-
-Both files contain full absolute paths. The exporter reads `data_detail.db` directly from `dirs.path`; `treemap.db` is optional and only used as a fallback by the Rust exporter.
+**Tracking:** the compute-node job writes `scan_status.json` (on shared storage)
+with a live heartbeat. Poll it from anywhere with
+`duscan status --target backend [--watch]`; `bjobs` still shows the LSF job state.
 
 ---
 
-## Output Layout
+## Output layout
+
+Per target: `<output-dir>/<target>/` holds a single `report.db`, the heartbeat,
+and one log per scan.
 
 ```text
-<output_dir>/
-├── disk_usage_report.json         # summary: general system + team + user usage
-├── inode_usage_report.json        # inode counts per user
-├── permission_issues.db           # access-error log (indexed SQLite; produced by Phase 2)
-├── scan_status.json               # heartbeat: stage, elapsed, running, message
-├── detail_users/
-│   └── data_detail.db             # per-user files/dirs/exts, indexed
-└── tree_map_data/                 # only when --tree-map
-    └── treemap.db                 # path dictionary + directory tree
+<output-dir>/<target>/
+├── report.db            # detail + treemap + history + perm_issues (single source of truth)
+├── scan_status.json     # heartbeat: stage, elapsed, running, file/dir/size counts
+└── logs/
+    └── scan_<ts>.log    # one log per scan (legacy-style phase summary)
 ```
+
+Permission issues are **merged into `report.db`** (the `perm_issues` table); the
+intermediate `permission_issues.db` scratch file is deleted after the merge.
 
 ---
 
-## Database Schemas
+## `report.db` schema
 
-### `data_detail.db` (application_id = `0xC0DD15D1`)
+A single SQLite DB per target with prefixed table groups.
 
-5 tables only. No FTS. No ext dictionary. No top_files. No dir_user_size.
+| Group | Tables | Purpose |
+|---|---|---|
+| Meta | `meta` | scan_root, scan_name/path, timestamp, totals, treemap_db |
+| Detail | `detail_users`, `detail_dirs`, `detail_file_names`, `detail_files` | Per-user files/dirs/exts, keyset-pagination indexed |
+| Treemap | `treemap_dirs`, `treemap_names`, `treemap_owners` | Directory tree + per-dir real inode owner (`st_uid`) |
+| History | `hist_snapshots`, `hist_user_usage`, `hist_team_usage` | Per-day usage trend for `history`/`--compare` |
+| Permissions | `perm_issues` | Indexed access-error log (uid, kind, errcode, path) |
 
-```
-meta        — key/value: scan_root, scan_timestamp
-users       — uid, username, team_id, total_files, total_dirs, total_size, permission_issues, is_target
-file_names  — id, name (unique file basename dictionary)
-dirs        — id, uid, parent_id, path (pre-computed absolute), owner_uid, size, files
-              PRIMARY KEY (id, uid) — one row per (dir entity, user) pair
-              owner_uid — reserved placeholder, currently always 0 (not populated; the
-              dashboard does not read it). Real dir-owner lives in treemap.db.
-files       — dir_id, name_id, ext (inline TEXT), uid, size
-              no surrogate id
-```
-
-Indexes (keyset pagination optimized):
-```
-ix_files_uid_size_dir_name      ON files(uid, size DESC, dir_id ASC, name_id ASC)
-ix_files_uid_ext_size_dir_name  ON files(uid, ext, size DESC, dir_id ASC, name_id ASC)
-ix_files_dir_uid_ext_size_name  ON files(dir_id, uid, ext, size DESC, name_id ASC)
-ix_dirs_uid_size_dir            ON dirs(uid, size DESC, id ASC)
-ix_file_names_name              ON file_names(name)
-```
-
-Cursor pagination: files cursor = `{size, dir_id, name_id}`, dirs cursor = `{size, id}`.
-
-### `treemap.db` (application_id = `0xC0DD15C0`)
-
-| Table | Purpose |
-|---|---|
-| `meta` | scan_root, scan_timestamp, max_level, total_size, total_dirs |
-| `names` | directory segment dictionary |
-| `dirs` | id, parent_id, name_id, total_size, file_count, dir_count, owner_uid, has_files |
-| `owners` | uid → username |
-
-`owner_uid` is the directory's **real inode owner** (`st_uid` from the Phase 1 walk),
-resolved to a username via the `owners` table — not the user who consumes the most space
-inside the directory. Directories that could not be stat'd fall back to the smallest known uid.
+`treemap_dirs.owner_uid` is the directory's **real inode owner** (`st_uid` from the
+Phase 1 walk), resolved via `treemap_owners` — not the user consuming the most
+space. Dirs that couldn't be stat'd fall back to the smallest known uid.
 
 ---
 
 ## Architecture
 
+```
+├── Cargo.toml              # Workspace
+├── core/src/               # Scanning engine (pure Rust)
+│   ├── scan_core.rs        # Phase 1 parallel filesystem walk
+│   ├── scan_state.rs       # Per-thread buffers + binary spill writers
+│   ├── report_pipeline.rs  # Phase 2+3 SQLite builder
+│   ├── db_writer.rs        # DDL, bulk insert, merge, atomic rename
+│   └── pipe_*.rs           # Spill format, permission, treemap helpers
+├── cli/src/                # CLI binary (duscan)
+│   ├── main.rs             # Clap dispatch + scan orchestration + status/LSF
+│   ├── config.rs           # TOML config CRUD
+│   ├── config_tui.rs       # Ratatui config + report TUI
+│   ├── scheduler.rs        # Device-aware scan plan
+│   └── ui.rs               # Read-only live scan monitor
+├── legacy/                 # Python reference code (read-only)
+└── src/rust_scanner/       # Original PyO3 crate (.so build, reference)
+```
+
 ### Pipeline phases
 
 ```
-Phase 1: Rust scan (WalkBuilder, 64 workers)
-  → /tmp/checkdisk_rust_*/scan_t*_b*.bin  (uncompressed binary events)
-  → /tmp/.../perm_t*.tsv                  (permission errors)
-  → /tmp/.../diragg_t*.bin                (dir aggregates)
-  → /tmp/.../dirowner_t*.bin              (dir inode owner: path → st_uid)
-         │
-         ▼
-Python: write summary JSON reports
-  → disk_usage_report.json + siblings
-         │
-         ▼
-Phase 2: Rust detail pipeline (Rayon)
-  → compact spill re-encoding (18 bytes/row)
-  → path tree assembly
-  → data_detail.db (files, dirs[path pre-computed], ...)
-  → persist treemap aggregates (aggregates.bin.zst)  [only with --tree-map]
-         │
-         ▼
-Phase 3: Rust treemap pipeline  [only with --tree-map]
-  → load aggregates.bin.zst
-  → treemap.db (filtered by --level depth)
-  → cleanup aggregates
-         │
-         ▼
-Phase 4: final heartbeat (drain sync if enabled)
+Phase 1: parallel WalkBuilder walk
+  → per-thread binary spill files (events, dir aggregates, dir owners, perm TSV)
+Phase 2: detail pipeline (Rayon)
+  → compact spill re-encoding → path tree → detail tables
+  → persist treemap aggregates (only with --tree-map)
+Phase 3: treemap pipeline (only with --tree-map)
+  → load aggregates → treemap tables (filtered by --level)
+Merge + History: fold everything into report.db, append the day's snapshot
 ```
 
-### Rust crates
+---
 
-| Crate | Module | Purpose |
-|---|---|---|
-| `src/rust_scanner/` | `scan_core.rs` | Phase 1 WalkBuilder parallel walker |
-| | `scan_state.rs` | Per-thread buffers + uncompressed binary/TSV spill writers |
-| | `scan_constants.rs` | Scan thresholds, buffer sizes, worker limits |
-| | `scan_utils.rs` | Shared scan utilities (path helpers, UID lookup) |
-| | `report_pipeline.rs` | Phase 2/3 ingest → detail.db + treemap.db |
-| | `db_writer.rs` | DDL, bulk insert, ANALYZE, atomic rename |
-| | `pipe_events.rs` | Binary spill format reader |
-| | `pipe_io.rs` | I/O helpers for spill file read/write |
-| | `pipe_permission.rs` | Permission TSV → permission_issues.db |
-| | `pipe_treemap.rs` | Path normalization helpers |
-| | `pipe_types.rs` | Shared types + extension/parent helpers |
-| `src/rust_exporter/` | `lib.rs` | Parallel TXT export via Rayon |
+## Scan performance (NFS)
 
-### Python modules
+Phase 1 is metadata-I/O-bound: on NFS every `lstat`/`statx` is a network RPC, so
+metadata dominates wall time. Two things keep it fast:
 
-| Module | Description |
-|---|---|
-| `disk_checker.py` | CLI dispatcher |
-| `src/cli_interface.py` | argparse setup + report rendering |
-| `src/config_manager.py` | Config CRUD: teams, users, scan directory |
-| `src/disk_scanner.py` | Wraps `fast_scanner.scan_disk`, builds `ScanResult` |
-| `src/report_generator.py` | Writes JSON summaries, invokes Rust pipeline |
-| `src/sync_manager.py` | `AsyncSyncPipeline` + atomic tar-stream sync |
-| `src/scan_status.py` | Atomic `scan_status.json` + heartbeat thread |
-| `src/formatters/` | Terminal table rendering |
-| `src/constants.py` | Filenames, directory names, intervals |
-| `src/utils.py` | Shared utility functions |
-| `src/msteams_notifier.py` | Microsoft Teams webhook notifications |
+- **One statx per entry.** Both the file and directory hot-paths issue a single
+  `statx_lite()` syscall returning dev+ino+mnt_id+blocks+uid+nlink at once —
+  covering bind-mount, filesystem-boundary (`du -x`), hardlink/loop dedup and
+  inode-owner checks together. Falls back to `entry.metadata()` on old kernels
+  where `statx()` isn't usable. Local filesystems keep the plain `metadata()` path.
+- **`nfs_parallel`** (default **16**) caps walker threads per NFS device. NFS is
+  latency-bound, so more RPCs in flight hide round-trip latency; raise it for
+  high-latency mounts, lower it if the NFS server is the bottleneck. HDDs stay
+  capped low (seek-bound); SSD/NVMe get the full budget.
+
+Correctness on NFS: hardlink dedup keys on `(stx_ino, stx_mnt_id)` because
+`st_dev` is unstable on NFS clients (the same inode reached via two paths can
+report different `st_dev`, which would inflate size).
 
 ---
 
-## Performance
+## Build
 
-### Benchmarks (48M files, 4.3M dirs, 131 users, 64 workers, NFS)
+```bash
+make build          # → ./duscan (release, dynamically linked, stripped)
+make static-build   # → ./duscan-static (fully static)
+make test           # cargo test -p duscan
+make install        # copy ./duscan to /usr/local/bin
+make clean
+```
 
-| Metric | Value |
-|---|---|
-| Phase 1 wall time | ~730s |
-| Phase 2+3 wall time | ~190s |
-| **Total pipeline** | **~920s** |
-| Phase 2 peak RSS | ~4-6 GB |
-| detail.db size | ~2.4 GB |
+Static build under the hood:
 
-### Key optimizations
+```bash
+RUSTFLAGS="-C target-feature=+crt-static" \
+  cargo build --release --target x86_64-unknown-linux-gnu -p duscan
+```
 
-**Phase 1:**
-- `ignore::WalkBuilder` work-stealing (better than custom bounded queue for NFS)
-- Per-thread event writers: 16MB BufWriter, uncompressed `.bin` files, flush at 32MB
-- 64 workers default (Python layer: `min(32, cpus × 2)` when `--workers` not specified; Rust Phase 1 supports up to `cpus × 4` clamped to 64 if called directly)
-
-**Phase 2:**
-- Phase 2/3 split: detail.db and treemap.db built independently → RAM freed between phases
-- Compact spill re-encoding: 18 bytes/row LZ4-compressed (was ~200 bytes with String paths)
-- Parallel re-encode pass (Rayon + DashMap) for 131-user workloads
-- `mallopt(M_MMAP_THRESHOLD=128KB)` + `malloc_trim(0)` returns ~10GB heap to OS after large drops
-- `PRAGMA optimize` instead of full `ANALYZE` (saves ~18s)
-- Replaced FTS4 virtual tables with LIKE-based keyword search + covering keyset indexes → simpler schema, no FTS tokenizer overhead
-
----
-
-## Reliability
-
-### Bounded RAM
-
-| Source | Bound |
-|---|---|
-| Phase 1 event buffer | `SCAN_EVENT_FLUSH_BYTES_THRESHOLD = 32MB` per bucket per worker |
-| Phase 2 row spill | `ROW_SPILL_THRESHOLD = 200K` rows → `.rows` spill files |
-| Phase 2 compact spill | 18 bytes/row after re-encoding |
-| Treemap aggregates | persisted to `aggregates.bin.zst`, freed before Phase 3 |
-
-### Hang protection
-
-| Risk | Protection |
-|---|---|
-| Walker panic | `DoneGuard` RAII flips `done` flag on drop |
-| SSH hang | `ServerAliveInterval=30 × CountMax=3` drops dead connections |
-| `/tmp` orphans | `_cleanup_orphan_tmpdirs()` sweeps at run start |
-| Ctrl+C mid-sync | Flushes status, drains pipeline, sweeps remote staging |
-| Partial DB write | `finalize_db` deletes `<final>.tmp.db` on any error |
+- **OS:** Linux x86_64
+- **Toolchain:** stable Rust (edition 2021)
+- **For sync (optional):** `ssh` with key-based auth, or `sshpass` for `--pass`
 
 ---
 
 ## Verification
 
 ```bash
-# Python tests
-python3 -m pytest tests/ -q
-
-# Rebuild Rust artifacts
-bash src/rust_scanner/build.sh
-bash src/rust_exporter/build.sh
-
-# Check SQLite schema of a generated detail DB
-sqlite3 /reports/detail_users/data_detail.db ".schema"
-sqlite3 /reports/detail_users/data_detail.db "SELECT * FROM meta"
+make test                                    # workspace tests
+./duscan run --target <name> --debug --no-lsf   # Phase 1/2/3 profiling + RSS
+sqlite3 reports/<name>/report.db ".tables"   # inspect the merged DB
+sqlite3 reports/<name>/report.db "SELECT * FROM meta"
 ```
+
