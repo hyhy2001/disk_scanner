@@ -31,6 +31,23 @@ enum Command {
         /// Emit core Phase 2/3 profiling + RSS diagnostics to the per-scan log.
         #[arg(long)]
         debug: bool,
+        /// Force a local scan even when [lsf] is enabled (skip batch submit).
+        /// Automatically implied inside a submitted job (DUSCAN_VIA_LSF set).
+        #[arg(long)]
+        no_lsf: bool,
+    },
+    /// Show the latest scan status per target (reads each target's
+    /// scan_status.json). Works for local, background, and LSF-submitted scans.
+    Status {
+        #[arg(long)]
+        output_dir: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        /// Poll and redraw every 2s until interrupted (Ctrl+C).
+        #[arg(long)]
+        watch: bool,
+        #[arg(long)]
+        json: bool,
     },
     List {
         #[arg(long)]
@@ -241,8 +258,11 @@ fn statvfs_meta(path: &str) -> (i64, i64, i64) {
     }
 }
 
-/// Atomically write `<target_dir>/scan_status.json` so a dashboard can poll
-/// scan progress. Mirrors the legacy Python heartbeat fields.
+/// Atomically write `<target_dir>/scan_status.json` so a dashboard — or another
+/// duscan process (`duscan status`) — can poll scan progress. Mirrors the legacy
+/// Python heartbeat fields, plus live `files`/`dirs`/`size_bytes` counts so a
+/// reader can show progress even when the scan runs elsewhere (e.g. an LSF job).
+#[allow(clippy::too_many_arguments)]
 fn write_scan_status(
     target_dir: &std::path::Path,
     stage: &str,
@@ -252,6 +272,9 @@ fn write_scan_status(
     message: &str,
     error: &str,
     tree_map_enabled: bool,
+    files: u64,
+    dirs: u64,
+    size_bytes: u64,
 ) {
     use std::io::Write;
     let now = std::time::SystemTime::now()
@@ -272,6 +295,9 @@ fn write_scan_status(
         "error": error,
         "tree_map_enabled": tree_map_enabled,
         "sync_enabled": false,
+        "files": files,
+        "dirs": dirs,
+        "size_bytes": size_bytes,
     });
     if std::fs::create_dir_all(target_dir).is_err() {
         return;
@@ -283,6 +309,144 @@ fn write_scan_status(
             let _ = std::fs::rename(&tmp, &path);
         }
     }
+}
+
+/// One target's scan status, read back from `scan_status.json`.
+struct TargetStatus {
+    name: String,
+    stage: String,
+    running: bool,
+    files: u64,
+    dirs: u64,
+    size_bytes: u64,
+    total_elapsed_sec: i64,
+    updated_at: i64,
+    error: String,
+}
+
+/// Read `<out>/<target>/scan_status.json` into a `TargetStatus`, or `None` if
+/// the file is missing/unreadable/unparseable (target never scanned).
+fn read_target_status(out: &str, target: &str) -> Option<TargetStatus> {
+    let path = std::path::Path::new(out).join(target).join("scan_status.json");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some(TargetStatus {
+        name: target.to_string(),
+        stage: v["stage"].as_str().unwrap_or("unknown").to_string(),
+        running: v["running"].as_bool().unwrap_or(false),
+        files: v["files"].as_u64().unwrap_or(0),
+        dirs: v["dirs"].as_u64().unwrap_or(0),
+        size_bytes: v["size_bytes"].as_u64().unwrap_or(0),
+        total_elapsed_sec: v["total_elapsed_sec"].as_i64().unwrap_or(0),
+        updated_at: v["updated_at"].as_i64().unwrap_or(0),
+        error: v["error"].as_str().unwrap_or("").to_string(),
+    })
+}
+
+/// `duscan status`: print the latest scan status for each configured target by
+/// reading its `scan_status.json`. Works regardless of WHERE the scan runs —
+/// local, background, or an LSF job — because the status file is on shared
+/// storage. `--watch` polls every 2s until Ctrl+C; `--json` emits a JSON array.
+fn show_status(cfg: &Config, out: &str, target: Option<&str>, watch: bool, json: bool) {
+    // Which targets to report: a single --target, else every configured target.
+    let names: Vec<String> = match target {
+        Some(t) => vec![t.to_string()],
+        None => cfg.targets.iter().map(|t| t.name.clone()).collect(),
+    };
+
+    let render = || {
+        let statuses: Vec<TargetStatus> = names
+            .iter()
+            .filter_map(|n| read_target_status(out, n))
+            .collect();
+        if json {
+            let arr: Vec<serde_json::Value> = statuses.iter().map(|s| serde_json::json!({
+                "target": s.name,
+                "stage": s.stage,
+                "running": s.running,
+                "files": s.files,
+                "dirs": s.dirs,
+                "size_bytes": s.size_bytes,
+                "total_elapsed_sec": s.total_elapsed_sec,
+                "updated_at": s.updated_at,
+                "error": s.error,
+            })).collect();
+            println!("{}", serde_json::Value::Array(arr));
+            return;
+        }
+        // Plain table.
+        println!("{:<18} {:<10} {:>12} {:>10} {:>10} {:>8}  {}",
+            "Target", "Stage", "Files", "Dirs", "Size", "Elapsed", "Note");
+        println!("{}", "-".repeat(90));
+        if statuses.is_empty() {
+            println!("(no scan status yet — run `duscan run --target <name>` first)");
+        }
+        for s in &statuses {
+            let note = if !s.error.is_empty() {
+                format!("ERROR: {}", s.error)
+            } else if s.running {
+                let age = now_epoch_secs().saturating_sub(s.updated_at);
+                // Flag a stale heartbeat: running but not updated in >30s.
+                if age > 30 { format!("running (stale {}s)", age) } else { "running".to_string() }
+            } else {
+                "idle/done".to_string()
+            };
+            println!("{:<18} {:<10} {:>12} {:>10} {:>10} {:>7}s  {}",
+                truncate_str(&s.name, 18),
+                s.stage,
+                fmt_count_u64(s.files),
+                fmt_count_u64(s.dirs),
+                fmt_size(s.size_bytes as i64),
+                s.total_elapsed_sec,
+                note);
+        }
+    };
+
+    if !watch {
+        render();
+        return;
+    }
+    // --watch: clear + redraw every 2s until interrupted.
+    loop {
+        // ANSI clear screen + home cursor.
+        print!("\x1b[2J\x1b[H");
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
+        println!("duscan status — {} (Ctrl+C to stop)\n", ts);
+        render();
+        let all_idle = names
+            .iter()
+            .filter_map(|n| read_target_status(out, n))
+            .all(|s| !s.running);
+        // Keep watching even when idle (a new scan may start); the user stops it.
+        let _ = all_idle;
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+/// Current unix time in seconds (0 on clock error).
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Thousands-separated u64.
+fn fmt_count_u64(n: u64) -> String {
+    let s = n.to_string();
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in b.iter().enumerate() {
+        if i > 0 && (b.len() - i) % 3 == 0 { out.push(','); }
+        out.push(*c as char);
+    }
+    out
+}
+
+/// Truncate to `max` chars with an ellipsis when cut.
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max { s.to_string() }
+    else { format!("{}…", s.chars().take(max.saturating_sub(1)).collect::<String>()) }
 }
 
 /// Aggregate per-user/per-team usage from the merged report.db and upsert one
@@ -482,8 +646,18 @@ fn main() {
                 }
             }
         }
-        Command::Run { output_dir, tree_map, workers, level, target, debug } => {
+        Command::Run { output_dir, tree_map, workers, level, target, debug, no_lsf } => {
+            // If [lsf] is enabled and we're not already inside a submitted job,
+            // re-submit this exact invocation to the cluster and exit. When the
+            // wrapper is missing (or --no-lsf), fall through to a local scan.
+            if maybe_submit_via_lsf(&cfg, output_dir, *tree_map, *workers, *level, target, *debug, *no_lsf) {
+                return;
+            }
             run_scan(&mut cfg, output_dir.clone(), *tree_map, *workers, *level, target, *debug);
+        }
+        Command::Status { output_dir, target, watch, json } => {
+            let out = output_dir.clone().unwrap_or_else(|| cfg.resolved_output_dir());
+            show_status(&cfg, &out, target.as_deref(), *watch, *json);
         }
         Command::Detail { user, output_dir, top, target, json, section, search } => {
             let out = output_dir.clone().unwrap_or_else(|| cfg.resolved_output_dir());
@@ -1477,14 +1651,195 @@ struct ViewJob {
 }
 
 /// Live per-view progress sink shared between a worker thread and the TUI.
-struct ViewProgress {
-    name: String,
-    scan: check_disk_core::scan_core::ScanProgress,
+pub(crate) struct ViewProgress {
+    pub name: String,
+    pub scan: check_disk_core::scan_core::ScanProgress,
     /// Current coarse phase label (scanning/building/treemap/merging/history/done/error).
-    phase: std::sync::Mutex<String>,
-    error: std::sync::Mutex<String>,
-    started: std::time::Instant,
-    finished: std::sync::atomic::AtomicBool,
+    pub phase: std::sync::Mutex<String>,
+    pub error: std::sync::Mutex<String>,
+    pub started: std::time::Instant,
+    pub finished: std::sync::atomic::AtomicBool,
+}
+
+/// A running (or completed) background scan: the per-view progress sinks the
+/// caller polls for live counts/phase, the worker join handles, and the shared
+/// abort flag. Returned by `spawn_scan_workers` so a caller that owns its own
+/// terminal (e.g. the config TUI) can render progress in-place without handing
+/// the screen to the standalone scan monitor.
+pub(crate) struct ScanRun {
+    pub progresses: Vec<std::sync::Arc<ViewProgress>>,
+    pub handles: Vec<std::thread::JoinHandle<()>>,
+    pub abort: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ScanRun {
+    /// True once every view's worker has finished (or errored).
+    pub fn all_finished(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        self.progresses.iter().all(|p| p.finished.load(Ordering::SeqCst))
+    }
+
+    /// Signal every worker to stop at the next safe checkpoint.
+    pub fn request_abort(&self) {
+        self.abort.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Join all worker threads (blocks until they exit).
+    pub fn join(&mut self) {
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Environment guard set on the submitted job so it scans locally instead of
+/// re-submitting itself (which would loop forever).
+const LSF_GUARD_ENV: &str = "DUSCAN_VIA_LSF";
+
+/// When `[lsf].enabled` and we're not already inside a submitted job, re-submit
+/// this `duscan run` invocation to the cluster via the `bs` wrapper and return
+/// `true` (the caller then exits). Returns `false` — meaning "scan locally
+/// here" — when LSF is disabled, `--no-lsf` was given, we're already inside a
+/// job, or the wrapper is not on PATH.
+///
+/// Fire-and-forget: the wrapper's own stdout/stderr (typically a job id) is
+/// inherited straight to the terminal, and we do not wait for the batch job.
+#[allow(clippy::too_many_arguments)]
+fn maybe_submit_via_lsf(
+    cfg: &Config,
+    output_dir: &Option<String>,
+    tree_map: bool,
+    workers: Option<usize>,
+    level: usize,
+    target: &[String],
+    debug: bool,
+    no_lsf: bool,
+) -> bool {
+    let lsf = &cfg.lsf;
+    if !lsf.enabled || no_lsf {
+        return false;
+    }
+    // Already running as a submitted job — scan here, don't re-submit.
+    if std::env::var_os(LSF_GUARD_ENV).is_some() {
+        return false;
+    }
+    // Locate the wrapper on PATH; missing → warn and fall back to local.
+    if which_in_path(&lsf.cmd).is_none() {
+        eprintln!(
+            "Warning: [lsf].enabled but '{}' not found on PATH — scanning locally.",
+            lsf.cmd
+        );
+        return false;
+    }
+
+    // Absolute path to this binary so the compute node runs the same duscan.
+    let exe = match std::env::current_exe() {
+        Ok(p) => p.to_string_lossy().into_owned(),
+        Err(e) => {
+            eprintln!("Warning: cannot resolve duscan path ({}) — scanning locally.", e);
+            return false;
+        }
+    };
+
+    // Build the wrapper argv: bs [-os OS] [-M MEM] [-q QUEUE] [extra…] <exe> run <args…>
+    let mut argv: Vec<String> = Vec::new();
+    if !lsf.os.is_empty() {
+        argv.push("-os".into());
+        argv.push(lsf.os.clone());
+    }
+    if lsf.mem_mb > 0 {
+        argv.push("-M".into());
+        argv.push(lsf.mem_mb.to_string());
+    }
+    if !lsf.queue.is_empty() {
+        argv.push("-q".into());
+        argv.push(lsf.queue.clone());
+    }
+    argv.extend(lsf.extra_args.iter().cloned());
+    argv.push(exe);
+    argv.extend(reconstruct_run_args(output_dir, tree_map, workers, level, target, debug));
+
+    let pretty = format!("{} {}", lsf.cmd, argv.join(" "));
+    println!("Submitting scan to LSF: {}", pretty);
+
+    let status = std::process::Command::new(&lsf.cmd)
+        .args(&argv)
+        // Guard so the job scans locally rather than re-submitting.
+        .env(LSF_GUARD_ENV, "1")
+        .status();
+    match status {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            eprintln!("LSF submit '{}' exited with {} — NOT scanning locally (fix the submit or use --no-lsf).", lsf.cmd, s);
+            // Treat as handled: a failed submit shouldn't silently fall back to a
+            // heavy local scan on the login node.
+            true
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to run '{}' ({}) — scanning locally.", lsf.cmd, e);
+            false
+        }
+    }
+}
+
+/// Rebuild the `run` subcommand arguments from the parsed values so the
+/// submitted job re-runs the same scan. `--no-lsf` is intentionally omitted
+/// (the guard env already forces local execution inside the job).
+fn reconstruct_run_args(
+    output_dir: &Option<String>,
+    tree_map: bool,
+    workers: Option<usize>,
+    level: usize,
+    target: &[String],
+    debug: bool,
+) -> Vec<String> {
+    let mut args = vec!["run".to_string()];
+    if let Some(od) = output_dir {
+        args.push("--output-dir".into());
+        args.push(od.clone());
+    }
+    if tree_map {
+        args.push("--tree-map".into());
+    }
+    if let Some(w) = workers {
+        args.push("--workers".into());
+        args.push(w.to_string());
+    }
+    // level has a clap default of 3; always emit it so the job matches exactly.
+    args.push("--level".into());
+    args.push(level.to_string());
+    for t in target {
+        args.push("--target".into());
+        args.push(t.clone());
+    }
+    if debug {
+        args.push("--debug".into());
+    }
+    args
+}
+
+/// Minimal `which`: return the first PATH entry containing an executable named
+/// `cmd`, or `None`. Absolute/relative paths with a separator are checked
+/// directly. Avoids a dependency for a one-off lookup.
+fn which_in_path(cmd: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let is_exec = |p: &std::path::Path| {
+        p.metadata()
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    if cmd.contains('/') {
+        let p = std::path::PathBuf::from(cmd);
+        return if is_exec(&p) { Some(p) } else { None };
+    }
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let cand = dir.join(cmd);
+        if is_exec(&cand) {
+            return Some(cand);
+        }
+    }
+    None
 }
 
 /// Set up the TUI, build the device-aware plan, and run each device group on
@@ -1501,81 +1856,12 @@ fn run_scan(
     target: &[String],
     debug: bool,
 ) {
-    let out = output_dir.unwrap_or_else(|| cfg.resolved_output_dir());
-    let budget = workers.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get() * 2)
-            .unwrap_or(8)
-            .min(32)
-    });
+    let (out, group_jobs, view_names, max_parallel_devices) =
+        match plan_scan_jobs(cfg, output_dir, workers, target) {
+            Some(v) => v,
+            None => return,
+        };
 
-    // Restrict to requested targets, if any.
-    if !target.is_empty() {
-        let want: std::collections::HashSet<&str> = target.iter().map(|s| s.as_str()).collect();
-        for m in target.iter().filter(|n| !cfg.targets.iter().any(|t| &t.name == *n)) {
-            eprintln!("Warning: target '{}' not found in config", m);
-        }
-        cfg.targets.retain(|t| want.contains(t.name.as_str()));
-        if cfg.targets.is_empty() {
-            eprintln!("No matching targets to scan.");
-            return;
-        }
-    }
-
-    let plan = build_scan_plan(cfg, budget);
-
-    // Flatten the plan into owned per-group job lists and a flat list of view
-    // names (in plan order) for the TUI. `end_scan` cutoff is enforced here:
-    // views past their end date are skipped with a warning.
-    let today = chrono::Local::now().format("%Y%m%d").to_string();
-    let mut group_jobs: Vec<(usize, Vec<ViewJob>)> = Vec::new();
-    let mut view_names: Vec<String> = Vec::new();
-    for group in &plan.groups {
-        let mut jobs: Vec<ViewJob> = Vec::new();
-        for root in &group.roots {
-            for view in &root.views {
-                if let Some(ref es) = view.end_scan {
-                    if today.as_str() > es.as_str() {
-                        eprintln!("Skipping target '{}': past end_scan {}", view.name, es);
-                        continue;
-                    }
-                }
-                view_names.push(view.name.clone());
-                jobs.push(ViewJob {
-                    name: view.name.clone(),
-                    scan_path: root.scan_path.to_string_lossy().to_string(),
-                    prefix: view.prefix.clone().map(|p| p.to_string_lossy().to_string()),
-                    team_map: view.team_map.clone(),
-                    team_names: view.team_names.clone(),
-                    purge_time: view.purge_time,
-                    tree_map: view.tree_map,
-                    level: view.level,
-                    workers: view.workers,
-                    sync_host: view.sync_host.clone(),
-                    sync_dest_dir: view.sync_dest_dir.clone(),
-                    sync_user: view.sync_user.clone(),
-                    sync_pass: view.sync_pass,
-                    webhook_url: view.webhook_url.clone(),
-                });
-            }
-        }
-        if !jobs.is_empty() {
-            // Diagnostic: confirms each device's class + worker allocation so it's
-            // clear local disks aren't wrongly capped as NFS.
-            let names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
-            eprintln!(
-                "Device group dev={} class={} workers={} targets=[{}]",
-                group.st_dev, group.dev_class, group.workers, names.join(", ")
-            );
-            group_jobs.push((group.workers, jobs));
-        }
-    }
-    if view_names.is_empty() {
-        eprintln!("No targets to scan (all skipped or empty).");
-        return;
-    }
-
-    let max_parallel_devices = cfg.max_parallel_devices.max(0) as usize;
     std::fs::create_dir_all(&out).ok();
     run_scan_tui(&out, tree_map, level, max_parallel_devices, group_jobs, view_names, debug);
 }
@@ -1669,21 +1955,27 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Own the terminal, spawn one worker thread per device group, and drive the
-/// live TUI: poll each view's ScanProgress ~7×/s, compute rate/mem, render, and
-/// watch for q / Ctrl+C to abort. Returns after all group threads join.
-fn run_scan_tui(
+/// Spawn the background scan: create one `ViewProgress` sink per view, then one
+/// worker thread per device group (roots within a group run sequentially). A
+/// counting semaphore caps concurrent device groups and a global build lock
+/// serializes the RAM-heavy Phase 2/3/merge/history so peak RSS stays at ~one
+/// pipeline while Phase 1 scans stay parallel.
+///
+/// This owns no terminal — it returns a `ScanRun` the caller polls for live
+/// progress. `run_scan_tui` drives it under the standalone monitor; the config
+/// TUI drives it in-place.
+pub(crate) fn spawn_scan_workers(
     out: &str,
     tree_map: bool,
     level: usize,
     max_parallel_devices: usize,
     group_jobs: Vec<(usize, Vec<ViewJob>)>,
-    view_names: Vec<String>,
+    view_names: &[String],
     debug: bool,
-) {
+) -> ScanRun {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     // Shared progress sinks, one per view, keyed by position in view_names.
     let progresses: Vec<Arc<ViewProgress>> = view_names
@@ -1704,7 +1996,6 @@ fn run_scan_tui(
         progresses.iter().map(|p| (p.name.clone(), p.clone())).collect();
 
     let abort = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let app_state = Arc::new(Mutex::new(ui::AppState::new(&view_names)));
 
     // Optional cap on how many device groups scan concurrently (0 = unlimited).
     // A tiny counting semaphore built from a Mutex+Condvar: each group thread
@@ -1756,6 +2047,120 @@ fn run_scan_tui(
             }
         }));
     }
+
+    ScanRun { progresses, handles, abort }
+}
+
+/// Build the device-aware scan plan for `cfg` (restricted to `target` when
+/// non-empty) and return the flattened per-group job lists plus the flat list of
+/// view names in plan order. Shared by the standalone monitor (`run_scan`) and
+/// the config TUI's in-place scan. Returns `None` when there is nothing to scan
+/// (no matching targets, or all skipped by `end_scan`).
+pub(crate) fn plan_scan_jobs(
+    cfg: &mut Config,
+    output_dir: Option<String>,
+    workers: Option<usize>,
+    target: &[String],
+) -> Option<(String, Vec<(usize, Vec<ViewJob>)>, Vec<String>, usize)> {
+    let out = output_dir.unwrap_or_else(|| cfg.resolved_output_dir());
+    let budget = workers.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get() * 2)
+            .unwrap_or(8)
+            .min(32)
+    });
+
+    // Restrict to requested targets, if any.
+    if !target.is_empty() {
+        let want: std::collections::HashSet<&str> = target.iter().map(|s| s.as_str()).collect();
+        for m in target.iter().filter(|n| !cfg.targets.iter().any(|t| &t.name == *n)) {
+            eprintln!("Warning: target '{}' not found in config", m);
+        }
+        cfg.targets.retain(|t| want.contains(t.name.as_str()));
+        if cfg.targets.is_empty() {
+            eprintln!("No matching targets to scan.");
+            return None;
+        }
+    }
+
+    let plan = build_scan_plan(cfg, budget);
+
+    // Flatten the plan into owned per-group job lists and a flat list of view
+    // names (in plan order) for the TUI. `end_scan` cutoff is enforced here:
+    // views past their end date are skipped with a warning.
+    let today = chrono::Local::now().format("%Y%m%d").to_string();
+    let mut group_jobs: Vec<(usize, Vec<ViewJob>)> = Vec::new();
+    let mut view_names: Vec<String> = Vec::new();
+    for group in &plan.groups {
+        let mut jobs: Vec<ViewJob> = Vec::new();
+        for root in &group.roots {
+            for view in &root.views {
+                if let Some(ref es) = view.end_scan {
+                    if today.as_str() > es.as_str() {
+                        eprintln!("Skipping target '{}': past end_scan {}", view.name, es);
+                        continue;
+                    }
+                }
+                view_names.push(view.name.clone());
+                jobs.push(ViewJob {
+                    name: view.name.clone(),
+                    scan_path: root.scan_path.to_string_lossy().to_string(),
+                    prefix: view.prefix.clone().map(|p| p.to_string_lossy().to_string()),
+                    team_map: view.team_map.clone(),
+                    team_names: view.team_names.clone(),
+                    purge_time: view.purge_time,
+                    tree_map: view.tree_map,
+                    level: view.level,
+                    workers: view.workers,
+                    sync_host: view.sync_host.clone(),
+                    sync_dest_dir: view.sync_dest_dir.clone(),
+                    sync_user: view.sync_user.clone(),
+                    sync_pass: view.sync_pass,
+                    webhook_url: view.webhook_url.clone(),
+                });
+            }
+        }
+        if !jobs.is_empty() {
+            let names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
+            eprintln!(
+                "Device group dev={} class={} workers={} targets=[{}]",
+                group.st_dev, group.dev_class, group.workers, names.join(", ")
+            );
+            group_jobs.push((group.workers, jobs));
+        }
+    }
+    if view_names.is_empty() {
+        eprintln!("No targets to scan (all skipped or empty).");
+        return None;
+    }
+
+    let max_parallel_devices = cfg.max_parallel_devices.max(0) as usize;
+    Some((out, group_jobs, view_names, max_parallel_devices))
+}
+
+/// Own the terminal, spawn one worker thread per device group, and drive the
+/// live TUI: poll each view's ScanProgress ~7×/s, compute rate/mem, render, and
+/// watch for q / Ctrl+C to abort. Returns after all group threads join.
+fn run_scan_tui(
+    out: &str,
+    tree_map: bool,
+    level: usize,
+    max_parallel_devices: usize,
+    group_jobs: Vec<(usize, Vec<ViewJob>)>,
+    view_names: Vec<String>,
+    debug: bool,
+) {
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    // Spawn the background scan workers (device-group threads + per-view sinks).
+    let run = spawn_scan_workers(out, tree_map, level, max_parallel_devices, group_jobs, &view_names, debug);
+    let progresses = run.progresses.clone();
+    let abort = run.abort.clone();
+    let handles = run.handles;
+
+    let app_state = Arc::new(Mutex::new(ui::AppState::new(&view_names)));
 
     // ── TUI poll loop (this thread owns the terminal) ──
     // The guard renders to /dev/tty and silences core stdout/stderr for the
@@ -1898,22 +2303,48 @@ fn scan_one_view(
     let dir_str = job.scan_path.clone();
 
     set_phase("scanning");
-    write_scan_status(&target_out, "scanning", true, run_started, run_started, "Phase 1 scan", "", tree_map);
+    write_scan_status(&target_out, "scanning", true, run_started, run_started, "Phase 1 scan", "", tree_map, 0, 0, 0);
 
-    // Phase 1 — hand the engine our shared progress sink so the TUI sees live counts.
+    // Phase 1 — hand the engine our shared progress sink so the TUI sees live
+    // counts. Because `run_scan_core` blocks, spawn a heartbeat thread that
+    // snapshots the sink and rewrites scan_status.json every ~2s: this is what
+    // lets `duscan status` show near-live file/dir counts even when the scan is
+    // an LSF job (a different process the in-memory sink can't reach).
     let progress = sink.scan.clone();
+    let hb_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let heartbeat = {
+        let hb_stop = hb_stop.clone();
+        let hb_sink = sink.scan.clone();
+        let hb_dir = target_out.clone();
+        std::thread::spawn(move || {
+            while !hb_stop.load(Ordering::SeqCst) {
+                // Sleep in short slices so stop is honored quickly, write ~every 2s.
+                for _ in 0..20 {
+                    if hb_stop.load(Ordering::SeqCst) { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if hb_stop.load(Ordering::SeqCst) { break; }
+                let (f, d, s) = hb_sink.snapshot();
+                write_scan_status(&hb_dir, "scanning", true, run_started, run_started, "Phase 1 scan", "", tree_map, f, d, s);
+            }
+        })
+    };
+
     let phase1 = check_disk_core::scan_core::run_scan_core(
         dir_str.clone(), vec![], None, Some(workers), debug, "cli", None, Some(progress),
     );
-    // Ensure the done flag is set regardless of engine internals.
+    // Ensure the done flag is set regardless of engine internals, and stop the
+    // heartbeat before writing any terminal status (so it can't overwrite it).
     sink.scan.done.store(true, Ordering::SeqCst);
+    hb_stop.store(true, Ordering::SeqCst);
+    let _ = heartbeat.join();
 
     let result = match phase1 {
         Ok(r) => r,
         Err(e) => {
             *sink.error.lock().unwrap() = e.to_string();
             set_phase("error");
-            write_scan_status(&target_out, "error", false, run_started, run_started, "", &e.to_string(), tree_map);
+            write_scan_status(&target_out, "error", false, run_started, run_started, "", &e.to_string(), tree_map, 0, 0, 0);
             eprintln!("Error scanning '{}': {}", job.name, e);
             return;
         }
@@ -1921,10 +2352,11 @@ fn scan_one_view(
 
     let files = result["total_files"].as_u64().unwrap_or(0);
     let dirs = result["total_dirs"].as_u64().unwrap_or(0);
+    let scanned_size = result["total_size"].as_u64().unwrap_or(0);
     let tmpdir = result["detail_tmpdir"].as_str().unwrap_or("").to_string();
     if tmpdir.is_empty() {
         set_phase("done");
-        write_scan_status(&target_out, "done", false, run_started, run_started, "Scan complete", "", tree_map);
+        write_scan_status(&target_out, "done", false, run_started, run_started, "Scan complete", "", tree_map, files, dirs, scanned_size);
         return;
     }
 
@@ -1953,14 +2385,14 @@ fn scan_one_view(
     // disks are scanned. Show `queued` while waiting for the build slot so the
     // TUI doesn't look hung. The guard is held to end of function.
     set_phase("queued");
-    write_scan_status(&target_out, "queued", true, run_started, run_started, "Waiting for build slot", "", tree_map);
+    write_scan_status(&target_out, "queued", true, run_started, run_started, "Waiting for build slot", "", tree_map, files, dirs, scanned_size);
     let _build_guard = build_lock.lock().unwrap_or_else(|e| e.into_inner());
 
     let timestamp = now_epoch();
     let phase2_start = std::time::Instant::now();
 
     set_phase("building");
-    write_scan_status(&target_out, "building", true, run_started, timestamp, "Phase 2 detail", "", tree_map);
+    write_scan_status(&target_out, "building", true, run_started, timestamp, "Phase 2 detail", "", tree_map, files, dirs, scanned_size);
 
     let build = check_disk_core::report_pipeline::build_detail_db_impl(
         tmpdir, uids_map, team_map,
@@ -1973,7 +2405,7 @@ fn scan_one_view(
         Err(e) => {
             *sink.error.lock().unwrap() = e.clone();
             set_phase("error");
-            write_scan_status(&target_out, "error", false, run_started, timestamp, "", &e, tree_map);
+            write_scan_status(&target_out, "error", false, run_started, timestamp, "", &e, tree_map, files, dirs, scanned_size);
             eprintln!("Phase 2 error for '{}': {}", job.name, e);
             return;
         }
@@ -2011,6 +2443,9 @@ fn scan_one_view(
         let _ = std::fs::remove_file(out_path.join("data_detail.db"));
         let _ = std::fs::remove_file(out_path.join("treemap.db"));
         let _ = std::fs::remove_file(out_path.join("report.tmp"));
+        // perm_issues has been merged into report.db; drop the scratch sidecar so
+        // the target dir holds a single source of truth (report.db + scan_status.json).
+        let _ = std::fs::remove_file(out_path.join("permission_issues.db"));
 
         set_phase("history");
         if let Err(e) = write_history_snapshot(
@@ -2063,7 +2498,7 @@ fn scan_one_view(
     }
 
     set_phase("done");
-    write_scan_status(&target_out, "done", false, run_started, timestamp, "Scan complete", "", tree_map);
+    write_scan_status(&target_out, "done", false, run_started, timestamp, "Scan complete", "", tree_map, files, dirs, scanned_size);
 }
 
 fn print_tree(
@@ -2466,5 +2901,26 @@ mod tests {
     fn parse_team_specs_dedups_users() {
         let specs = parse_team_specs(&["dev=alice,alice,bob".into()]).unwrap();
         assert_eq!(specs[0].users, vec!["alice".to_string(), "bob".to_string()]);
+    }
+
+    #[test]
+    fn reconstruct_run_args_roundtrip() {
+        // Full set of options: every flag should be reproduced for the job.
+        let args = reconstruct_run_args(
+            &Some("/tmp/out".into()), true, Some(8), 5,
+            &["ABC".to_string(), "Test".to_string()], true,
+        );
+        assert_eq!(args, vec![
+            "run", "--output-dir", "/tmp/out", "--tree-map",
+            "--workers", "8", "--level", "5",
+            "--target", "ABC", "--target", "Test", "--debug",
+        ]);
+    }
+
+    #[test]
+    fn reconstruct_run_args_minimal() {
+        // No options: only the run subcommand + the always-emitted level default.
+        let args = reconstruct_run_args(&None, false, None, 3, &[], false);
+        assert_eq!(args, vec!["run", "--level", "3"]);
     }
 }

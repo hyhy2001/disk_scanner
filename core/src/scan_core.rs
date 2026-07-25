@@ -151,8 +151,12 @@ fn hardlink_key(path: &std::path::Path, ino: u64, dev: u64, use_statx: bool) -> 
 /// Lightweight statx result for the NFS hot-path: one syscall yields the
 /// inode identity (stx_ino + stx_mnt_id) AND the disk-usage fields
 /// (stx_blocks, stx_uid, stx_nlink) so we can avoid a separate entry.metadata() call.
+/// `dev` is reconstructed from stx_dev_major/minor (always populated by statx,
+/// no mask bit needed) and equals `metadata().dev()` — used by the directory
+/// hot-path to fuse the bind-mount check into the same single syscall.
 struct StatxLite {
     ino: u64,
+    dev: u64,
     mnt_id: u64,
     blocks: u64,
     uid: u32,
@@ -188,6 +192,9 @@ fn statx_lite(path: &std::path::Path) -> Option<StatxLite> {
         }
         Some(StatxLite {
             ino: s.stx_ino,
+            // st_dev == makedev(major, minor); statx always fills these two
+            // fields, so no STATX_* mask bit is required for them.
+            dev: libc::makedev(s.stx_dev_major, s.stx_dev_minor) as u64,
             mnt_id: s.stx_mnt_id,
             // stx_blocks is in 512-byte units, identical semantics to st_blocks
             blocks: s.stx_blocks,
@@ -712,12 +719,68 @@ pub fn run_scan_core(
                             }
                         }
 
+                        // --- NFS fast path: one statx() covers all three checks ---
+                        // On NFS every entry.metadata() is a remote lstat RPC, and
+                        // the boundary + visited-dir checks below each issued their
+                        // own extra statx() via hardlink_key() — 3 RPCs per dir.
+                        // statx_lite() yields dev+ino+mnt_id+uid in a single syscall,
+                        // fusing the bind-mount, boundary and dedup checks into one.
+                        // Falls back to the entry.metadata() path if statx_lite()
+                        // returns None (old kernel, CString error, etc.).
+                        let mut handled_via_statx = false;
+                        if use_statx_dedup {
+                            let meta_start = debug.then(Instant::now);
+                            let sx = statx_lite(path);
+                            if let Some(start) = meta_start {
+                                state.prof_metadata_ns.fetch_add(
+                                    start.elapsed().as_nanos() as u64,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                            if let Some(sx) = sx {
+                                // Bind mount detection: (dev, ino) matches a known
+                                // bind mount destination. sx.dev == metadata().dev().
+                                if bind_mount.contains(&(sx.dev, sx.ino)) {
+                                    return WalkState::Skip;
+                                }
+                                // Skip kernel/pseudo filesystem mount points.
+                                if let Some(path_str) = path.to_str() {
+                                    if kernfs.contains(path_str) {
+                                        return WalkState::Skip;
+                                    }
+                                }
+                                // Filesystem boundary (du -x): compare stx_mnt_id
+                                // (st_dev unreliable on NFS).
+                                if let Some(root_m) = root_mnt_id {
+                                    if sx.mnt_id != root_m {
+                                        if foreign_mnt_logged.insert(sx.mnt_id) {
+                                            eprintln!("[SCAN] skip foreign mount: {} (mnt_id {} != root {})",
+                                                path.display(), sx.mnt_id, root_m);
+                                        }
+                                        return WalkState::Skip;
+                                    }
+                                }
+                                // Runtime bind mount loop detection: statx-stable
+                                // (ino, mnt_id) key, consistent across paths on NFS.
+                                if !visited_dirs.insert((sx.ino, sx.mnt_id)) {
+                                    return WalkState::Skip;
+                                }
+                                // Directory's own inode owner (st_uid) — already
+                                // paid for by the statx above, so this is free.
+                                state.add_dir_owner(&path.to_string_lossy(), sx.uid);
+                                handled_via_statx = true;
+                            }
+                        }
+
                         // --- Cross-device check: skip NFS / snapshots / bind-mounts ---
+                        // Local FS path, or NFS fallback when statx_lite() failed.
                         // visited_dirs is kept for runtime bind-mount loop detection:
                         // catches loops not in /proc/self/mountinfo (e.g. container
                         // bind mounts). Keyed by statx identity (ino, mnt_id) on NFS.
                         let meta_start = debug.then(Instant::now);
-                        if let Ok(meta) = entry.metadata() {
+                        if handled_via_statx {
+                            // Already handled via the fused statx above.
+                        } else if let Ok(meta) = entry.metadata() {
                             if let Some(start) = meta_start {
                                 state.prof_metadata_ns.fetch_add(
                                     start.elapsed().as_nanos() as u64,

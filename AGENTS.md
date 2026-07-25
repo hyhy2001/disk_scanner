@@ -16,10 +16,18 @@ targets/teams/users and writes every change straight to `duscan.toml` +
 `targets/*.toml` (save on each op). Keys: `↹`/`1`..`5` switch tabs, `↑↓`
 move, `[`/`]` switch target (on Teams, Scan/Sync & Output tabs), `a` add, `e`
 edit, `d` delete, `u` add users (supports `alice,bob` and `@file`), `x` remove
-user, path inputs support `Tab` directory completion, `q`/`Esc` quit.
+user, `q`/`Esc` quit. Local path inputs (scan path, `export_dir`) and the `@file`
+token in add-users support `Tab` completion and are stored as absolute paths;
+`sync_dest_dir` (remote path) and `output_dir` (anchored to the binary dir) are
+left as typed. `/` filters long lists (see the Output tab notes below).
 
 **Run a scan from the TUI:** `r` scans the selected target, `R` scans all. The
-TUI hands the screen to the scan monitor, then returns when the scan finishes.
+scan runs **in-place** — the TUI stays open and a live "Scan jobs" panel appears
+above the footer showing each target's current stage (Scanning → Building detail
+→ Merging → History → Done) plus live file/dir counts. You can keep navigating
+the config while it runs; `q` quits the TUI (the scan keeps running in the
+background until its threads finish). Only one scan runs at a time (`r`/`R` are
+ignored while one is in flight). When it finishes the config reloads from disk.
 
 **Scan/Sync tab** — per-target overrides (empty = use the global default):
 `tree_map`, `level`, `workers`, `sync_host`/`sync_dest_dir`/`sync_user`,
@@ -33,10 +41,12 @@ after each scan. These are also stored in `targets/<name>.toml`.
 sub-views switched with `h`/`d`/`p`/`i`/`t`: **History** (per-day usage snapshots
 + top users), **Detail** (pick a user → totals + top dirs/files; `x` exports the
 selected user's usage txt, `X` exports every user), **Perm** (`p` — the selected
-user's permission issues: Type/Error/Path), **Inode** (`i` — the user's per-dir
-file-count breakdown, sorted by file count), and **Treemap** (an
-ncdu-style directory browser: `↑↓` move, `Enter` descend into a sub-directory,
-`Backspace` go up, sized bars per entry). `[`/`]` switch target. Reads each
+user's permission issues: Type/Error/Path), **Inode** (`i` — the user's inode
+count = files + dirs, plus a per-dir file-count breakdown sorted by file count),
+and **Treemap** (an ncdu-style directory browser: `↑↓` move, `Enter` descend into
+a sub-directory, `Backspace` go up, sized bars per entry). `[`/`]` switch target.
+Press `/` to filter long lists live (Detail/Perm/Inode user column, Treemap
+entries, and the Teams&Users user column) — type to narrow, `Esc` clears. Reads each
 target's `report.db`; empty states point you to press `r` to scan first.
 
 `duscan run` remains a separate read-only scan monitor.
@@ -60,9 +70,14 @@ target's `report.db`; empty states point you to press `r` to scan first.
 ./duscan list [--target <name>] [--team <name>] [--json]
 
 # Scan + read (all reader commands fall back to output_dir from duscan.toml — no need to repeat --output-dir)
-./duscan run [--output-dir DIR] [--tree-map] [--workers N] [--level N] [--target <name>] [--debug]
+./duscan run [--output-dir DIR] [--tree-map] [--workers N] [--level N] [--target <name>] [--debug] [--no-lsf]
 #   --debug: emit core Phase 1/2/3 profiling + RSS diagnostics (headless/piped stdout; TUI mode suppresses core stdout)
+#   --no-lsf: force a local scan even when [lsf] is enabled (see the LSF section below)
 #   per-target webhook_url auto-sends a Teams card after each scan (set on Scan/Sync tab) — no separate `notify` step for cron
+./duscan status [--output-dir DIR] [--target <name>] [--watch] [--json]
+#   reads each target's scan_status.json (stage/running/files/dirs/size/elapsed). Works for local,
+#   background, AND LSF-submitted scans (status file is on shared storage). --watch redraws every 2s;
+#   a scan whose heartbeat is >30s old is flagged "running (stale)" (e.g. a killed/dead LSF job).
 ./duscan detail --user <user> [--output-dir DIR] [--top N] [--target <name>] [--json]
 #   --type report (default: top dirs/files by size) | permission (perm_issues, filter with --search KW) | inode (per-dir file counts)
 ./duscan tree-show [--output-dir DIR] [--level N] [--limit N] [--path P] [--search KW] [--target <name>]
@@ -100,10 +115,43 @@ anchored to the binary dir, so reports land next to the binary — not under cro
 cwd. An **absolute** `output_dir`, or an explicit `--output-dir`, is used as-is.
 So a cron entry is just: `0 2 * * * /path/to/duscan run --target <name>`.
 
+## LSF batch submit (optional)
+
+On an LSF cluster, a scan should run on a compute node, not the login node. Add
+an `[lsf]` table to `duscan.toml` and a headless `duscan run` will **re-submit
+itself** as a batch job via the `bs` wrapper (a site-local `bsub`) instead of
+scanning in place:
+
+```toml
+[lsf]
+enabled = true      # master switch (default false = always scan locally)
+cmd = "bs"          # submit wrapper (default "bs")
+os = "RHEL8"        # -os <os>   (empty = omit)
+mem_mb = 20000      # -M <mem>   (0 = omit)
+queue = ""          # -q <queue> (empty = omit)
+extra_args = []     # extra raw args before the binary, e.g. ["-n", "4"]
+```
+
+With this, `duscan run --target backend` submits
+`bs -os RHEL8 -M 20000 /abs/path/duscan run --level 3 --target backend` and
+exits (fire-and-forget — track the job with `bjobs`/the per-scan log). The
+submitted job carries `DUSCAN_VIA_LSF=1` so it scans locally instead of
+re-submitting (no loop). Fallbacks: if `bs` isn't on `PATH`, duscan warns and
+scans locally; `--no-lsf` forces a local scan even when enabled. The config TUI
+`r`/`R` scan always runs in-place (interactive), never via LSF. So a cluster
+cron entry stays simple: `0 2 * * * /path/to/duscan run --target <name>`.
+
+**Tracking an LSF (or background) scan:** the compute-node job writes
+`scan_status.json` into each target dir (on shared storage) with a live
+heartbeat — stage + file/dir/size counts, refreshed ~every 2s during the walk.
+Poll it from anywhere with `duscan status --target <name> [--watch]`; you get
+near-live progress even though the scan runs in a different process. `bjobs`
+still shows the LSF-level job state.
+
 Config layout (TOML, auto-created next to the binary):
 
 ```
-duscan.toml            # global settings only: output_dir, workers, max_parallel_devices, nfs_parallel
+duscan.toml            # global settings only: output_dir, workers, max_parallel_devices, nfs_parallel, [lsf]
 targets/
 ├── backend.toml       # one target per file (ergonomic: teams carry users, no team_id)
 ├── frontend.toml
@@ -131,7 +179,7 @@ name = "ops"
 users = ["carol"]
 ```
 
-Per-target output: `<output-dir>/<target>/` holds `report.db`, `permission_issues.db`, `scan_status.json`, and `logs/scan_<ts>.log` (one log per scan, legacy-style phase summary).
+Per-target output: `<output-dir>/<target>/` holds `report.db`, `scan_status.json`, and `logs/scan_<ts>.log` (one log per scan, legacy-style phase summary). Permission issues are **merged into `report.db`** (the `perm_issues` table, read by `detail --type permission` and the TUI Perm view); the intermediate `permission_issues.db` scratch file is deleted after the merge, so `report.db` is the single source of truth.
 
 ## Architecture
 
@@ -150,6 +198,23 @@ Per-target output: `<output-dir>/<target>/` holds `report.db`, `permission_issue
 ├── legacy/                 # Python reference code (read-only)
 └── src/rust_scanner/       # Original PyO3 crate (.so build)
 ```
+
+## Scan performance (NFS)
+
+Phase 1 (the parallel walk in `core/src/scan_core.rs`) is metadata-I/O-bound: on
+NFS every `lstat`/`statx` is a network RPC, so metadata dominates wall time. Two
+things keep it fast on NFS:
+
+- **One statx per entry.** Both the file and directory hot-paths issue a single
+  `statx_lite()` syscall that returns dev+ino+mnt_id+blocks+uid+nlink at once —
+  covering the bind-mount, filesystem-boundary (`du -x`), hardlink/loop dedup and
+  inode-owner checks together. On old kernels where `statx()` isn't usable it
+  falls back to `entry.metadata()` (correct, just more syscalls). Local
+  filesystems keep the plain `metadata()` path (already one syscall).
+- **`nfs_parallel`** (in `duscan.toml`, default **16**) caps walker threads per
+  NFS device. NFS is latency-bound, so more RPCs in flight hide round-trip
+  latency; raise it for high-latency mounts, lower it if the NFS server is the
+  bottleneck. HDDs stay capped low (seek-bound); SSD/NVMe get the full budget.
 
 ## Build notes
 
