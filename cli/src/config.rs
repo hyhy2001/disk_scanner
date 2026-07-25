@@ -205,7 +205,11 @@ pub struct Config {
 
 fn default_output_dir() -> String { "reports".into() }
 fn default_workers() -> String { "auto".into() }
-fn default_nfs_parallel() -> i64 { 4 }
+// NFS is latency-bound: hiding per-RPC round-trip latency needs many metadata
+// requests in flight, so the per-device walker cap defaults well above the old
+// value of 4 (production traces showed ~25 threads productively blocked on
+// metadata). Still overridable via `nfs_parallel` in duscan.toml.
+fn default_nfs_parallel() -> i64 { 16 }
 
 impl Default for Config {
     fn default() -> Self {

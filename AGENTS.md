@@ -199,6 +199,23 @@ Per-target output: `<output-dir>/<target>/` holds `report.db`, `scan_status.json
 └── src/rust_scanner/       # Original PyO3 crate (.so build)
 ```
 
+## Scan performance (NFS)
+
+Phase 1 (the parallel walk in `core/src/scan_core.rs`) is metadata-I/O-bound: on
+NFS every `lstat`/`statx` is a network RPC, so metadata dominates wall time. Two
+things keep it fast on NFS:
+
+- **One statx per entry.** Both the file and directory hot-paths issue a single
+  `statx_lite()` syscall that returns dev+ino+mnt_id+blocks+uid+nlink at once —
+  covering the bind-mount, filesystem-boundary (`du -x`), hardlink/loop dedup and
+  inode-owner checks together. On old kernels where `statx()` isn't usable it
+  falls back to `entry.metadata()` (correct, just more syscalls). Local
+  filesystems keep the plain `metadata()` path (already one syscall).
+- **`nfs_parallel`** (in `duscan.toml`, default **16**) caps walker threads per
+  NFS device. NFS is latency-bound, so more RPCs in flight hide round-trip
+  latency; raise it for high-latency mounts, lower it if the NFS server is the
+  bottleneck. HDDs stay capped low (seek-bound); SSD/NVMe get the full budget.
+
 ## Build notes
 
 - Release: `make build` → `./duscan` (dynamically linked)
