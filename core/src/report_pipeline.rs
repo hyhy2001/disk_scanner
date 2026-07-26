@@ -1318,8 +1318,12 @@ pub fn build_detail_db_impl(
 
         // ─── STAGE 5: index + finalize detail.db ─────────────────
         let t5 = Instant::now();
-        println!("[Phase 2] Finalizing detail.db (index + vacuum)...");
-        let files_inserted = db_writer::detail_finalize(detail_handle)?;
+        println!("[Phase 2] Finalizing detail.db...");
+        // for_merge = true: this data_detail.db is consumed by
+        // merge_into_single_db (a sequential INSERT … SELECT *) and then
+        // deleted, so its indexes and VACUUM would be built and thrown away —
+        // report.db rebuilds the same three indexes anyway.
+        let files_inserted = db_writer::detail_finalize(detail_handle, true)?;
         t_finalize_detail = t5.elapsed().as_secs_f64();
 
         // ─── STAGE 6: persist treemap aggregates if requested ─────────
