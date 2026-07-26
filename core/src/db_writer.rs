@@ -443,7 +443,15 @@ fn stamp_db(conn: &Connection, app_id: i32) -> PyResult<()> {
 const VACUUM_SIZE_MIN_BYTES: u64 = 100 * 1024 * 1024;
 const VACUUM_SIZE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
-fn finalize_db(conn: Connection, build_path: &Path, final_path: &Path) -> PyResult<()> {
+/// `skip_repack` drops the `PRAGMA optimize` + `VACUUM INTO` pass, for a DB that
+/// is only going to be read sequentially once and then deleted. The build file is
+/// still renamed into `final_path` either way.
+fn finalize_db(
+    conn: Connection,
+    build_path: &Path,
+    final_path: &Path,
+    skip_repack: bool,
+) -> PyResult<()> {
     let tmp_path = final_path.with_extension("tmp.db");
     if tmp_path.exists() {
         let _ = fs::remove_file(&tmp_path);
@@ -456,13 +464,16 @@ fn finalize_db(conn: Connection, build_path: &Path, final_path: &Path) -> PyResu
     // write); a leaked tmp.db would otherwise sit on disk until the next run.
     let result: PyResult<()> = (|| {
         let t_analyze = Instant::now();
-        conn.execute_batch("PRAGMA optimize;")
-            .map_err(|e| PyRuntimeError::new_err(format!("optimize: {}", e)))?;
+        if !skip_repack {
+            conn.execute_batch("PRAGMA optimize;")
+                .map_err(|e| PyRuntimeError::new_err(format!("optimize: {}", e)))?;
+        }
         let analyze_secs = t_analyze.elapsed().as_secs_f64();
 
         let build_size = fs::metadata(build_path).map(|m| m.len()).unwrap_or(0);
-        let skip_vacuum =
-            build_size < VACUUM_SIZE_MIN_BYTES || build_size > VACUUM_SIZE_MAX_BYTES;
+        let skip_vacuum = skip_repack
+            || build_size < VACUUM_SIZE_MIN_BYTES
+            || build_size > VACUUM_SIZE_MAX_BYTES;
 
         let mut vacuum_secs = 0.0f64;
         if !skip_vacuum {
@@ -480,7 +491,9 @@ fn finalize_db(conn: Connection, build_path: &Path, final_path: &Path) -> PyResu
             .unwrap_or("<db>");
         let size_mb = build_size as f64 / (1024.0 * 1024.0);
         if skip_vacuum {
-            let reason = if build_size < VACUUM_SIZE_MIN_BYTES {
+            let reason = if skip_repack {
+                "merge input"
+            } else if build_size < VACUUM_SIZE_MIN_BYTES {
                 "small"
             } else {
                 "huge"
@@ -776,7 +789,9 @@ pub fn build_treemap_db(
         );
     }
 
-    finalize_db(conn, &build_path, final_path)?;
+    // treemap.db keeps its repack pass: it is small enough that VACUUM is
+    // already skipped by the size band, so there is nothing to save here.
+    finalize_db(conn, &build_path, final_path, false)?;
     Ok(())
 }
 
@@ -944,7 +959,18 @@ pub fn detail_set_meta(handle: &mut DetailBuildHandle, meta: &[(String, String)]
     insert_meta(&mut handle.conn, meta)
 }
 
-pub fn detail_finalize(handle: DetailBuildHandle) -> PyResult<i64> {
+/// Finalize the intermediate `data_detail.db`.
+///
+/// `for_merge` says this DB exists only to be consumed by
+/// `merge_into_single_db` and then deleted. In that case the indexes and the
+/// VACUUM are pure waste: the merge reads every table with a sequential
+/// `INSERT INTO … SELECT *` (no index can help that) and rebuilds the same
+/// three indexes on `report.db` afterwards. Skipping them here removes a
+/// duplicated index build over 1.5M rows plus a full file rewrite.
+///
+/// Pass `false` when the caller wants a standalone, queryable `data_detail.db`
+/// (bare table names, as `detail_prefix()` supports) rather than a merge input.
+pub fn detail_finalize(handle: DetailBuildHandle, for_merge: bool) -> PyResult<i64> {
     // Boost cache + mmap for CREATE INDEX phase. Indexes are built by
     // scanning the entire `files` table multiple times — bigger cache
     // means fewer disk re-reads. Restored to default after finalize.
@@ -956,10 +982,12 @@ pub fn detail_finalize(handle: DetailBuildHandle) -> PyResult<i64> {
         )
         .map_err(|e| PyRuntimeError::new_err(format!("pragma boost: {}", e)))?;
 
-    handle
-        .conn
-        .execute_batch(DETAIL_INDEX_DDL)
-        .map_err(|e| PyRuntimeError::new_err(format!("detail idx: {}", e)))?;
+    if !for_merge {
+        handle
+            .conn
+            .execute_batch(DETAIL_INDEX_DDL)
+            .map_err(|e| PyRuntimeError::new_err(format!("detail idx: {}", e)))?;
+    }
 
     stamp_db(&handle.conn, DETAIL_APP_ID)?;
 
@@ -977,6 +1005,10 @@ pub fn detail_finalize(handle: DetailBuildHandle) -> PyResult<i64> {
         files_inserted,
         ..
     } = handle;
-    finalize_db(conn, &build_path, &final_path)?;
+    // `skip_repack`: for a merge input, PRAGMA optimize (stats for a query
+    // planner that will never run a query here) and VACUUM INTO (a full rewrite
+    // of a file about to be deleted) are both wasted work. The file still gets
+    // moved into place, because the merge reads it by name.
+    finalize_db(conn, &build_path, &final_path, for_merge)?;
     Ok(files_inserted)
 }

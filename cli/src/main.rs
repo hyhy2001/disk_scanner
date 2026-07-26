@@ -2440,7 +2440,9 @@ fn scan_one_view(
         tmpdir, uids_map, team_map,
         detail_db, treemap_db,
         dir_str.clone(), level, 0, timestamp,
-        1, tree_map, false, job.prefix.clone(),
+        // `debug` was hard-coded false here, so `run --debug` never reached
+        // Phase 2 and its [Phase 2 Profile] block could never print.
+        1, tree_map, debug, job.prefix.clone(),
     );
     let (total, agg_opt) = match build {
         Ok(v) => v,
@@ -2453,12 +2455,17 @@ fn scan_one_view(
         }
     };
 
+    if debug {
+        eprintln!("[stage] phase2 detail: {:.2}s", phase2_start.elapsed().as_secs_f64());
+    }
+    let treemap_start = std::time::Instant::now();
+
     if tree_map {
         if let Some(agg) = &agg_opt {
             set_phase("treemap");
             let tm_out = out_path.join("treemap.db");
             if let Err(e) = check_disk_core::report_pipeline::build_treemap_db_impl(
-                agg, &tm_out, &dir_str, level, 0, timestamp, false,
+                agg, &tm_out, &dir_str, level, 0, timestamp, debug,
             ) {
                 eprintln!("Treemap error for '{}': {:?}", job.name, e);
             }
@@ -2472,11 +2479,19 @@ fn scan_one_view(
         let _ = std::fs::rename(&root_perm, &target_perm);
     }
 
+    if debug {
+        eprintln!("[stage] phase3 treemap: {:.2}s", treemap_start.elapsed().as_secs_f64());
+    }
+    let merge_start = std::time::Instant::now();
+
     set_phase("merging");
     let merged = out_path.join("report.db");
     let merge_result = check_disk_core::db_writer::merge_into_single_db(
         &out_path, &merged, &job.name, &dir_str, timestamp,
     );
+    if debug {
+        eprintln!("[stage] merge: {:.2}s", merge_start.elapsed().as_secs_f64());
+    }
     let merge_ok = merge_result.is_ok();
     if !merge_ok {
         eprintln!("Merge error for '{}': {:?}", job.name, merge_result);
@@ -2490,10 +2505,14 @@ fn scan_one_view(
         let _ = std::fs::remove_file(out_path.join("permission_issues.db"));
 
         set_phase("history");
+        let hist_start = std::time::Instant::now();
         if let Err(e) = write_history_snapshot(
             &merged, &dir_str, &job.team_map, &job.team_names, timestamp, job.purge_time,
         ) {
             eprintln!("History error for '{}': {}", job.name, e);
+        }
+        if debug {
+            eprintln!("[stage] history: {:.2}s", hist_start.elapsed().as_secs_f64());
         }
     }
 
