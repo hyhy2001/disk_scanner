@@ -135,11 +135,12 @@ CREATE TABLE files (
 
 const DETAIL_INDEX_DDL: &str = "
 -- Files: cover keyset pagination (uid, size DESC, dir_id ASC, name_id ASC).
+-- This is the only index needed on `files`: every reader queries it as
+-- WHERE uid = ?1 ORDER BY size DESC (detail views, --json, export). The former
+-- ix_files_uid_ext_size_dir_name and ix_files_dir_uid_ext_size_name indexed
+-- `ext`/`dir_id`, which no query in cli/ or core/ ever filters or orders by, so
+-- they only added CREATE INDEX time and file size on the 1.5M-row table.
 CREATE INDEX ix_files_uid_size_dir_name      ON files(uid, size DESC, dir_id ASC, name_id ASC);
--- Files: cover ext filter + keyset pagination.
-CREATE INDEX ix_files_uid_ext_size_dir_name  ON files(uid, ext, size DESC, dir_id ASC, name_id ASC);
--- Files: cover dir_id-anchored lookups (used when joining via dir_id).
-CREATE INDEX ix_files_dir_uid_ext_size_name  ON files(dir_id, uid, ext, size DESC, name_id ASC);
 -- Dirs: cover keyset pagination (uid, size DESC, id ASC).
 CREATE INDEX ix_dirs_uid_size_dir            ON dirs(uid, size DESC, id ASC);
 -- file_names: cover LIKE substring search.
@@ -248,12 +249,19 @@ CREATE TABLE IF NOT EXISTS hist_user_usage (
 ";
 
 const MERGED_INDEX_DDL: &str = "
+-- Only the (uid, size DESC, …) index is built on detail_files. It covers the
+-- one query the codebase actually runs against that table (the per-user export
+-- in export_user_text: WHERE uid = ?1 ORDER BY size DESC), and the planner
+-- confirms it serves that as a COVERING INDEX.
+--
+-- The former ix_detail_files_uid_ext_size_dir_name and
+-- ix_detail_files_dir_uid_ext_size_name were dropped: no query in cli/ or core/
+-- ever filters or orders by `ext` or leads with `dir_id`, so they served nothing
+-- while costing ~3.8s of CREATE INDEX time and ~60MB in every report.db. If an
+-- extension-breakdown or per-directory query is added later, reintroduce the
+-- matching index then.
 CREATE INDEX IF NOT EXISTS ix_detail_files_uid_size_dir_name
     ON detail_files(uid, size DESC, dir_id ASC, name_id ASC);
-CREATE INDEX IF NOT EXISTS ix_detail_files_uid_ext_size_dir_name
-    ON detail_files(uid, ext, size DESC, dir_id ASC, name_id ASC);
-CREATE INDEX IF NOT EXISTS ix_detail_files_dir_uid_ext_size_name
-    ON detail_files(dir_id, uid, ext, size DESC, name_id ASC);
 CREATE INDEX IF NOT EXISTS ix_detail_dirs_uid_size_dir
     ON detail_dirs(uid, size DESC, id ASC);
 CREATE INDEX IF NOT EXISTS ix_detail_file_names_name
