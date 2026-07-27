@@ -238,23 +238,49 @@ fn username_for_uid(uid: u32) -> String {
     }
 }
 
-/// statvfs(path) → (total, used, available) bytes of the filesystem holding `path`.
-fn statvfs_meta(path: &str) -> (i64, i64, i64) {
+/// What one statvfs() call says about the filesystem holding a path: bytes and
+/// inodes side by side, because they come from the same struct and the dashboard
+/// shows them as two views of the same capacity.
+#[derive(Clone, Copy, Debug, Default)]
+struct FsCapacity {
+    total: i64,
+    used: i64,
+    available: i64,
+    inodes_total: i64,
+    inodes_used: i64,
+    inodes_free: i64,
+}
+
+/// statvfs(path) → byte and inode capacity of the filesystem holding `path`.
+///
+/// A filesystem with no fixed inode table (btrfs, XFS with dynamic inodes, most
+/// NFS mounts) reports `f_files = 0`. That is passed through as 0 rather than
+/// faked, so the dashboard can say "not reported" instead of showing 100% used.
+fn statvfs_meta(path: &str) -> FsCapacity {
     use std::ffi::CString;
     let c_path = match CString::new(path) {
         Ok(p) => p,
-        Err(_) => return (0, 0, 0),
+        Err(_) => return FsCapacity::default(),
     };
     unsafe {
         let mut s: libc::statvfs = std::mem::zeroed();
         if libc::statvfs(c_path.as_ptr(), &mut s) != 0 {
-            return (0, 0, 0);
+            return FsCapacity::default();
         }
         let bsize = s.f_frsize as i64;
         let total = s.f_blocks as i64 * bsize;
         let available = s.f_bavail as i64 * bsize;
         let used = total - s.f_bfree as i64 * bsize;
-        (total, used, available)
+        let inodes_total = s.f_files as i64;
+        let inodes_free = s.f_ffree as i64;
+        FsCapacity {
+            total,
+            used,
+            available,
+            inodes_total,
+            inodes_used: (inodes_total - inodes_free).max(0),
+            inodes_free,
+        }
     }
 }
 
@@ -452,6 +478,10 @@ fn truncate_str(s: &str, max: usize) -> String {
 /// Aggregate per-user/per-team usage from the merged report.db and upsert one
 /// per-day history snapshot. `team_map` maps username → team_id, `team_names`
 /// maps team_id → team name (both from config).
+///
+/// `inodes_scanned` is the walk's own inode count. statvfs cannot supply it: it
+/// knows the whole filesystem, not the scan root.
+#[allow(clippy::too_many_arguments)]
 fn write_history_snapshot(
     db_path: &std::path::Path,
     scan_path: &str,
@@ -459,6 +489,7 @@ fn write_history_snapshot(
     team_names: &std::collections::HashMap<i64, String>,
     timestamp: i64,
     purge_days: Option<i64>,
+    inodes_scanned: i64,
 ) -> Result<(), String> {
     use check_disk_core::report_history::{self, SnapshotMeta, UsageRow};
 
@@ -500,8 +531,17 @@ fn write_history_snapshot(
         })
         .collect();
 
-    let (total, used, available) = statvfs_meta(scan_path);
-    let meta = SnapshotMeta { path: scan_path.to_string(), total, used, available };
+    let fs = statvfs_meta(scan_path);
+    let meta = SnapshotMeta {
+        path: scan_path.to_string(),
+        total: fs.total,
+        used: fs.used,
+        available: fs.available,
+        inodes_total: fs.inodes_total,
+        inodes_used: fs.inodes_used,
+        inodes_free: fs.inodes_free,
+        inodes_scanned,
+    };
 
     report_history::upsert_snapshot(&conn, timestamp, &meta, &teams, &users)
         .map_err(|e| e.to_string())?;
@@ -2484,6 +2524,10 @@ fn scan_one_view(
     }
     let merge_start = std::time::Instant::now();
 
+    // Phase 1's inode count. Read once here because both the history snapshot and
+    // the per-scan log want it.
+    let total_inodes = result["total_inodes"].as_u64().unwrap_or(0);
+
     set_phase("merging");
     let merged = out_path.join("report.db");
     let merge_result = check_disk_core::db_writer::merge_into_single_db(
@@ -2508,6 +2552,7 @@ fn scan_one_view(
         let hist_start = std::time::Instant::now();
         if let Err(e) = write_history_snapshot(
             &merged, &dir_str, &job.team_map, &job.team_names, timestamp, job.purge_time,
+            total_inodes as i64,
         ) {
             eprintln!("History error for '{}': {}", job.name, e);
         }
@@ -2523,7 +2568,7 @@ fn scan_one_view(
     write_scan_log(
         &logs_dir.join(&log_name), &merged, &job.name, &dir_str,
         files, dirs,
-        result["total_inodes"].as_u64().unwrap_or(0),
+        total_inodes,
         result["total_size"].as_i64().unwrap_or(0),
         result["permission_issues_count"].as_u64().unwrap_or(0),
         total, tree_map, merge_ok, phase2_start.elapsed().as_secs() as i64,
