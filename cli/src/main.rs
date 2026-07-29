@@ -1899,11 +1899,30 @@ pub(crate) fn submit_lsf_target(cfg: &Config, exe: &str, lsf_prefix: &[String], 
     match std::process::Command::new(&cfg.lsf.cmd)
         .args(&argv)
         .env(LSF_GUARD_ENV, "1")
-        .status()
+        .spawn()
     {
-        Ok(s) if s.success() => true,
-        Ok(s) => { eprintln!("LSF submit '{}' exited with {} — skip.", cfg.lsf.cmd, s); false }
-        Err(e) => { eprintln!("Warning: failed to run '{}' ({})", cfg.lsf.cmd, e); false }
+        Ok(mut child) => {
+            // Wait up to 30s for the submit command to finish.
+            for _ in 0..60 {
+                match child.try_wait() {
+                    Ok(Some(status)) => return status.success(),
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
+                    Err(e) => {
+                        eprintln!("LSF submit '{}' error: {}", cfg.lsf.cmd, e);
+                        return false;
+                    }
+                }
+            }
+            // Timed out — kill the child and report failure.
+            let _ = child.kill();
+            let _ = child.wait();
+            eprintln!("LSF submit '{}' timed out for target '{}'.", cfg.lsf.cmd, target_name);
+            false
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to run '{}' ({})", cfg.lsf.cmd, e);
+            false
+        }
     }
 }
 

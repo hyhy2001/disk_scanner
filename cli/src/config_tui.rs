@@ -92,6 +92,8 @@ enum Mode {
 struct LsfScanRun {
     /// Per-target progress snapshots, refreshed by the background poller.
     targets: std::sync::Arc<std::sync::Mutex<Vec<LsfTargetProgress>>>,
+    /// Status message updated by the background thread.
+    status: std::sync::Arc<std::sync::Mutex<String>>,
     /// Signal the poller to stop.
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Join handle for the poller thread.
@@ -438,8 +440,9 @@ pub fn run(cfg: Config) -> Result<(), String> {
             }
         }
 
-        // Poll LSF scan completion; when all targets are done, clear and reload.
+        // Poll LSF scan status message and completion.
         if let Some(lsf) = app.lsf_scan.as_ref() {
+            app.status = lsf.status.lock().unwrap().clone();
             let snap = lsf.targets.lock().unwrap().clone();
             if !snap.is_empty() && snap.iter().all(|t| t.done) {
                 if let Some(mut lsf) = app.lsf_scan.take() {
@@ -524,6 +527,8 @@ fn start_scan(app: &mut App, names: &[String]) {
         let stop_clone = stop.clone();
         let targets_clone = targets.clone();
         let cfg_clone = cfg.clone();
+        let status = std::sync::Arc::new(std::sync::Mutex::new(format!("Submitting {} target(s) to LSF...", total)));
+        let status_clone = status.clone();
         let handle = std::thread::spawn(move || {
             let start = std::time::Instant::now();
             // Phase 1: submit all targets (runs in background so TUI stays responsive).
@@ -534,8 +539,10 @@ fn start_scan(app: &mut App, names: &[String]) {
                 progress_clone.lock().unwrap()[i].phase = if done { "submitted".into() } else { "error".into() };
                 progress_clone.lock().unwrap()[i].error = if done { String::new() } else { "submit failed".into() };
                 if done { ok += 1; }
+                *status_clone.lock().unwrap() = format!("Submitted {}/{} target(s) to LSF — tracking live...", ok, targets_clone.len());
             }
             if ok == 0 {
+                *status_clone.lock().unwrap() = "All LSF submits failed.".into();
                 for t in progress_clone.lock().unwrap().iter_mut() { t.done = true; }
                 return;
             }
@@ -567,9 +574,7 @@ fn start_scan(app: &mut App, names: &[String]) {
             }
         });
 
-        app.lsf_scan = Some(LsfScanRun { targets: progress, stop, handle: Some(handle) });
-        app.status = format!("Submitting {} target(s) to LSF...", total);
-        return;
+        app.lsf_scan = Some(LsfScanRun { targets: progress, status, stop, handle: Some(handle) });
     }
 
     // Local scan mode.
