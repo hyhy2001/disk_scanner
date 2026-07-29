@@ -535,7 +535,18 @@ fn start_scan(app: &mut App, names: &[String]) {
             let mut ok: usize = 0;
             for (i, t) in targets_clone.iter().enumerate() {
                 if stop_clone.load(std::sync::atomic::Ordering::SeqCst) { break; }
-                let done = crate::submit_lsf_target(&cfg_clone, &exe, &lsf_prefix, t);
+                let level = cfg_clone.targets.iter()
+                    .find(|x| x.name == *t)
+                    .and_then(|x| x.level)
+                    .unwrap_or(3) as usize;
+                let workers = cfg_clone.targets.iter()
+                    .find(|x| x.name == *t)
+                    .and_then(|x| x.workers)
+                    .map(|w| w.max(1) as usize);
+                let done = crate::submit_lsf_target(
+                    &cfg_clone, &exe, &lsf_prefix, t,
+                    level, workers, false, None,
+                );
                 progress_clone.lock().unwrap()[i].phase = if done { "submitted".into() } else { "error".into() };
                 progress_clone.lock().unwrap()[i].error = if done { String::new() } else { "submit failed".into() };
                 if done { ok += 1; }

@@ -1890,11 +1890,16 @@ fn maybe_submit_via_lsf(
 
 /// Submit a single target to LSF. Returns true on success. Used by both the
 /// CLI (per-target loop) and the TUI (r/R keys when LSF is enabled).
-pub(crate) fn submit_lsf_target(cfg: &Config, exe: &str, lsf_prefix: &[String], target_name: &str) -> bool {
+pub(crate) fn submit_lsf_target(
+    cfg: &Config, exe: &str, lsf_prefix: &[String],
+    target_name: &str, level: usize, workers: Option<usize>, tree_map: bool,
+    output_dir: Option<&str>,
+) -> bool {
     let mut argv = lsf_prefix.to_vec();
     argv.push(exe.to_string());
     argv.extend(reconstruct_run_args(
-        &None, false, None, 3, &[target_name.to_string()], false,
+        &output_dir.map(|s| s.to_string()), tree_map, workers, level,
+        &[target_name.to_string()], false,
     ));
     match std::process::Command::new(&cfg.lsf.cmd)
         .args(&argv)
