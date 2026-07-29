@@ -509,24 +509,12 @@ fn start_scan(app: &mut App, names: &[String]) {
         let total = targets.len();
         let out = cfg.resolved_output_dir();
 
-        // Submit all targets.
-        let mut ok = 0;
-        for t in &targets {
-            if crate::submit_lsf_target(&cfg, &exe, &lsf_prefix, t) {
-                ok += 1;
-            }
-        }
-        if ok == 0 {
-            app.status = "All LSF submits failed.".into();
-            return;
-        }
-
-        // Spawn background poller.
+        // Build initial progress slots (phase = "submitting" while bs runs).
         let progress = std::sync::Arc::new(std::sync::Mutex::new(vec![
-            LsfTargetProgress { name: String::new(), phase: "submitted".into(),
+            LsfTargetProgress { name: String::new(), phase: "submitting".into(),
                 files: 0, dirs: 0, size_bytes: 0, error: String::new(),
                 elapsed_sec: 0.0, done: false };
-            targets.len()
+            total
         ]));
         for (i, t) in targets.iter().enumerate() {
             progress.lock().unwrap()[i].name = t.clone();
@@ -535,40 +523,52 @@ fn start_scan(app: &mut App, names: &[String]) {
         let progress_clone = progress.clone();
         let stop_clone = stop.clone();
         let targets_clone = targets.clone();
+        let cfg_clone = cfg.clone();
         let handle = std::thread::spawn(move || {
             let start = std::time::Instant::now();
+            // Phase 1: submit all targets (runs in background so TUI stays responsive).
+            let mut ok: usize = 0;
+            for (i, t) in targets_clone.iter().enumerate() {
+                if stop_clone.load(std::sync::atomic::Ordering::SeqCst) { break; }
+                let done = crate::submit_lsf_target(&cfg_clone, &exe, &lsf_prefix, t);
+                progress_clone.lock().unwrap()[i].phase = if done { "submitted".into() } else { "error".into() };
+                progress_clone.lock().unwrap()[i].error = if done { String::new() } else { "submit failed".into() };
+                if done { ok += 1; }
+            }
+            if ok == 0 {
+                for t in progress_clone.lock().unwrap().iter_mut() { t.done = true; }
+                return;
+            }
+            // Phase 2: poll scan_status.json from shared storage.
             while !stop_clone.load(std::sync::atomic::Ordering::SeqCst) {
                 let mut snap = progress_clone.lock().unwrap();
                 let mut all_done = true;
                 for (i, t) in targets_clone.iter().enumerate() {
+                    if snap[i].phase == "error" { continue; }
                     if let Some(s) = crate::read_target_status(&out, t) {
                         snap[i] = LsfTargetProgress {
-                            name: t.clone(),
-                            phase: s.stage.clone(),
-                            files: s.files,
-                            dirs: s.dirs,
-                            size_bytes: s.size_bytes,
-                            error: s.error.clone(),
-                            elapsed_sec: s.total_elapsed_sec as f64,
+                            name: t.clone(), phase: s.stage.clone(),
+                            files: s.files, dirs: s.dirs, size_bytes: s.size_bytes,
+                            error: s.error.clone(), elapsed_sec: s.total_elapsed_sec as f64,
                             done: !s.running,
                         };
                         if s.running { all_done = false; }
-                    } else if snap[i].phase == "submitted" {
-                        // Target hasn't started writing status yet — still queueing.
+                    } else if snap[i].phase == "submitted" || snap[i].phase == "submitting" {
                         snap[i].elapsed_sec = start.elapsed().as_secs_f64();
                         all_done = false;
                     }
                 }
                 drop(snap);
-                if all_done {
-                    break;
+                if all_done { break; }
+                for _ in 0..20 {
+                    if stop_clone.load(std::sync::atomic::Ordering::SeqCst) { break; }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(2000));
             }
         });
 
         app.lsf_scan = Some(LsfScanRun { targets: progress, stop, handle: Some(handle) });
-        app.status = format!("Submitted {}/{} target(s) to LSF — tracking live...", ok, total);
+        app.status = format!("Submitting {} target(s) to LSF...", total);
         return;
     }
 
