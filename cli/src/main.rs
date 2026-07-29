@@ -961,6 +961,7 @@ fn apply_targets_file(cfg: &mut Config, file: &str, dry_run: bool, merge: bool) 
 /// `days` limits how many recent snapshots to show; `json` emits machine output.
 /// One history snapshot for a target, with its top users. Shared by the CLI
 /// `history` command and the config-TUI Output tab.
+#[derive(Clone)]
 pub struct HistorySnapshot {
     pub scan_date: i64,
     pub path: String,
@@ -972,6 +973,7 @@ pub struct HistorySnapshot {
 
 /// Per-user detail for one target. Shared by the CLI `detail` command and the
 /// config-TUI Output tab.
+#[derive(Clone)]
 pub struct UserDetail {
     pub uid: i64,
     pub total_files: i64,
@@ -982,6 +984,7 @@ pub struct UserDetail {
 }
 
 /// One directory node in the treemap. Shared by the TUI treemap browser.
+#[derive(Clone)]
 pub struct TreeEntry {
     pub id: i64,
     pub name: String,
@@ -1035,6 +1038,7 @@ pub fn query_user_detail(db: &std::path::Path, username: &str, top: usize) -> Op
 /// report.db (every uid the scan saw), not from config. `has_team` is false
 /// when the user was not in any configured team — those are the "Other" users,
 /// matching legacy which buckets unassigned users under Other.
+#[derive(Clone)]
 pub struct ReportUser {
     pub username: String,
     pub size: i64,
@@ -1062,6 +1066,7 @@ pub fn query_report_users(db: &std::path::Path) -> Vec<ReportUser> {
 }
 
 /// One permission issue row (Type / Error / Path). Shared by the TUI Output tab.
+#[derive(Clone)]
 pub struct PermIssue {
     pub item_type: String,
     pub error: String,
@@ -1088,6 +1093,7 @@ pub fn query_user_permissions(db: &std::path::Path, user: &str, top: usize) -> (
 }
 
 /// A per-directory file-count row (files, size, path). Shared by the TUI Output tab.
+#[derive(Clone)]
 pub struct InodeDir {
     pub files: i64,
     pub size: i64,
@@ -1868,7 +1874,7 @@ fn reconstruct_run_args(
 /// Minimal `which`: return the first PATH entry containing an executable named
 /// `cmd`, or `None`. Absolute/relative paths with a separator are checked
 /// directly. Avoids a dependency for a one-off lookup.
-fn which_in_path(cmd: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn which_in_path(cmd: &str) -> Option<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt;
     let is_exec = |p: &std::path::Path| {
         p.metadata()
