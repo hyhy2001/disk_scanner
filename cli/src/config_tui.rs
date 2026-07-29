@@ -1668,6 +1668,9 @@ fn phase_display(phase: &str) -> (String, Color) {
         "syncing" => ("Syncing".into(), Color::Blue),
         "done" => ("Done".into(), Color::Green),
         "error" => ("Error".into(), Color::Red),
+        "submitting" => ("Submitting…".into(), Color::DarkGray),
+        "submitted" => ("Submitted".into(), Color::DarkGray),
+        "cancelled" => ("Cancelled".into(), Color::Red),
         other => (other.to_string(), Color::White),
     }
 }
@@ -1685,11 +1688,17 @@ fn draw_scan_jobs(frame: &mut Frame, app: &App, area: Rect) {
             let (label, color) = phase_display(&t.phase);
             let detail = if t.phase == "error" && !t.error.is_empty() {
                 format!("  {}", t.error)
-            } else if t.phase == "submitted" {
-                format!("  waiting for job to start...")
-            } else {
+            } else if t.phase == "submitting" || t.phase == "submitted" {
+                if t.elapsed_sec > 120.0 {
+                    format!("  queued on cluster ({:.0}s)...", t.elapsed_sec)
+                } else {
+                    format!("  waiting for job to start ({:.0}s)...", t.elapsed_sec)
+                }
+            } else if t.files > 0 || t.dirs > 0 {
                 format!("  {} files · {} dirs · {}  |  {:.1}s",
                     fmt_count(t.files), fmt_count(t.dirs), crate::fmt_size(t.size_bytes as i64), t.elapsed_sec)
+            } else {
+                format!("  initializing...")
             };
             rows.push(ListItem::new(Line::from(vec![
                 Span::styled(format!("{:<16}", truncate(&t.name, 16)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
