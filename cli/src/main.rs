@@ -1941,8 +1941,8 @@ pub(crate) fn lsf_prefix_args(cfg: &Config) -> Option<Vec<String>> {
     Some(args)
 }
 
-/// Rebuild the `run` subcommand arguments. Always appends `--no-lsf` so the
-/// submitted job scans locally instead of re-submitting recursively.
+/// Rebuild the `run` subcommand arguments. Only emits non-default values so the
+/// compute node reads per-target overrides from its own config files.
 fn reconstruct_run_args(
     output_dir: &Option<String>,
     tree_map: bool,
@@ -1963,9 +1963,10 @@ fn reconstruct_run_args(
         args.push("--workers".into());
         args.push(w.to_string());
     }
-    // level has a clap default of 3; always emit it so the job matches exactly.
-    args.push("--level".into());
-    args.push(level.to_string());
+    if level != 3 {
+        args.push("--level".into());
+        args.push(level.to_string());
+    }
     for t in target {
         args.push("--target".into());
         args.push(t.clone());
@@ -1973,7 +1974,6 @@ fn reconstruct_run_args(
     if debug {
         args.push("--debug".into());
     }
-    // Always force local execution inside the submitted job.
     args.push("--no-lsf".into());
     args
 }
@@ -3055,6 +3055,6 @@ mod tests {
     fn reconstruct_run_args_minimal() {
         // No options: only the run subcommand + the always-emitted level default.
         let args = reconstruct_run_args(&None, false, None, 3, &[], false);
-        assert_eq!(args, vec!["run", "--level", "3", "--no-lsf"]);
+        assert_eq!(args, vec!["run", "--no-lsf"]);
     }
 }
