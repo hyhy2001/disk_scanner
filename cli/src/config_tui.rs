@@ -308,7 +308,7 @@ impl App {
         // selection past the end.
         let nusers = self.filtered_team_users().len();
         if self.user_sel >= nusers { self.user_sel = nusers.saturating_sub(1); }
-        if self.settings_sel > 8 { self.settings_sel = 8; }
+        if self.settings_sel > 10 { self.settings_sel = 10; }
         if self.scansync_sel > 8 { self.scansync_sel = 8; }
         // Detail/Perm/Inode list users from report.db (team + Other), filtered.
         let ntusers = filtered_report_users(self).len();
@@ -1197,7 +1197,7 @@ fn browse_output(app: &mut App, key: event::KeyEvent) {
 fn browse_settings(app: &mut App, key: event::KeyEvent) {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => { if app.settings_sel > 0 { app.settings_sel -= 1; } }
-        KeyCode::Down | KeyCode::Char('j') => { if app.settings_sel < 8 { app.settings_sel += 1; } }
+        KeyCode::Down | KeyCode::Char('j') => { if app.settings_sel < 10 { app.settings_sel += 1; } }
         KeyCode::Enter | KeyCode::Char('e') => {
             match app.settings_sel {
                 0 => begin_input(app, InputKind::SetOutputDir, "output_dir:", &app.cfg.output_dir.clone()),
