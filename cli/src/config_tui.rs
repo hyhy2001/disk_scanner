@@ -87,6 +87,29 @@ enum Mode {
     Confirm { action: ConfirmAction, prompt: String },
 }
 
+/// LSF scan tracking: a background thread polls scan_status.json from shared
+/// storage every ~2s; the TUI reads the latest snapshot without blocking.
+struct LsfScanRun {
+    /// Per-target progress snapshots, refreshed by the background poller.
+    targets: std::sync::Arc<std::sync::Mutex<Vec<LsfTargetProgress>>>,
+    /// Signal the poller to stop.
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Join handle for the poller thread.
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug, Clone)]
+struct LsfTargetProgress {
+    name: String,
+    phase: String,
+    files: u64,
+    dirs: u64,
+    size_bytes: u64,
+    error: String,
+    elapsed_sec: f64,
+    done: bool,
+}
+
 /// Whole-app state: the live config plus cursor positions per tab.
 /// A txt export running on a background thread. The worker does the SQLite
 /// reads + file writes (potentially minutes on a large NFS report) and reports
@@ -141,6 +164,8 @@ struct App {
     /// The live in-place scan, if one is running. Its per-view `ViewProgress`
     /// sinks are polled each tick to draw the scan-jobs panel; `None` when idle.
     scan: Option<crate::ScanRun>,
+    /// LSF-submitted scan, tracked via scan_status.json polling.
+    lsf_scan: Option<LsfScanRun>,
     /// A running txt export, if any. Export I/O runs on a worker thread so the
     /// event loop keeps drawing and reading keys while it works; polled each
     /// tick and cleared once its thread signals `done`. `None` when idle.
@@ -197,6 +222,7 @@ impl App {
             quit: false,
             pending_scan: None,
             scan: None,
+            lsf_scan: None,
             export: None,
             output_view: OutputView::History,
             hist_sel: 0,
@@ -412,6 +438,23 @@ pub fn run(cfg: Config) -> Result<(), String> {
             }
         }
 
+        // Poll LSF scan completion; when all targets are done, clear and reload.
+        if let Some(lsf) = app.lsf_scan.as_ref() {
+            let snap = lsf.targets.lock().unwrap().clone();
+            if !snap.is_empty() && snap.iter().all(|t| t.done) {
+                if let Some(mut lsf) = app.lsf_scan.take() {
+                    lsf.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(h) = lsf.handle.take() {
+                        let _ = h.join();
+                    }
+                }
+                app.cfg = Config::load();
+                app.invalidate_report_cache();
+                app.clamp_selections();
+                app.status = "LSF scan finished — back to config.".into();
+            }
+        }
+
         // Poll a running export; once its worker has posted a result, join it,
         // clear the handle, and show the outcome in the footer.
         if let Some(result) = app.export.as_ref().and_then(|e| e.take_result()) {
@@ -422,14 +465,17 @@ pub fn run(cfg: Config) -> Result<(), String> {
         }
     }
 
-    // If the user quits mid-scan, signal the workers to cancel (both the
-    // between-jobs abort flag and the in-walk cancel flag) and wait for them so
-    // no thread is left writing into a half-torn-down process. Because the walk
-    // now checks the cancel flag per entry, this returns promptly instead of
-    // blocking until the rest of a large tree finishes.
+    // If the user quits mid-scan, signal the workers to cancel.
     if let Some(mut run) = app.scan.take() {
         run.request_abort();
         run.join();
+    }
+    // Stop the LSF poller thread if still running.
+    if let Some(mut lsf) = app.lsf_scan.take() {
+        lsf.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(h) = lsf.handle.take() {
+            let _ = h.join();
+        }
     }
     // Wait for any in-flight export so we don't exit mid-write and leave a
     // truncated txt file behind.
@@ -439,12 +485,94 @@ pub fn run(cfg: Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Launch an in-place scan of `names` (empty = all targets). Builds the plan
-/// from a clone of the live config (so the scan sees the on-disk targets), then
-/// spawns the background workers into `app.scan`. Displayed by the scan-jobs
-/// panel; polled by the main loop until finished.
+/// Launch an in-place scan of `names` (empty = all targets). When LSF is
+/// enabled, submits one job per target instead of scanning locally.
 fn start_scan(app: &mut App, names: &[String]) {
     let mut cfg = app.cfg.clone();
+
+    // If LSF is enabled, submit per-target to the cluster instead of scanning
+    // locally. A background thread polls scan_status.json every 2s so the
+    // TUI shows live progress without blocking.
+    if let Some(lsf_prefix) = crate::lsf_prefix_args(&cfg) {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(_) => {
+                app.status = "Cannot resolve duscan path for LSF submit.".into();
+                return;
+            }
+        };
+        let targets: Vec<String> = if names.is_empty() {
+            cfg.targets.iter().map(|t| t.name.clone()).collect()
+        } else {
+            names.to_vec()
+        };
+        let total = targets.len();
+        let out = cfg.resolved_output_dir();
+
+        // Submit all targets.
+        let mut ok = 0;
+        for t in &targets {
+            if crate::submit_lsf_target(&cfg, &exe, &lsf_prefix, t) {
+                ok += 1;
+            }
+        }
+        if ok == 0 {
+            app.status = "All LSF submits failed.".into();
+            return;
+        }
+
+        // Spawn background poller.
+        let progress = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            LsfTargetProgress { name: String::new(), phase: "submitted".into(),
+                files: 0, dirs: 0, size_bytes: 0, error: String::new(),
+                elapsed_sec: 0.0, done: false };
+            targets.len()
+        ]));
+        for (i, t) in targets.iter().enumerate() {
+            progress.lock().unwrap()[i].name = t.clone();
+        }
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let progress_clone = progress.clone();
+        let stop_clone = stop.clone();
+        let targets_clone = targets.clone();
+        let handle = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !stop_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut snap = progress_clone.lock().unwrap();
+                let mut all_done = true;
+                for (i, t) in targets_clone.iter().enumerate() {
+                    if let Some(s) = crate::read_target_status(&out, t) {
+                        snap[i] = LsfTargetProgress {
+                            name: t.clone(),
+                            phase: s.stage.clone(),
+                            files: s.files,
+                            dirs: s.dirs,
+                            size_bytes: s.size_bytes,
+                            error: s.error.clone(),
+                            elapsed_sec: s.total_elapsed_sec as f64,
+                            done: !s.running,
+                        };
+                        if s.running { all_done = false; }
+                    } else if snap[i].phase == "submitted" {
+                        // Target hasn't started writing status yet — still queueing.
+                        snap[i].elapsed_sec = start.elapsed().as_secs_f64();
+                        all_done = false;
+                    }
+                }
+                drop(snap);
+                if all_done {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2000));
+            }
+        });
+
+        app.lsf_scan = Some(LsfScanRun { targets: progress, stop, handle: Some(handle) });
+        app.status = format!("Submitted {}/{} target(s) to LSF — tracking live...", ok, total);
+        return;
+    }
+
+    // Local scan mode.
     match crate::plan_scan_jobs(&mut cfg, None, None, names) {
         Some((out, group_jobs, view_names, max_parallel_devices)) => {
             std::fs::create_dir_all(&out).ok();
@@ -493,7 +621,23 @@ fn handle_browse_key(app: &mut App, key: event::KeyEvent) {
     }
     // Global keys.
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => { app.quit = true; return; }
+        KeyCode::Char('q') | KeyCode::Esc => {
+            // If a scan is running, cancel it instead of quitting.
+            if let Some(r) = app.scan.as_ref() {
+                if !r.all_finished() {
+                    r.request_abort();
+                    app.status = "Scan cancelled — back to config.".into();
+                    return;
+                }
+            }
+            // If LSF scan is active, just clear the panel (jobs keep running).
+            if app.lsf_scan.is_some() {
+                app.lsf_scan = None;
+                app.status = "LSF scan still running on cluster. Use: duscan status --watch".into();
+                return;
+            }
+            app.quit = true; return;
+        }
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => { app.quit = true; return; }
         KeyCode::Tab | KeyCode::Char('\t') => { app.tab = next_tab(app.tab); app.clear_filter(); return; }
         KeyCode::BackTab => { app.tab = prev_tab(app.tab); app.clear_filter(); return; }
@@ -1504,11 +1648,43 @@ fn phase_display(phase: &str) -> (String, Color) {
 /// Render the live scan-jobs panel: one row per target showing its current
 /// stage (Scanning / Building detail / Merging / …) plus live file+dir counts.
 fn draw_scan_jobs(frame: &mut Frame, app: &App, area: Rect) {
+    let mem_mb = check_disk_core::pipe_types::get_rss_mb();
+
+    // LSF scan: render from polled scan_status.json snapshots.
+    if let Some(lsf) = app.lsf_scan.as_ref() {
+        let snap = lsf.targets.lock().unwrap().clone();
+        let mut rows: Vec<ListItem> = Vec::new();
+        for t in &snap {
+            let (label, color) = phase_display(&t.phase);
+            let detail = if t.phase == "error" && !t.error.is_empty() {
+                format!("  {}", t.error)
+            } else if t.phase == "submitted" {
+                format!("  waiting for job to start...")
+            } else {
+                format!("  {} files · {} dirs · {}  |  {:.1}s",
+                    fmt_count(t.files), fmt_count(t.dirs), crate::fmt_size(t.size_bytes as i64), t.elapsed_sec)
+            };
+            rows.push(ListItem::new(Line::from(vec![
+                Span::styled(format!("{:<16}", truncate(&t.name, 16)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{:<18}", label), Style::default().fg(color)),
+                Span::styled(detail, Style::default().fg(Color::Gray)),
+            ])));
+        }
+        let all_done = snap.iter().all(|t| t.done);
+        let title = if all_done {
+            " LSF scan — finished ".to_string()
+        } else {
+            " LSF scan — running (q quits, scan continues) ".to_string()
+        };
+        let list = List::new(rows).block(Block::default().borders(Borders::ALL).title(title));
+        frame.render_widget(list, area);
+        return;
+    }
+
     let run = match app.scan.as_ref() {
         Some(r) => r,
         None => return,
     };
-    let mem_mb = check_disk_core::pipe_types::get_rss_mb();
     let mut rows: Vec<ListItem> = Vec::new();
     for p in &run.progresses {
         let (files, dirs, size) = p.scan.snapshot();

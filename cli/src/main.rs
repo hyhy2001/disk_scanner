@@ -337,21 +337,21 @@ fn write_scan_status(
 }
 
 /// One target's scan status, read back from `scan_status.json`.
-struct TargetStatus {
-    name: String,
-    stage: String,
-    running: bool,
-    files: u64,
-    dirs: u64,
-    size_bytes: u64,
-    total_elapsed_sec: i64,
-    updated_at: i64,
-    error: String,
+pub(crate) struct TargetStatus {
+    pub name: String,
+    pub stage: String,
+    pub running: bool,
+    pub files: u64,
+    pub dirs: u64,
+    pub size_bytes: u64,
+    pub total_elapsed_sec: i64,
+    pub updated_at: i64,
+    pub error: String,
 }
 
 /// Read `<out>/<target>/scan_status.json` into a `TargetStatus`, or `None` if
 /// the file is missing/unreadable/unparseable (target never scanned).
-fn read_target_status(out: &str, target: &str) -> Option<TargetStatus> {
+pub(crate) fn read_target_status(out: &str, target: &str) -> Option<TargetStatus> {
     let path = std::path::Path::new(out).join(target).join("scan_status.json");
     let text = std::fs::read_to_string(&path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
@@ -1886,6 +1886,39 @@ fn maybe_submit_via_lsf(
     // Always treat as handled: failed submits should never silently fall back to
     // a heavy local scan on the login node.
     true
+}
+
+/// Submit a single target to LSF. Returns true on success. Used by both the
+/// CLI (per-target loop) and the TUI (r/R keys when LSF is enabled).
+pub(crate) fn submit_lsf_target(cfg: &Config, exe: &str, lsf_prefix: &[String], target_name: &str) -> bool {
+    let mut argv = lsf_prefix.to_vec();
+    argv.push(exe.to_string());
+    argv.extend(reconstruct_run_args(
+        &None, false, None, 3, &[target_name.to_string()], false,
+    ));
+    match std::process::Command::new(&cfg.lsf.cmd)
+        .args(&argv)
+        .env(LSF_GUARD_ENV, "1")
+        .status()
+    {
+        Ok(s) if s.success() => true,
+        Ok(s) => { eprintln!("LSF submit '{}' exited with {} — skip.", cfg.lsf.cmd, s); false }
+        Err(e) => { eprintln!("Warning: failed to run '{}' ({})", cfg.lsf.cmd, e); false }
+    }
+}
+
+/// Build the LSF prefix args (shared across targets). Returns empty if LSF is not ready.
+pub(crate) fn lsf_prefix_args(cfg: &Config) -> Option<Vec<String>> {
+    let lsf = &cfg.lsf;
+    if !lsf.enabled { return None; }
+    if std::env::var_os(LSF_GUARD_ENV).is_some() { return None; }
+    if which_in_path(&lsf.cmd).is_none() { return None; }
+    let mut args: Vec<String> = Vec::new();
+    if !lsf.os.is_empty() { args.push("-os".into()); args.push(lsf.os.clone()); }
+    if lsf.mem_mb > 0 { args.push("-M".into()); args.push(lsf.mem_mb.to_string()); }
+    if !lsf.queue.is_empty() { args.push("-q".into()); args.push(lsf.queue.clone()); }
+    args.extend(lsf.extra_args.iter().cloned());
+    Some(args)
 }
 
 /// Rebuild the `run` subcommand arguments from the parsed values so the
