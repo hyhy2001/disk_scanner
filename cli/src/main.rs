@@ -1,7 +1,6 @@
 mod config;
 mod config_tui;
 mod scheduler;
-mod ui;
 
 use clap::Parser;
 use config::Config;
@@ -1756,7 +1755,9 @@ const LSF_GUARD_ENV: &str = "DUSCAN_VIA_LSF";
 /// job, or the wrapper is not on PATH.
 ///
 /// Fire-and-forget: the wrapper's own stdout/stderr (typically a job id) is
-/// inherited straight to the terminal, and we do not wait for the batch job.
+/// Submit one LSF job per target so each target runs independently on its own
+/// compute node. When no targets are specified (scan all), submit one job for
+/// all targets combined (the scheduler on the compute node will handle grouping).
 #[allow(clippy::too_many_arguments)]
 fn maybe_submit_via_lsf(
     cfg: &Config,
@@ -1772,11 +1773,9 @@ fn maybe_submit_via_lsf(
     if !lsf.enabled || no_lsf {
         return false;
     }
-    // Already running as a submitted job — scan here, don't re-submit.
     if std::env::var_os(LSF_GUARD_ENV).is_some() {
         return false;
     }
-    // Locate the wrapper on PATH; missing → warn and fall back to local.
     if which_in_path(&lsf.cmd).is_none() {
         eprintln!(
             "Warning: [lsf].enabled but '{}' not found on PATH — scanning locally.",
@@ -1785,7 +1784,6 @@ fn maybe_submit_via_lsf(
         return false;
     }
 
-    // Absolute path to this binary so the compute node runs the same duscan.
     let exe = match std::env::current_exe() {
         Ok(p) => p.to_string_lossy().into_owned(),
         Err(e) => {
@@ -1794,45 +1792,100 @@ fn maybe_submit_via_lsf(
         }
     };
 
-    // Build the wrapper argv: bs [-os OS] [-M MEM] [-q QUEUE] [extra…] <exe> run <args…>
-    let mut argv: Vec<String> = Vec::new();
+    // Build the LSF prefix args once (shared across all targets).
+    let mut lsf_prefix: Vec<String> = Vec::new();
     if !lsf.os.is_empty() {
-        argv.push("-os".into());
-        argv.push(lsf.os.clone());
+        lsf_prefix.push("-os".into());
+        lsf_prefix.push(lsf.os.clone());
     }
     if lsf.mem_mb > 0 {
-        argv.push("-M".into());
-        argv.push(lsf.mem_mb.to_string());
+        lsf_prefix.push("-M".into());
+        lsf_prefix.push(lsf.mem_mb.to_string());
     }
     if !lsf.queue.is_empty() {
-        argv.push("-q".into());
-        argv.push(lsf.queue.clone());
+        lsf_prefix.push("-q".into());
+        lsf_prefix.push(lsf.queue.clone());
     }
-    argv.extend(lsf.extra_args.iter().cloned());
-    argv.push(exe);
-    argv.extend(reconstruct_run_args(output_dir, tree_map, workers, level, target, debug));
+    lsf_prefix.extend(lsf.extra_args.iter().cloned());
 
-    let pretty = format!("{} {}", lsf.cmd, argv.join(" "));
-    println!("Submitting scan to LSF: {}", pretty);
+    // Resolve output dir so we can show the log path per target.
+    let out = output_dir.clone().unwrap_or_else(|| cfg.resolved_output_dir());
 
-    let status = std::process::Command::new(&lsf.cmd)
-        .args(&argv)
-        // Guard so the job scans locally rather than re-submitting.
-        .env(LSF_GUARD_ENV, "1")
-        .status();
-    match status {
-        Ok(s) if s.success() => true,
-        Ok(s) => {
-            eprintln!("LSF submit '{}' exited with {} — NOT scanning locally (fix the submit or use --no-lsf).", lsf.cmd, s);
-            // Treat as handled: a failed submit shouldn't silently fall back to a
-            // heavy local scan on the login node.
-            true
+    // Per-target submission (one job each) or single job if scanning all.
+    let submit_one = |t: &[String], compact: bool| -> bool {
+        let mut argv = lsf_prefix.clone();
+        argv.push(exe.clone());
+        argv.extend(reconstruct_run_args(output_dir, tree_map, workers, level, t, debug));
+
+        let label: String = if t.is_empty() {
+            "all targets".into()
+        } else {
+            t.join(", ")
+        };
+        let log_dir = if t.len() == 1 {
+            format!("{}/{}/logs/", out, t[0])
+        } else {
+            format!("{}/logs/", out)
+        };
+
+        if compact {
+            // Submit silently — caller handles display.
+        } else {
+            let pretty = format!("{} {}", lsf.cmd, argv.join(" "));
+            println!("Submitting scan to LSF: {}", pretty);
+            println!("  target : {}", label);
+            println!("  log    : {}scan_*.log", log_dir);
         }
-        Err(e) => {
-            eprintln!("Warning: failed to run '{}' ({}) — scanning locally.", lsf.cmd, e);
-            false
+
+        let status = std::process::Command::new(&lsf.cmd)
+            .args(&argv)
+            .env(LSF_GUARD_ENV, "1")
+            .status();
+        match status {
+            Ok(s) if s.success() => true,
+            Ok(s) => {
+                eprintln!("LSF submit '{}' exited with {} — skip.", lsf.cmd, s);
+                false
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to run '{}' ({})", lsf.cmd, e);
+                false
+            }
+        }
+    };
+
+    if target.is_empty() {
+        return submit_one(&[], false);
+    }
+
+    let total = target.len();
+    println!("Submitting {} scan(s) to LSF:", total);
+
+    // Show the submission command format once (same for all targets).
+    let sample_argv = {
+        let mut a = lsf_prefix.clone();
+        a.push(exe.clone());
+        a.extend(reconstruct_run_args(output_dir, tree_map, workers, level, &[target[0].clone()], debug));
+        a
+    };
+    println!("  {} {}", lsf.cmd, sample_argv.join(" "));
+    println!();
+
+    let mut any_ok = false;
+    for (i, t) in target.iter().enumerate() {
+        let single = vec![t.clone()];
+        let log_dir = format!("{}/{}/logs/", out, t);
+        eprintln!("  [{}/{}] {} -> {}", i + 1, total, t, log_dir);
+        if submit_one(&single, true) {
+            any_ok = true;
         }
     }
+    if !any_ok {
+        eprintln!("All LSF submits failed — NOT scanning locally (fix the submit or use --no-lsf).");
+    }
+    // Always treat as handled: failed submits should never silently fall back to
+    // a heavy local scan on the login node.
+    true
 }
 
 /// Rebuild the `run` subcommand arguments from the parsed values so the
@@ -1916,96 +1969,7 @@ fn run_scan(
         };
 
     std::fs::create_dir_all(&out).ok();
-    run_scan_tui(&out, tree_map, level, max_parallel_devices, group_jobs, view_names, debug);
-}
-
-/// RAII guard that owns the terminal for the TUI. It renders to `/dev/tty`
-/// directly (a dedicated fd) and redirects stdout+stderr (fd 1/2) to /dev/null
-/// for the duration of the scan, so the core's Phase 2/3 `println!`/`eprintln!`
-/// noise never bleeds onto the live table. On drop — including panics — it
-/// restores fd 1/2, leaves the alternate screen, and disables raw mode, so an
-/// abort or crash never leaves the user's terminal wedged.
-struct TerminalGuard {
-    active: bool,
-    /// The /dev/tty handle the ratatui backend renders through.
-    tty: Option<std::fs::File>,
-    /// Saved originals of fd 1 and fd 2, restored on drop.
-    saved_stdout: libc::c_int,
-    saved_stderr: libc::c_int,
-}
-
-impl TerminalGuard {
-    /// Enter TUI mode. Returns the guard plus the /dev/tty writer the caller
-    /// hands to `CrosstermBackend`. `active == false` (and `tty == None`) when
-    /// stdout is not a TTY or /dev/tty is unavailable — the caller then runs
-    /// headless with plain stdout logging.
-    fn enter() -> Self {
-        use crossterm::terminal::{enable_raw_mode, EnterAlternateScreen};
-        use crossterm::ExecutableCommand;
-        use std::os::unix::io::AsRawFd;
-
-        let is_tty = unsafe { libc::isatty(libc::STDOUT_FILENO) != 0 };
-        let mut g = TerminalGuard { active: false, tty: None, saved_stdout: -1, saved_stderr: -1 };
-        if !is_tty {
-            return g;
-        }
-
-        // Render target: the controlling terminal, independent of fd 1/2.
-        let mut tty = match std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
-            Ok(f) => f,
-            Err(_) => return g,
-        };
-        if enable_raw_mode().is_err() {
-            return g;
-        }
-        if tty.execute(EnterAlternateScreen).is_err() {
-            let _ = crossterm::terminal::disable_raw_mode();
-            return g;
-        }
-
-        // Suppress core stdout/stderr: save fd 1/2, point both at /dev/null.
-        unsafe {
-            g.saved_stdout = libc::dup(1);
-            g.saved_stderr = libc::dup(2);
-            if let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
-                let nfd = devnull.as_raw_fd();
-                libc::dup2(nfd, 1);
-                libc::dup2(nfd, 2);
-                // devnull dropped here closes its own fd; the dup2'd 1/2 remain.
-            }
-        }
-
-        g.tty = Some(tty);
-        g.active = true;
-        g
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
-        use crossterm::ExecutableCommand;
-        // Restore fd 1/2 first so LeaveAlternateScreen and any later prints land
-        // on the real terminal.
-        unsafe {
-            if self.saved_stdout >= 0 {
-                libc::dup2(self.saved_stdout, 1);
-                libc::close(self.saved_stdout);
-            }
-            if self.saved_stderr >= 0 {
-                libc::dup2(self.saved_stderr, 2);
-                libc::close(self.saved_stderr);
-            }
-        }
-        if let Some(ref mut tty) = self.tty {
-            let _ = tty.execute(LeaveAlternateScreen);
-        }
-        let _ = disable_raw_mode();
-        self.active = false;
-    }
+    run_scan_headless(&out, tree_map, level, max_parallel_devices, group_jobs, view_names, debug);
 }
 
 /// Spawn the background scan: create one `ViewProgress` sink per view, then one
@@ -2015,7 +1979,7 @@ impl Drop for TerminalGuard {
 /// pipeline while Phase 1 scans stay parallel.
 ///
 /// This owns no terminal — it returns a `ScanRun` the caller polls for live
-/// progress. `run_scan_tui` drives it under the standalone monitor; the config
+/// progress. `run_scan_headless` drives it under the standalone monitor; the config
 /// TUI drives it in-place.
 pub(crate) fn spawn_scan_workers(
     out: &str,
@@ -2136,7 +2100,7 @@ pub(crate) fn plan_scan_jobs(
         }
     }
 
-    let plan = build_scan_plan(cfg, budget);
+    let plan = build_scan_plan(cfg, budget, workers.is_some());
 
     // Flatten the plan into owned per-group job lists and a flat list of view
     // names (in plan order) for the TUI. `end_scan` cutoff is enforced here:
@@ -2194,7 +2158,7 @@ pub(crate) fn plan_scan_jobs(
 /// Own the terminal, spawn one worker thread per device group, and drive the
 /// live TUI: poll each view's ScanProgress ~7×/s, compute rate/mem, render, and
 /// watch for q / Ctrl+C to abort. Returns after all group threads join.
-fn run_scan_tui(
+fn run_scan_headless(
     out: &str,
     tree_map: bool,
     level: usize,
@@ -2204,126 +2168,117 @@ fn run_scan_tui(
     debug: bool,
 ) {
     use std::sync::atomic::Ordering;
-    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    // Spawn the background scan workers (device-group threads + per-view sinks).
     let run = spawn_scan_workers(out, tree_map, level, max_parallel_devices, group_jobs, &view_names, debug);
     let progresses = run.progresses.clone();
     let abort = run.abort.clone();
     let handles = run.handles;
 
-    let app_state = Arc::new(Mutex::new(ui::AppState::new(&view_names)));
-
-    // ── TUI poll loop (this thread owns the terminal) ──
-    // The guard renders to /dev/tty and silences core stdout/stderr for the
-    // scan; it restores everything on drop (incl. panic).
-    let guard = TerminalGuard::enter();
-    let tui_active = guard.active;
-    use ratatui::backend::CrosstermBackend;
-    let mut terminal = match guard.tty.as_ref() {
-        Some(tty) => {
-            // Clone the /dev/tty handle for the backend; the guard keeps its own
-            // for LeaveAlternateScreen on drop.
-            tty.try_clone().ok().and_then(|w| ratatui::Terminal::new(CrosstermBackend::new(w)).ok())
+    let abort_sig = abort.clone();
+    let progresses_sig = progresses.clone();
+    ctrlc::set_handler(move || {
+        abort_sig.store(true, Ordering::SeqCst);
+        for p in &progresses_sig {
+            p.scan.request_cancel();
         }
-        None => None,
-    };
+    }).ok();
 
-    // Per-view rate tracking: (last_files, last_instant).
-    let mut last_seen: std::collections::HashMap<String, (u64, Instant)> =
-        view_names.iter().map(|n| (n.clone(), (0u64, Instant::now()))).collect();
+    println!("Scanning {} target(s)...", view_names.len());
+
+    let mut last_phases: Vec<String> = view_names.iter().map(|_| String::new()).collect();
+    let mut last_progress: Vec<Instant> = view_names.iter().map(|_| Instant::now()).collect();
+    let mut last_counts: Vec<(u64, u64)> = view_names.iter().map(|_| (0, 0)).collect();
+    let scan_start = Instant::now();
 
     loop {
-        // Poll keyboard for abort (q / Ctrl+C / Esc).
-        if tui_active {
-            while crossterm::event::poll(Duration::from_millis(0)).unwrap_or(false) {
-                if let Ok(crossterm::event::Event::Key(k)) = crossterm::event::read() {
-                    use crossterm::event::{KeyCode, KeyModifiers};
-                    let quit = matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
-                        || (k.code == KeyCode::Char('c')
-                            && k.modifiers.contains(KeyModifiers::CONTROL));
-                    if quit {
-                        abort.store(true, Ordering::SeqCst);
-                        // The between-jobs `abort` flag only stops the *next*
-                        // queued view; also set each in-flight scan's cancel
-                        // flag so the running Phase-1 walk bails mid-directory
-                        // instead of finishing the whole tree + build first.
-                        for p in &progresses {
-                            p.scan.request_cancel();
-                        }
-                        let mut s = app_state.lock().unwrap();
-                        s.abort = true;
-                    }
-                }
-            }
-        }
-
-        // Sync sink → AppState, compute rate/mem.
-        let mem_mb = check_disk_core::pipe_types::get_rss_mb();
         let all_finished = progresses.iter().all(|p| p.finished.load(Ordering::SeqCst));
-        {
-            let mut s = app_state.lock().unwrap();
-            for p in &progresses {
-                let (files, dirs, size) = p.scan.snapshot();
-                let now = Instant::now();
-                let entry = last_seen.get_mut(&p.name).unwrap();
-                let dt = now.duration_since(entry.1).as_secs_f64();
-                let rate = if dt > 0.0 { (files.saturating_sub(entry.0)) as f64 / dt } else { 0.0 };
-                *entry = (files, now);
-                let phase = p.phase.lock().unwrap().clone();
-                let err = p.error.lock().unwrap().clone();
-                if let Some(t) = s.target_mut(&p.name) {
-                    t.files = files;
-                    t.dirs = dirs;
-                    t.size = size;
-                    if phase != "waiting" {
-                        t.rate = rate;
-                        t.mem_mb = mem_mb;
-                        t.elapsed = p.started.elapsed().as_secs_f64();
+        let mem_mb = check_disk_core::pipe_types::get_rss_mb();
+
+        for (i, p) in progresses.iter().enumerate() {
+            let phase = p.phase.lock().unwrap().clone();
+            let (files, dirs, size) = p.scan.snapshot();
+            let elapsed = p.started.elapsed().as_secs_f64();
+
+            if phase != last_phases[i] {
+                last_phases[i] = phase.clone();
+                let size_str = fmt_size(size as i64);
+                match phase.as_str() {
+                    "scanning" => {
+                        println!("[{}] Started scanning...", p.name);
                     }
-                    t.phase = phase;
-                    t.error = err;
+                    "queued" => {
+                        println!("[{}] Queued (waiting for build slot)...", p.name);
+                    }
+                    "building" => {
+                        println!("[{}] Building detail DB... ({} files, {} dirs, {} | {:.1}s {:.0} MB)",
+                            p.name, files, dirs, size_str, elapsed, mem_mb);
+                    }
+                    "treemap" => {
+                        println!("[{}] Building treemap...", p.name);
+                    }
+                    "merging" => {
+                        println!("[{}] Merging into report.db...", p.name);
+                    }
+                    "history" => {
+                        println!("[{}] Writing history snapshot...", p.name);
+                    }
+                    "syncing" => {
+                        println!("[{}] Syncing to remote...", p.name);
+                    }
+                    "error" => {
+                        let err = p.error.lock().unwrap().clone();
+                        eprintln!("[{}] ERROR: {}", p.name, err);
+                    }
+                    "done" => {
+                        println!("[{}] Done: {} files, {} dirs, {} | {:.1}s {:.0} MB",
+                            p.name, files, dirs, size_str, elapsed, mem_mb);
+                    }
+                    _ => {}
                 }
-            }
-            if all_finished {
-                s.running = false;
-            }
-            if let Some(ref mut term) = terminal {
-                term.draw(|f| ui::draw(f, &s)).ok();
+                last_progress[i] = Instant::now();
+                last_counts[i] = (files, dirs);
+            } else if phase == "scanning" {
+                let elapsed_since = last_progress[i].elapsed().as_secs_f64();
+                if elapsed_since >= 2.0 && (files, dirs) != last_counts[i] {
+                    let rate = if elapsed_since > 0.0 {
+                        ((files - last_counts[i].0) as f64 / elapsed_since) as u64
+                    } else {
+                        0
+                    };
+                    println!("[{}] {} files, {} dirs | {:.1}s {:.0} MB ({} files/s)",
+                        p.name, files, dirs, elapsed, mem_mb, rate);
+                    last_progress[i] = Instant::now();
+                    last_counts[i] = (files, dirs);
+                }
             }
         }
 
         if all_finished {
             break;
         }
-        std::thread::sleep(Duration::from_millis(150));
+
+        if abort.load(Ordering::SeqCst) {
+            println!("Aborting...");
+            break;
+        }
+
+        std::thread::sleep(Duration::from_millis(500));
     }
 
     for h in handles {
         let _ = h.join();
     }
 
-    // Final render, brief pause so the user sees the completed table.
-    {
-        let mut s = app_state.lock().unwrap();
-        s.running = false;
-        if let Some(ref mut term) = terminal {
-            term.draw(|f| ui::draw(f, &s)).ok();
-        }
-    }
-    std::thread::sleep(Duration::from_millis(800));
-    drop(terminal);
-    drop(guard);
-
-    let (tf, td): (u64, u64) = {
-        let s = app_state.lock().unwrap();
-        s.targets.iter().fold((0, 0), |(f, d), t| (f + t.files, d + t.dirs))
-    };
+    let (tf, td): (u64, u64) = progresses.iter().fold((0, 0), |(f, d), p| {
+        let (pf, pd, _) = p.scan.snapshot();
+        (f + pf, d + pd)
+    });
+    let total_elapsed = scan_start.elapsed().as_secs_f64();
     if abort.load(Ordering::SeqCst) {
-        println!("Scan aborted: {} files, {} dirs (partial)", tf, td);
+        println!("Scan aborted: {} files, {} dirs | {:.1}s (partial)", tf, td, total_elapsed);
     } else {
-        println!("Scan complete: {} files, {} dirs", tf, td);
+        println!("Scan complete: {} files, {} dirs | {:.1}s", tf, td, total_elapsed);
     }
 }
 
@@ -2694,6 +2649,7 @@ fn print_tree(
 /// `only_user = Some(name)` exports just that user; None exports all. Returns the
 /// number of users exported. Shared by the CLI `export` command and the TUI.
 pub fn export_target_users(db: &std::path::Path, export_dir: &std::path::Path, only_user: Option<&str>) -> Result<usize, String> {
+    let start = std::time::Instant::now();
     let conn = rusqlite::Connection::open(db).map_err(|e| format!("open {}: {}", db.display(), e))?;
     let mut stmt = conn.prepare("SELECT uid, username FROM detail_users")
         .map_err(|_| "no detail data in report.db — scan this target first".to_string())?;
@@ -2707,6 +2663,7 @@ pub fn export_target_users(db: &std::path::Path, export_dir: &std::path::Path, o
         if let Some(want) = only_user {
             if uname != want { continue; }
         }
+        eprintln!("  Exporting '{}'...", uname);
         export_user_text(&conn, *uid, uname, export_dir);
         n += 1;
     }
@@ -2716,6 +2673,7 @@ pub fn export_target_users(db: &std::path::Path, export_dir: &std::path::Path, o
             None => "no users in report.db".to_string(),
         });
     }
+    eprintln!("  Exported {} user(s) in {:.1}s", n, start.elapsed().as_secs_f64());
     Ok(n)
 }
 
@@ -2727,10 +2685,9 @@ fn export_user_text(conn: &rusqlite::Connection, uid: i64, username: &str, expor
         .collect();
     let header = format!("{:<5} {:<20} {:>12}  {}\n{}\n", "Type", "User", "Size", "Path", "-".repeat(90));
 
-    // Dirs. Wrap in a BufWriter so a user with hundreds of thousands of rows
-    // becomes a few thousand block writes instead of one write() syscall per
-    // line (that per-line syscall storm is what made export take minutes).
+    // Dirs.
     let dir_path = export_dir.join(format!("usage_dir_{}.txt", safe_user));
+    let mut dir_rows: usize = 0;
     if let Ok(f) = std::fs::File::create(&dir_path) {
         let mut w = std::io::BufWriter::new(f);
         let _ = w.write_all(header.as_bytes());
@@ -2742,14 +2699,16 @@ fn export_user_text(conn: &rusqlite::Connection, uid: i64, username: &str, expor
             }) {
                 for row in rows.flatten() {
                     let _ = writeln!(w, "{:<5} {:<20} {:>12}  {}", "dir", username, fmt_size(row.0), row.1);
+                    dir_rows += 1;
                 }
             }
         }
         let _ = w.flush();
     }
 
-    // Files (join names + parent dir path). Same BufWriter treatment.
+    // Files.
     let file_path = export_dir.join(format!("usage_file_{}.txt", safe_user));
+    let mut file_rows: usize = 0;
     if let Ok(f) = std::fs::File::create(&file_path) {
         let mut w = std::io::BufWriter::new(f);
         let _ = w.write_all(header.as_bytes());
@@ -2766,11 +2725,14 @@ fn export_user_text(conn: &rusqlite::Connection, uid: i64, username: &str, expor
                 for row in rows.flatten() {
                     let full = format!("{}/{}", row.1.trim_end_matches('/'), row.2);
                     let _ = writeln!(w, "{:<5} {:<20} {:>12}  {}", "file", username, fmt_size(row.0), full);
+                    file_rows += 1;
                 }
             }
         }
         let _ = w.flush();
     }
+    eprintln!("    usage_dir_{}.txt  — {} dirs", safe_user, dir_rows);
+    eprintln!("    usage_file_{}.txt — {} files", safe_user, file_rows);
 }
 
 /// Read the latest snapshot from report.db, build an MS Teams Adaptive Card,

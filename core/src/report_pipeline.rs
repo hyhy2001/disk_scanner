@@ -317,11 +317,7 @@ impl PathTree {
             id
         };
 
-        let root_name = if root == "/" {
-            "/".to_string()
-        } else {
-            tm_basename(root)
-        };
+        let root_name = root.to_string();
         let root_name_id = intern(root_name);
 
         let mut dir_id_of: HashMap<String, i64> = HashMap::new();
@@ -1036,8 +1032,6 @@ pub fn build_detail_db_impl(
             v
         };
 
-        let mut chunk: Vec<FileRow> = Vec::with_capacity(FILE_INSERT_CHUNK);
-
         let mut sorted_users: Vec<String> = compact_row_spills.keys().cloned().collect();
         sorted_users.sort();
 
@@ -1054,57 +1048,121 @@ pub fn build_detail_db_impl(
             "[Phase 2] Building user detail for {} users...",
             total_users
         );
-        let progress_step = (total_users / 10).max(1);
-        for (idx, username) in sorted_users.iter().enumerate() {
-            let uid = intern_user(username, &mut username_to_uid, &mut uid_to_username);
-            let totals = user_totals.entry(uid).or_default();
-            let Some(spills) = user_spill_paths.get(username) else { continue };
-            for spill_path in spills {
-                if let Ok(meta) = fs::metadata(spill_path) {
-                    total_spill_read += meta.len();
-                }
-                let rows = read_compact_spill(spill_path)?;
-                for (size, dir_id_u32, name_id_u32, ext_id_u16) in rows {
-                    let size_i64 = size as i64;
-                    let dir_id = dir_id_u32 as i64;
-                    let name_id = name_id_u32 as i64;
-                    let ext_id = ext_id_u16 as i64;
 
-                    let dus = user_dir_size.entry((uid, dir_id)).or_insert((0, 0));
-                    dus.0 += size_i64;
-                    dus.1 += 1;
+        // Pre-compute uid mappings — intern_user is not thread-safe.
+        let uid_of: HashMap<String, i64> = {
+            let mut utu = username_to_uid.clone();
+            let mut utu2 = uid_to_username.clone();
+            sorted_users.iter().map(|u| {
+                (u.clone(), intern_user(u, &mut utu, &mut utu2))
+            }).collect()
+        };
+        for (u, uid) in &uid_of {
+            username_to_uid.entry(u.clone()).or_insert(*uid);
+            uid_to_username.entry(*uid).or_insert(u.clone());
+        }
 
-                    if (dir_id as usize) < direct_file_count.len() {
-                        direct_file_count[dir_id as usize] += 1;
+        // Parallel: aggregate per-user stats from spill files.
+        let dir_count = direct_file_count.len();
+        let ext_ref = &ext_string_by_id;
+        let spills_ref = &user_spill_paths;
+        let user_aggregates: Vec<(i64, String, UserTotals, HashMap<(i64,i64),(i64,i64)>,
+                                  Vec<FileRow>, Vec<i64>, i64, i64, u64)> =
+            sorted_users.par_iter().map(|username| {
+                let uid = uid_of[username];
+                let mut totals = UserTotals::default();
+                let mut dir_size: HashMap<(i64,i64),(i64,i64)> = HashMap::new();
+                let mut file_rows: Vec<FileRow> = Vec::new();
+                let mut dfs = vec![0i64; dir_count];
+                let mut docs: i64 = 0;
+                let mut size_sum: i64 = 0;
+                let mut spill_bytes: u64 = 0;
+
+                if let Some(spills) = spills_ref.get(username) {
+                    for spill_path in spills {
+                        if let Ok(meta) = fs::metadata(spill_path) {
+                            spill_bytes += meta.len();
+                        }
+                        let rows = match read_compact_spill(spill_path) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("Warning: read_compact_spill {}: {:?}", spill_path.display(), e);
+                                continue;
+                            }
+                        };
+                        for (size, dir_id_u32, name_id_u32, ext_id_u16) in rows {
+                            let size_i64 = size as i64;
+                            let dir_id = dir_id_u32 as i64;
+                            let name_id = name_id_u32 as i64;
+                            let ext_id = ext_id_u16 as i64;
+
+                            let dus = dir_size.entry((uid, dir_id)).or_insert((0, 0));
+                            dus.0 += size_i64;
+                            dus.1 += 1;
+
+                            if (dir_id as usize) < dir_count {
+                                dfs[dir_id as usize] += 1;
+                            }
+
+                            totals.files += 1;
+                            totals.size += size_i64;
+                            docs += 1;
+                            size_sum += size_i64;
+
+                            let ext_str = ext_ref.get(ext_id as usize)
+                                .cloned().unwrap_or_default();
+                            file_rows.push(FileRow { dir_id, name_id, ext: ext_str, uid, size: size_i64 });
+                        }
                     }
-
-                    totals.files += 1;
-                    totals.size += size_i64;
-                    total_docs += 1;
-                    total_size += size_i64;
-
-                    let ext_str = ext_string_by_id.get(ext_id as usize).cloned().unwrap_or_default();
-                    chunk.push(FileRow {
-                        dir_id,
-                        name_id,
-                        ext: ext_str,
-                        uid,
-                        size: size_i64,
-                    });
-                    if chunk.len() >= FILE_INSERT_CHUNK {
-                        db_writer::detail_insert_files_chunk(&mut detail_handle, &chunk)?;
-                        chunk.clear();
-                    }
                 }
-                let _ = fs::remove_file(spill_path);
+                (uid, username.clone(), totals, dir_size, file_rows, dfs, docs, size_sum, spill_bytes)
+            }).collect();
+
+        // Serial merge of per-user aggregates into global state.
+        for (uid, uname, totals, dir_size, file_rows, dfs, docs, size_sum, spill_bytes) in &user_aggregates {
+            let ut = user_totals.entry(*uid).or_default();
+            ut.files += totals.files;
+            ut.size += totals.size;
+
+            for ((u, d), (s, c)) in dir_size {
+                let e = user_dir_size.entry((*u, *d)).or_insert((0, 0));
+                e.0 += s;
+                e.1 += c;
             }
-            let done = idx + 1;
-            if done == total_users || done % progress_step == 0 {
-                let pct = (done as f64) * 100.0 / (total_users.max(1) as f64);
-                println!(
-                    "[Phase 2]   user detail: {}/{} ({:.0}%)",
-                    done, total_users, pct
-                );
+
+            for (i, c) in dfs.iter().enumerate() {
+                if i < direct_file_count.len() {
+                    direct_file_count[i] += c;
+                }
+            }
+
+            total_docs += docs;
+            total_size += size_sum;
+            total_spill_read += spill_bytes;
+
+            // Delete spill files after processing.
+            if let Some(spills) = user_spill_paths.get(uname) {
+                for p in spills {
+                    let _ = fs::remove_file(p);
+                }
+            }
+        }
+
+        // Serial SQLite insert pass.
+        let mut chunk: Vec<FileRow> = Vec::with_capacity(FILE_INSERT_CHUNK);
+        for (_uid, _uname, _totals, _dir_size, file_rows, _dfs, _docs, _size_sum, _spill_bytes) in &user_aggregates {
+            for row in file_rows {
+                chunk.push(FileRow {
+                    dir_id: row.dir_id,
+                    name_id: row.name_id,
+                    ext: row.ext.clone(),
+                    uid: row.uid,
+                    size: row.size,
+                });
+                if chunk.len() >= FILE_INSERT_CHUNK {
+                    db_writer::detail_insert_files_chunk(&mut detail_handle, &chunk)?;
+                    chunk.clear();
+                }
             }
         }
         if !chunk.is_empty() {

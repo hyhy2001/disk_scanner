@@ -2,6 +2,8 @@ use dashmap::DashSet;
 use ignore::{WalkBuilder, WalkState};
 use std::collections::HashMap;
 
+use hashbrown::HashMap as HbHashMap;
+
 use crate::pyo3::PyRuntimeError;
 
 use std::collections::HashSet;
@@ -658,8 +660,8 @@ pub fn run_scan_core(
                     t_size: 0,
                     t_uid_sizes: HashMap::with_capacity(256),
                     t_uid_files: HashMap::with_capacity(256),
-                    t_dir_sizes: HashMap::with_capacity(50_000),
-                    t_dir_owners: HashMap::with_capacity(50_000),
+                    t_dir_sizes: HbHashMap::with_capacity(50_000),
+                    t_dir_owners: HbHashMap::with_capacity(50_000),
                     t_dir_owner_uids: HashSet::new(),
                     t_event_bin_bufs: (0..ThreadLocalState::EVENT_BUCKETS)
                         .map(|_| Vec::with_capacity(1024 * 1024))

@@ -88,6 +88,10 @@ pub struct Globals {
     pub max_parallel_devices: i64,
     #[serde(default = "default_nfs_parallel")]
     pub nfs_parallel: i64,
+    #[serde(default = "default_hdd_parallel")]
+    pub hdd_parallel: i64,
+    #[serde(default = "default_ssd_parallel")]
+    pub ssd_parallel: i64,
     /// Optional LSF batch-submit settings. When `enabled`, a headless
     /// `duscan run` re-submits itself to the cluster via the `bs` wrapper
     /// (a site-local `bsub`) instead of scanning on the login node.
@@ -102,6 +106,8 @@ impl Default for Globals {
             workers: default_workers(),
             max_parallel_devices: 0,
             nfs_parallel: default_nfs_parallel(),
+            hdd_parallel: default_hdd_parallel(),
+            ssd_parallel: default_ssd_parallel(),
             lsf: LsfConfig::default(),
         }
     }
@@ -199,6 +205,8 @@ pub struct Config {
     pub workers: String,
     pub max_parallel_devices: i64,
     pub nfs_parallel: i64,
+    pub hdd_parallel: i64,
+    pub ssd_parallel: i64,
     pub lsf: LsfConfig,
     pub targets: Vec<Target>,
 }
@@ -209,7 +217,16 @@ fn default_workers() -> String { "auto".into() }
 // requests in flight, so the per-device walker cap defaults well above the old
 // value of 4 (production traces showed ~25 threads productively blocked on
 // metadata). Still overridable via `nfs_parallel` in duscan.toml.
-fn default_nfs_parallel() -> i64 { 16 }
+fn default_nfs_parallel() -> i64 { 64 }
+
+// HDD is seek-bound, but modern drives with NCQ can handle more concurrent
+// readers than the old cap of 4. Default 8 balances throughput against
+// thrash on single-spindle disks. Override via `hdd_parallel` in duscan.toml.
+fn default_hdd_parallel() -> i64 { 8 }
+
+// SSD defaults to 0 (no cap = use full per-group budget). Set a positive
+// value to cap walker threads on a specific SSD device group.
+fn default_ssd_parallel() -> i64 { 0 }
 
 impl Default for Config {
     fn default() -> Self {
@@ -219,6 +236,8 @@ impl Default for Config {
             workers: g.workers,
             max_parallel_devices: g.max_parallel_devices,
             nfs_parallel: g.nfs_parallel,
+            hdd_parallel: g.hdd_parallel,
+            ssd_parallel: g.ssd_parallel,
             lsf: g.lsf,
             targets: Vec::new(),
         }
@@ -363,6 +382,8 @@ impl Config {
             workers: globals.workers,
             max_parallel_devices: globals.max_parallel_devices,
             nfs_parallel: globals.nfs_parallel,
+            hdd_parallel: globals.hdd_parallel,
+            ssd_parallel: globals.ssd_parallel,
             lsf: globals.lsf,
             targets: Vec::new(),
         };
@@ -412,6 +433,8 @@ impl Config {
             workers: self.workers.clone(),
             max_parallel_devices: self.max_parallel_devices,
             nfs_parallel: self.nfs_parallel,
+            hdd_parallel: self.hdd_parallel,
+            ssd_parallel: self.ssd_parallel,
             lsf: self.lsf.clone(),
         };
         let content = toml::to_string_pretty(&globals).map_err(|e| format!("serialize: {}", e))?;

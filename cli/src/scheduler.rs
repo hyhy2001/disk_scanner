@@ -51,7 +51,9 @@ pub struct TargetView {
 }
 
 /// Build a device-aware scan plan from config targets.
-pub fn build_scan_plan(config: &Config, budget: usize) -> ScanPlan {
+/// When `explicit_workers` is true, `--workers` was passed on the CLI and
+/// device-class caps are skipped — the full budget is used per group.
+pub fn build_scan_plan(config: &Config, budget: usize, explicit_workers: bool) -> ScanPlan {
     let output_dir = PathBuf::from(&config.output_dir);
 
     // Resolve targets: stat each, group by device
@@ -82,16 +84,19 @@ pub fn build_scan_plan(config: &Config, budget: usize) -> ScanPlan {
     let workers_per_group = (budget / n_groups).max(1);
 
     let nfs_cap = config.nfs_parallel.max(1) as usize;
-    // HDDs are seek-bound: many concurrent walker threads on one spindle cause
-    // thrash and *lower* throughput, so cap them low. SSD/NVMe get the full
-    // per-group budget. NFS is latency-bound: cap at nfs_parallel.
-    const HDD_WORKER_CAP: usize = 4;
+    let hdd_cap = config.hdd_parallel.max(1) as usize;
+    let ssd_cap = config.ssd_parallel.max(0) as usize; // 0 = no cap (use full budget)
     for (dev, targets) in by_dev {
         let class = classify_device(dev, &mount_info);
-        let group_workers = match class.as_str() {
-            "nfs" => workers_per_group.min(nfs_cap),
-            "hdd" => workers_per_group.min(HDD_WORKER_CAP),
-            _ => workers_per_group, // ssd / unknown
+        let group_workers = if explicit_workers {
+            workers_per_group // --workers explicit: bypass device caps
+        } else {
+            match class.as_str() {
+                "nfs" => workers_per_group.min(nfs_cap),
+                "hdd" => workers_per_group.min(hdd_cap),
+                "ssd" => if ssd_cap > 0 { workers_per_group.min(ssd_cap) } else { workers_per_group },
+                _ => workers_per_group,
+            }
         };
 
         // Sort shortest path first for nesting detection

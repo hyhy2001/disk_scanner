@@ -99,9 +99,20 @@ is optional once configured.
 
 ```bash
 ./duscan run [--target <name>] [--tree-map] [--workers N] [--level N] [--debug] [--no-lsf]
-#   --debug: Phase 1/2/3 profiling + RSS diagnostics
-#   --no-lsf: force a local scan even when [lsf] is enabled
-#   per-target webhook_url auto-sends a Teams card after each scan (no separate step)
+#   Headless text output: per-target phases, live files/dirs/s + elapsed + memory.
+#   --workers N: explicit workers bypass device-class caps (use full budget).
+#   --debug: Phase 1/2/3 profiling + RSS diagnostics.
+#   --no-lsf: force a local scan even when [lsf] is enabled.
+#   per-target webhook_url auto-sends a Teams card after each scan (no separate step).
+#
+#   Example output:
+#     Device group dev=64512 class=hdd workers=8 targets=[Test]
+#     Scanning 1 target(s)...
+#     [Test] Started scanning...
+#     [Test] 277108 files, 34188 dirs | 2.1s 45 MB (138451 files/s)
+#     [Test] Building detail DB... (1506009 files, 225996 dirs, 87.6 GB | 14.5s 320 MB)
+#     [Test] Done: 1506009 files, 225996 dirs, 87.6 GB | 26.5s 82 MB
+#     Scan complete: 1506009 files, 225996 dirs | 26.5s
 
 ./duscan status [--target <name>] [--watch] [--json]
 #   reads scan_status.json (stage/running/files/dirs/size/elapsed). Works for local,
@@ -113,6 +124,11 @@ is optional once configured.
 
 ./duscan tree-show [--target <name>] [--level N] [--limit N] [--path P] [--search KW]
 ./duscan export --user <user> [--target <name>] [--export-dir DIR]
+#   Headless export with per-user progress and file/dir counts:
+#     Exporting 'alice'...
+#       usage_dir_alice.txt   — 1234 dirs
+#       usage_file_alice.txt  — 56789 files
+#     Exported 32 user(s) in 45.3s
 ./duscan history [--target <name>] [--days N] [--json]
 #   --compare [--top N]: per-user growth/trend table across snapshots
 ./duscan notify --webhook-url URL [--target <name>]
@@ -142,7 +158,9 @@ targets/
 output_dir = "reports"        # relative → anchored to the binary dir; absolute → used as-is
 workers = "auto"
 max_parallel_devices = 0      # 0 = unlimited concurrent device groups
-nfs_parallel = 16             # walker-thread cap per NFS device (latency-bound)
+nfs_parallel = 64             # walker-thread cap per NFS device (latency-bound; default 64)
+hdd_parallel = 8              # walker-thread cap per HDD device (seek-bound; default 8)
+ssd_parallel = 0              # walker-thread cap per SSD device (0 = unlimited)
 ```
 
 ```toml
@@ -250,9 +268,8 @@ space. Dirs that couldn't be stat'd fall back to the smallest known uid.
 ├── cli/src/                # CLI binary (duscan)
 │   ├── main.rs             # Clap dispatch + scan orchestration + status/LSF
 │   ├── config.rs           # TOML config CRUD
-│   ├── config_tui.rs       # Ratatui config + report TUI
-│   ├── scheduler.rs        # Device-aware scan plan
-│   └── ui.rs               # Read-only live scan monitor
+│   ├── scheduler.rs        # Device-aware scan plan (classify + cap workers)
+│   └── config_tui.rs       # Ratatui config + report TUI
 ├── legacy/                 # Python reference code (read-only)
 └── src/rust_scanner/       # Original PyO3 crate (.so build, reference)
 ```
@@ -262,9 +279,9 @@ space. Dirs that couldn't be stat'd fall back to the smallest known uid.
 ```
 Phase 1: parallel WalkBuilder walk
   → per-thread binary spill files (events, dir aggregates, dir owners, perm TSV)
-Phase 2: detail pipeline (Rayon)
-  → compact spill re-encoding → path tree → detail tables
-  → persist treemap aggregates (only with --tree-map)
+Phase 2: detail pipeline (Rayon parallel)
+  → compact spill re-encoding → path tree → per-user detail (rayon par_iter)
+  → detail tables → persist treemap aggregates (only with --tree-map)
 Phase 3: treemap pipeline (only with --tree-map)
   → load aggregates → treemap tables (filtered by --level)
 Merge + History: fold everything into report.db, append the day's snapshot
@@ -272,7 +289,7 @@ Merge + History: fold everything into report.db, append the day's snapshot
 
 ---
 
-## Scan performance (NFS)
+## Scan performance
 
 Phase 1 is metadata-I/O-bound: on NFS every `lstat`/`statx` is a network RPC, so
 metadata dominates wall time. Two things keep it fast:
@@ -282,10 +299,13 @@ metadata dominates wall time. Two things keep it fast:
   covering bind-mount, filesystem-boundary (`du -x`), hardlink/loop dedup and
   inode-owner checks together. Falls back to `entry.metadata()` on old kernels
   where `statx()` isn't usable. Local filesystems keep the plain `metadata()` path.
-- **`nfs_parallel`** (default **16**) caps walker threads per NFS device. NFS is
+- **`nfs_parallel`** (default **64**) caps walker threads per NFS device. NFS is
   latency-bound, so more RPCs in flight hide round-trip latency; raise it for
-  high-latency mounts, lower it if the NFS server is the bottleneck. HDDs stay
-  capped low (seek-bound); SSD/NVMe get the full budget.
+  high-latency mounts, lower it if the NFS server is the bottleneck.
+- **`hdd_parallel`** (default **8**) caps walker threads per HDD device (seek-bound).
+- **`ssd_parallel`** (default **0** = unlimited) caps walker threads per SSD device.
+  All three caps are configurable in `duscan.toml` and editable in the Settings tab.
+  Pass `--workers N` explicitly to bypass all caps and use the full budget.
 
 Correctness on NFS: hardlink dedup keys on `(stx_ino, stx_mnt_id)` because
 `st_dev` is unstable on NFS clients (the same inode reached via two paths can

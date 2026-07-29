@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use hashbrown::HashMap as HbHashMap;
+
 use crate::scan_constants::{DIR_AGG_BIN_MAGIC_V1, DIR_OWNER_BIN_MAGIC_V1, SCAN_EVENT_BIN_MAGIC_V1};
 
 pub(crate) struct GlobalStats {
@@ -29,8 +31,8 @@ pub(crate) struct ThreadLocalState {
     pub(crate) t_size: u64,
     pub(crate) t_uid_sizes: HashMap<u32, u64>,
     pub(crate) t_uid_files: HashMap<u32, u64>,
-    pub(crate) t_dir_sizes: HashMap<(u32, String), i64>,
-    pub(crate) t_dir_owners: HashMap<String, u32>,
+    pub(crate) t_dir_sizes: HbHashMap<(u32, String), i64>,
+    pub(crate) t_dir_owners: HbHashMap<String, u32>,
     pub(crate) t_dir_owner_uids: HashSet<u32>,
     pub(crate) t_event_bin_bufs: Vec<Vec<u8>>,
     pub(crate) t_event_buf_records: Vec<usize>,
@@ -118,7 +120,27 @@ impl ThreadLocalState {
             return;
         };
 
-        *self.t_dir_sizes.entry((uid, parent.to_string())).or_insert(0) += size as i64;
+        // Compute hash from uid+parent without allocating — only allocate
+        // parent.to_string() on first insert (cold path). Most files share
+        // the same parent directory, so this avoids millions of allocations.
+        use std::hash::{BuildHasher, Hash, Hasher};
+        let hash = {
+            let mut hasher = self.t_dir_sizes.hasher().build_hasher();
+            uid.hash(&mut hasher);
+            parent.hash(&mut hasher);
+            hasher.finish()
+        };
+
+        let entry = self.t_dir_sizes.raw_entry_mut()
+            .from_hash(hash, |k: &(u32, String)| k.0 == uid && k.1 == parent);
+        match entry {
+            hashbrown::hash_map::RawEntryMut::Occupied(mut e) => {
+                *e.get_mut() += size as i64;
+            }
+            hashbrown::hash_map::RawEntryMut::Vacant(e) => {
+                e.insert_hashed_nocheck(hash, (uid, parent.to_string()), size as i64);
+            }
+        }
 
         // Flush dir aggregates early to bound per-thread memory.
         // At 7.67M dirs × 80 bytes/path = ~614 MB just for keys.
@@ -129,7 +151,21 @@ impl ThreadLocalState {
     }
 
     pub(crate) fn add_dir_owner(&mut self, dir_path: &str, owner_uid: u32) {
-        self.t_dir_owners.insert(dir_path.to_string(), owner_uid);
+        // Avoid allocation on lookup — only allocate dir_path.to_string() on insert.
+        use std::hash::{BuildHasher, Hash, Hasher};
+        let hash = {
+            let mut hasher = self.t_dir_owners.hasher().build_hasher();
+            dir_path.hash(&mut hasher);
+            hasher.finish()
+        };
+        let entry = self.t_dir_owners.raw_entry_mut()
+            .from_hash(hash, |k: &String| k.as_str() == dir_path);
+        match entry {
+            hashbrown::hash_map::RawEntryMut::Occupied(_) => {}
+            hashbrown::hash_map::RawEntryMut::Vacant(e) => {
+                e.insert_hashed_nocheck(hash, dir_path.to_string(), owner_uid);
+            }
+        }
         self.t_dir_owner_uids.insert(owner_uid);
 
         // Bound per-thread memory the same way add_dir_size does: one entry

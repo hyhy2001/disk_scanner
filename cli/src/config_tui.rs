@@ -52,6 +52,8 @@ enum InputKind {
     SetWorkers,
     SetMaxParallel,
     SetNfsParallel,
+    SetHddParallel,
+    SetSsdParallel,
     // Per-target Scan/Sync tab fields.
     SetTargetLevel,
     SetTargetWorkers,
@@ -1058,11 +1060,13 @@ fn browse_settings(app: &mut App, key: event::KeyEvent) {
                 1 => begin_input(app, InputKind::SetWorkers, "workers (auto or N):", &app.cfg.workers.clone()),
                 2 => begin_input(app, InputKind::SetMaxParallel, "max_parallel_devices (0=unlimited):", &app.cfg.max_parallel_devices.to_string()),
                 3 => begin_input(app, InputKind::SetNfsParallel, "nfs_parallel:", &app.cfg.nfs_parallel.to_string()),
-                4 => begin_input(app, InputKind::SetLsfEnabled, "lsf.enabled (yes/no):", &bool_str(&app.cfg.lsf.enabled)),
-                5 => begin_input(app, InputKind::SetLsfCmd, "lsf.cmd (submit wrapper):", &app.cfg.lsf.cmd.clone()),
-                6 => begin_input(app, InputKind::SetLsfOs, "lsf.os (e.g. RHEL8, empty=omit):", &app.cfg.lsf.os.clone()),
-                7 => begin_input(app, InputKind::SetLsfMemMb, "lsf.mem_mb (0=omit):", &app.cfg.lsf.mem_mb.to_string()),
-                8 => begin_input(app, InputKind::SetLsfQueue, "lsf.queue (empty=omit):", &app.cfg.lsf.queue.clone()),
+                4 => begin_input(app, InputKind::SetHddParallel, "hdd_parallel:", &app.cfg.hdd_parallel.to_string()),
+                5 => begin_input(app, InputKind::SetSsdParallel, "ssd_parallel (0=unlimited):", &app.cfg.ssd_parallel.to_string()),
+                6 => begin_input(app, InputKind::SetLsfEnabled, "lsf.enabled (yes/no):", &bool_str(&app.cfg.lsf.enabled)),
+                7 => begin_input(app, InputKind::SetLsfCmd, "lsf.cmd (submit wrapper):", &app.cfg.lsf.cmd.clone()),
+                8 => begin_input(app, InputKind::SetLsfOs, "lsf.os (e.g. RHEL8, empty=omit):", &app.cfg.lsf.os.clone()),
+                9 => begin_input(app, InputKind::SetLsfMemMb, "lsf.mem_mb (0=omit):", &app.cfg.lsf.mem_mb.to_string()),
+                10 => begin_input(app, InputKind::SetLsfQueue, "lsf.queue (empty=omit):", &app.cfg.lsf.queue.clone()),
                 _ => {}
             }
         }
@@ -1275,6 +1279,14 @@ fn commit_input(app: &mut App) {
         },
         InputKind::SetNfsParallel => match buf.parse::<i64>() {
             Ok(n) => { app.cfg.nfs_parallel = n.max(1); save_globals(app).map(|_| "nfs_parallel updated".into()) }
+            Err(_) => Err("must be a number".into()),
+        },
+        InputKind::SetHddParallel => match buf.parse::<i64>() {
+            Ok(n) => { app.cfg.hdd_parallel = n.max(1); save_globals(app).map(|_| "hdd_parallel updated".into()) }
+            Err(_) => Err("must be a number".into()),
+        },
+        InputKind::SetSsdParallel => match buf.parse::<i64>() {
+            Ok(n) => { app.cfg.ssd_parallel = n.max(0); save_globals(app).map(|_| "ssd_parallel updated".into()) }
             Err(_) => Err("must be a number".into()),
         },
         // Per-target Scan/Sync fields (empty clears to None = default/disabled).
@@ -1496,16 +1508,19 @@ fn draw_scan_jobs(frame: &mut Frame, app: &App, area: Rect) {
         Some(r) => r,
         None => return,
     };
+    let mem_mb = check_disk_core::pipe_types::get_rss_mb();
     let mut rows: Vec<ListItem> = Vec::new();
     for p in &run.progresses {
         let (files, dirs, size) = p.scan.snapshot();
         let phase = p.phase.lock().map(|g| g.clone()).unwrap_or_default();
         let err = p.error.lock().map(|g| g.clone()).unwrap_or_default();
+        let elapsed = p.started.elapsed().as_secs_f64();
         let (label, color) = phase_display(&phase);
         let detail = if phase == "error" && !err.is_empty() {
             format!("  {}", err)
         } else {
-            format!("  {} files · {} dirs · {}", fmt_count(files), fmt_count(dirs), crate::fmt_size(size as i64))
+            format!("  {} files · {} dirs · {}  |  {:.1}s  {:.0} MB",
+                fmt_count(files), fmt_count(dirs), crate::fmt_size(size as i64), elapsed, mem_mb)
         };
         rows.push(ListItem::new(Line::from(vec![
             Span::styled(format!("{:<16}", truncate(&p.name, 16)), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
@@ -1980,6 +1995,8 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         format!("workers              = {}", app.cfg.workers),
         format!("max_parallel_devices = {}", app.cfg.max_parallel_devices),
         format!("nfs_parallel         = {}", app.cfg.nfs_parallel),
+        format!("hdd_parallel         = {}", app.cfg.hdd_parallel),
+        format!("ssd_parallel         = {}", app.cfg.ssd_parallel),
     ];
     let lsf_rows = [
         Line::from(vec![

@@ -229,7 +229,11 @@ CREATE TABLE IF NOT EXISTS hist_snapshots (
   path       TEXT,
   total      INTEGER,
   used       INTEGER,
-  available  INTEGER
+  available  INTEGER,
+  inodes_total   INTEGER,
+  inodes_used    INTEGER,
+  inodes_free    INTEGER,
+  inodes_scanned INTEGER
 );
 CREATE TABLE IF NOT EXISTS hist_team_usage (
   snapshot_id INTEGER NOT NULL,
@@ -303,6 +307,25 @@ pub fn open_merged_db(merged_db_path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// Add missing `hist_snapshots` columns to databases written by an older duscan.
+fn migrate_hist_snapshots(conn: &Connection) -> rusqlite::Result<()> {
+    let new_cols: &[&str] = &["inodes_total", "inodes_used", "inodes_free", "inodes_scanned"];
+    for col in new_cols {
+        let exists = conn
+            .prepare(&format!("PRAGMA table_info(hist_snapshots)"))
+            .and_then(|mut s| {
+                Ok(s.query_map([], |r| r.get::<_, String>(1))?
+                    .flatten()
+                    .any(|c| c == *col))
+            })
+            .unwrap_or(true);
+        if !exists {
+            conn.execute(&format!("ALTER TABLE hist_snapshots ADD COLUMN {} INTEGER", col), [])?;
+        }
+    }
+    Ok(())
+}
+
 /// Copy all rows from source DBs into a merged report.db.
 /// Expects `source_dir` to contain the 4 source files.
 /// The target `merged_db` is created/updated atomically via temp + rename.
@@ -321,6 +344,10 @@ pub fn merge_into_single_db(
 
     // Build schemas + pragmas
     let mut conn = open_merged_db(&tmp)?;
+
+    // Migrate hist_snapshots if this report.db was created by an older duscan
+    // (before inode columns were added).
+    migrate_hist_snapshots(&conn)?;
 
     // ATTACH all 4 source DBs
     let source_detail = source_dir.join("data_detail.db");
