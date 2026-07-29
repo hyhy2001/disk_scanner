@@ -1894,7 +1894,7 @@ pub(crate) fn submit_lsf_target(
     cfg: &Config, exe: &str, lsf_prefix: &[String],
     target_name: &str, level: usize, workers: Option<usize>, tree_map: bool,
     output_dir: Option<&str>,
-) -> bool {
+) -> Result<(), String> {
     let mut argv = lsf_prefix.to_vec();
     argv.push(exe.to_string());
     argv.extend(reconstruct_run_args(
@@ -1907,27 +1907,23 @@ pub(crate) fn submit_lsf_target(
         .spawn()
     {
         Ok(mut child) => {
-            // Wait up to 30s for the submit command to finish.
             for _ in 0..60 {
                 match child.try_wait() {
-                    Ok(Some(status)) => return status.success(),
-                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
-                    Err(e) => {
-                        eprintln!("LSF submit '{}' error: {}", cfg.lsf.cmd, e);
-                        return false;
+                    Ok(Some(status)) => {
+                        if status.success() {
+                            return Ok(());
+                        }
+                        return Err(format!("{} exited with {}", cfg.lsf.cmd, status));
                     }
+                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
+                    Err(e) => return Err(format!("{}: {}", cfg.lsf.cmd, e)),
                 }
             }
-            // Timed out — kill the child and report failure.
             let _ = child.kill();
             let _ = child.wait();
-            eprintln!("LSF submit '{}' timed out for target '{}'.", cfg.lsf.cmd, target_name);
-            false
+            Err(format!("{} timed out", cfg.lsf.cmd))
         }
-        Err(e) => {
-            eprintln!("Warning: failed to run '{}' ({})", cfg.lsf.cmd, e);
-            false
-        }
+        Err(e) => Err(format!("{}: {}", cfg.lsf.cmd, e)),
     }
 }
 

@@ -547,10 +547,21 @@ fn start_scan(app: &mut App, names: &[String]) {
                     &cfg_clone, &exe, &lsf_prefix, t,
                     level, workers, false, None,
                 );
-                progress_clone.lock().unwrap()[i].phase = if done { "submitted".into() } else { "error".into() };
-                progress_clone.lock().unwrap()[i].error = if done { String::new() } else { "submit failed".into() };
-                if done { ok += 1; }
-                *status_clone.lock().unwrap() = format!("Submitted {}/{} target(s) to LSF — tracking live...", ok, targets_clone.len());
+                match done {
+                    Ok(()) => {
+                        progress_clone.lock().unwrap()[i].phase = "submitted".into();
+                        ok += 1;
+                    }
+                    Err(e) => {
+                        progress_clone.lock().unwrap()[i].phase = "error".into();
+                        progress_clone.lock().unwrap()[i].error = e;
+                    }
+                }
+                *status_clone.lock().unwrap() = if ok > 0 {
+                    format!("Submitted {}/{} to LSF — tracking live...", ok, targets_clone.len())
+                } else {
+                    format!("LSF submit failed — check panel for errors")
+                };
             }
             if ok == 0 {
                 *status_clone.lock().unwrap() = "All LSF submits failed.".into();
