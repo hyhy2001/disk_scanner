@@ -571,12 +571,18 @@ fn start_scan(app: &mut App, names: &[String]) {
                 return;
             }
             // Phase 2: poll scan_status.json from shared storage.
+            // Read files OUTSIDE the lock so slow NFS I/O doesn't block the TUI.
             while !stop_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                // Collect fresh statuses without holding the lock.
+                let fresh: Vec<Option<crate::TargetStatus>> = targets_clone.iter()
+                    .map(|t| crate::read_target_status(&out, t))
+                    .collect();
+
                 let mut snap = progress_clone.lock().unwrap();
                 let mut all_done = true;
                 for (i, t) in targets_clone.iter().enumerate() {
                     if snap[i].phase == "error" { continue; }
-                    if let Some(s) = crate::read_target_status(&out, t) {
+                    if let Some(s) = &fresh[i] {
                         snap[i] = LsfTargetProgress {
                             name: t.clone(), phase: s.stage.clone(),
                             files: s.files, dirs: s.dirs, size_bytes: s.size_bytes,
