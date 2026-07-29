@@ -238,3 +238,7 @@ __marimo__/
 /legacy/
 # compiled PyO3 extension modules (build artifacts)
 /src/*.abi3.so
+# Local dev scripts and config
+/demo.sh
+/test_full.sh
+.claude/
