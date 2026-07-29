@@ -527,7 +527,9 @@ fn start_scan(app: &mut App, names: &[String]) {
         let stop_clone = stop.clone();
         let targets_clone = targets.clone();
         let cfg_clone = cfg.clone();
-        let status = std::sync::Arc::new(std::sync::Mutex::new(format!("Submitting {} target(s) to LSF...", total)));
+        let cmd_line = format!("{} {} duscan run --target <name> --no-lsf",
+            cfg.lsf.cmd, lsf_prefix.join(" "));
+        let status = std::sync::Arc::new(std::sync::Mutex::new(format!("Submitting {} target(s) to LSF: {}", total, cmd_line)));
         let status_clone = status.clone();
         let handle = std::thread::spawn(move || {
             let start = std::time::Instant::now();
