@@ -233,7 +233,8 @@ CREATE TABLE IF NOT EXISTS hist_snapshots (
   inodes_total   INTEGER,
   inodes_used    INTEGER,
   inodes_free    INTEGER,
-  inodes_scanned INTEGER
+  inodes_scanned INTEGER,
+  scanned_size INTEGER
 );
 CREATE TABLE IF NOT EXISTS hist_team_usage (
   snapshot_id INTEGER NOT NULL,
@@ -253,25 +254,25 @@ CREATE TABLE IF NOT EXISTS hist_user_usage (
 ";
 
 const MERGED_INDEX_DDL: &str = "
--- Only the (uid, size DESC, …) index is built on detail_files. It covers the
--- one query the codebase actually runs against that table (the per-user export
--- in export_user_text: WHERE uid = ?1 ORDER BY size DESC), and the planner
--- confirms it serves that as a COVERING INDEX.
+-- ix_detail_files_uid_size_dir_name covers the per-user export query
+-- (WHERE uid = ?1 ORDER BY size DESC) as a covering index.
 --
--- The former ix_detail_files_uid_ext_size_dir_name and
--- ix_detail_files_dir_uid_ext_size_name were dropped: no query in cli/ or core/
--- ever filters or orders by `ext` or leads with `dir_id`, so they served nothing
--- while costing ~3.8s of CREATE INDEX time and ~60MB in every report.db. If an
--- extension-breakdown or per-directory query is added later, reintroduce the
--- matching index then.
+-- ix_detail_files_uid_ext_size_dir_name was dropped then re-added: the
+-- dashboard's detail tab filters by extension (ext IN (?)), which needs an
+-- index leading with (uid, ext) for a fast range seek instead of a full user
+-- scan. It costs ~3.8s of CREATE INDEX time and ~60MB per report.
 CREATE INDEX IF NOT EXISTS ix_detail_files_uid_size_dir_name
     ON detail_files(uid, size DESC, dir_id ASC, name_id ASC);
+CREATE INDEX IF NOT EXISTS ix_detail_files_uid_ext_size_dir_name
+    ON detail_files(uid, ext, size DESC, dir_id ASC, name_id ASC);
 CREATE INDEX IF NOT EXISTS ix_detail_dirs_uid_size_dir
     ON detail_dirs(uid, size DESC, id ASC);
 CREATE INDEX IF NOT EXISTS ix_detail_file_names_name
     ON detail_file_names(name);
 CREATE INDEX IF NOT EXISTS ix_treemap_dirs_parent_size
     ON treemap_dirs(parent_id, total_size DESC);
+CREATE INDEX IF NOT EXISTS ix_detail_users_files
+    ON detail_users(total_files DESC);
 CREATE INDEX IF NOT EXISTS ix_perm_user
     ON perm_issues(user);
 CREATE INDEX IF NOT EXISTS ix_perm_user_type

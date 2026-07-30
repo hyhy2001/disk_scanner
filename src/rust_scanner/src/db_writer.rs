@@ -1,8 +1,9 @@
 // SQLite builders for the Phase 2 reports.
 //
-// Two output databases are produced per scan:
+// Output databases:
 //   * `treemap.db`     — directory tree (adjacency list + per-dir aggregates)
 //   * `data_detail.db` — per-user file/dir breakdown
+//   * `report.db`      — merged single-DB (detail + treemap + perm + history)
 //
 // Schemas: STRICT tables, INTEGER PRIMARY KEY rowid aliases, lookup tables
 // for path segments and extensions, partial / covering indexes.
@@ -28,6 +29,7 @@ use std::time::Instant;
 
 pub const TREEMAP_APP_ID: i32 = 0xC0DD15C0u32 as i32;
 pub const DETAIL_APP_ID: i32 = 0xC0DD15D1u32 as i32;
+pub const MERGED_APP_ID: i32 = 0xC0DD15D2u32 as i32;
 pub const SCHEMA_VERSION: i32 = 1;
 pub const PAGE_SIZE: i32 = 16384;
 
@@ -144,7 +146,236 @@ CREATE INDEX ix_dirs_uid_size_dir            ON dirs(uid, size DESC, id ASC);
 CREATE INDEX ix_file_names_name              ON file_names(name);
 ";
 
-// ─── PRAGMA / lifecycle helpers ───────────────────────────────────────
+const MERGED_DDL: &str = "
+PRAGMA application_id = 2685705682;  -- 0xC0DD15D2
+PRAGMA schema_version = 1;
+
+CREATE TABLE IF NOT EXISTS meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
+
+-- Detail tables (prefixed detail_)
+CREATE TABLE IF NOT EXISTS detail_users (
+  uid               INTEGER PRIMARY KEY,
+  username          TEXT    NOT NULL,
+  team_id           TEXT,
+  total_files       INTEGER NOT NULL,
+  total_dirs        INTEGER NOT NULL,
+  total_size        INTEGER NOT NULL,
+  permission_issues INTEGER NOT NULL DEFAULT 0,
+  is_target         INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS detail_file_names (
+  id   INTEGER PRIMARY KEY,
+  name TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS detail_dirs (
+  id        INTEGER NOT NULL,
+  uid       INTEGER NOT NULL,
+  parent_id INTEGER,
+  path      TEXT    NOT NULL,
+  owner_uid INTEGER NOT NULL,
+  size      INTEGER NOT NULL,
+  files     INTEGER NOT NULL,
+  PRIMARY KEY (id, uid)
+);
+CREATE TABLE IF NOT EXISTS detail_files (
+  dir_id  INTEGER NOT NULL,
+  name_id INTEGER NOT NULL,
+  ext     TEXT    NOT NULL,
+  uid     INTEGER NOT NULL,
+  size    INTEGER NOT NULL
+);
+
+-- Treemap tables (prefixed treemap_)
+CREATE TABLE IF NOT EXISTS treemap_names (
+  id   INTEGER PRIMARY KEY,
+  name TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS treemap_owners (
+  uid      INTEGER PRIMARY KEY,
+  username TEXT    NOT NULL
+);
+CREATE TABLE IF NOT EXISTS treemap_dirs (
+  id          INTEGER PRIMARY KEY,
+  parent_id   INTEGER,
+  name_id     INTEGER NOT NULL,
+  total_size  INTEGER NOT NULL,
+  file_count  INTEGER NOT NULL,
+  dir_count   INTEGER NOT NULL,
+  owner_uid   INTEGER NOT NULL,
+  has_files   INTEGER NOT NULL
+);
+
+-- Permission tables (prefixed perm_)
+CREATE TABLE IF NOT EXISTS perm_issues (
+  id          INTEGER PRIMARY KEY,
+  user        TEXT NOT NULL,
+  item_type   TEXT NOT NULL,
+  error       TEXT NOT NULL,
+  path        TEXT NOT NULL
+);
+
+-- History tables (prefixed hist_, survive rebuild)
+CREATE TABLE IF NOT EXISTS hist_snapshots (
+  id         INTEGER PRIMARY KEY,
+  scan_date  INTEGER NOT NULL UNIQUE,
+  scanned_at INTEGER,
+  path       TEXT,
+  total      INTEGER,
+  used       INTEGER,
+  available  INTEGER
+);
+CREATE TABLE IF NOT EXISTS hist_team_usage (
+  snapshot_id INTEGER NOT NULL,
+  name        TEXT,
+  team_id     INTEGER,
+  size        INTEGER,
+  FOREIGN KEY(snapshot_id) REFERENCES hist_snapshots(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS hist_user_usage (
+  snapshot_id INTEGER NOT NULL,
+  name        TEXT,
+  team_id     INTEGER,
+  size        INTEGER,
+  kind        TEXT,
+  FOREIGN KEY(snapshot_id) REFERENCES hist_snapshots(id) ON DELETE CASCADE
+);
+";
+
+const MERGED_INDEX_DDL: &str = "
+CREATE INDEX IF NOT EXISTS ix_detail_files_uid_size_dir_name
+    ON detail_files(uid, size DESC, dir_id ASC, name_id ASC);
+CREATE INDEX IF NOT EXISTS ix_detail_files_uid_ext_size_dir_name
+    ON detail_files(uid, ext, size DESC, dir_id ASC, name_id ASC);
+CREATE INDEX IF NOT EXISTS ix_detail_files_dir_uid_ext_size_name
+    ON detail_files(dir_id, uid, ext, size DESC, name_id ASC);
+CREATE INDEX IF NOT EXISTS ix_detail_dirs_uid_size_dir
+    ON detail_dirs(uid, size DESC, id ASC);
+CREATE INDEX IF NOT EXISTS ix_detail_file_names_name
+    ON detail_file_names(name);
+CREATE INDEX IF NOT EXISTS ix_treemap_dirs_parent_size
+    ON treemap_dirs(parent_id, total_size DESC);
+CREATE INDEX IF NOT EXISTS ix_perm_user
+    ON perm_issues(user);
+CREATE INDEX IF NOT EXISTS ix_perm_user_type
+    ON perm_issues(user, item_type);
+CREATE INDEX IF NOT EXISTS ix_perm_path
+    ON perm_issues(path COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS ix_hist_team_snap
+    ON hist_team_usage(snapshot_id);
+CREATE INDEX IF NOT EXISTS ix_hist_user_snap
+    ON hist_user_usage(snapshot_id);
+";
+
+/// Create or open a merged report.db, initialising schema if needed.
+/// Returns the connection with WAL mode, cache, and mmap configured.
+pub fn open_merged_db(merged_db_path: &Path) -> rusqlite::Result<Connection> {
+    let exists = merged_db_path.exists();
+    let mut conn = Connection::open(merged_db_path)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA temp_store=MEMORY;
+         PRAGMA cache_size=-65536;
+         PRAGMA mmap_size=268435456;
+         PRAGMA foreign_keys=ON;",
+    )?;
+    if !exists {
+        conn.execute_batch(MERGED_DDL)?;
+    }
+    Ok(conn)
+}
+
+/// Copy all rows from source DBs into a merged report.db.
+/// Expects `source_dir` to contain the 4 source files.
+/// The target `merged_db` is created/updated atomically via temp + rename.
+/// Source files are NOT deleted (caller owns cleanup).
+pub fn merge_into_single_db(
+    source_dir: &Path,
+    merged_db: &Path,
+    view_name: &str,
+    view_path: &str,
+    timestamp: i64,
+) -> rusqlite::Result<()> {
+    let tmp = merged_db.with_extension("tmp");
+
+    // Remove stale tmp if present
+    let _ = std::fs::remove_file(&tmp);
+
+    // Build schemas + pragmas
+    let mut conn = open_merged_db(&tmp)?;
+
+    // ATTACH all 4 source DBs
+    let source_detail = source_dir.join("data_detail.db");
+    let source_treemap = source_dir.join("tree_map_data").join("treemap.db");
+    let source_perm = source_dir.join("permission_issues.db");
+    let source_report = source_dir.join("report.db");
+
+    if source_detail.exists() {
+        conn.execute("ATTACH DATABASE ?1 AS srcdetail", rusqlite::params![source_detail.to_string_lossy().as_ref()])?;
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO meta SELECT key, value FROM srcdetail.meta;
+             INSERT OR IGNORE INTO detail_users SELECT * FROM srcdetail.users;
+             INSERT OR IGNORE INTO detail_file_names SELECT * FROM srcdetail.file_names;
+             INSERT OR IGNORE INTO detail_dirs SELECT * FROM srcdetail.dirs;
+             INSERT INTO detail_files SELECT * FROM srcdetail.files;"
+        )?;
+        conn.execute("DETACH DATABASE srcdetail", [])?;
+    }
+
+    if source_treemap.exists() {
+        conn.execute("ATTACH DATABASE ?1 AS srctreemap", rusqlite::params![source_treemap.to_string_lossy().as_ref()])?;
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO treemap_names SELECT * FROM srctreemap.names;
+             INSERT OR IGNORE INTO treemap_owners SELECT * FROM srctreemap.owners;
+             INSERT OR IGNORE INTO treemap_dirs SELECT * FROM srctreemap.dirs;"
+        )?;
+        conn.execute("DETACH DATABASE srctreemap", [])?;
+    }
+
+    if source_perm.exists() {
+        conn.execute("ATTACH DATABASE ?1 AS srcperm", rusqlite::params![source_perm.to_string_lossy().as_ref()])?;
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO perm_issues SELECT * FROM srcperm.issues;"
+        )?;
+        conn.execute("DETACH DATABASE srcperm", [])?;
+    }
+
+    if source_report.exists() {
+        conn.execute("ATTACH DATABASE ?1 AS srcreport", rusqlite::params![source_report.to_string_lossy().as_ref()])?;
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO hist_snapshots SELECT * FROM srcreport.snapshots;
+             INSERT OR IGNORE INTO hist_team_usage SELECT * FROM srcreport.hist_team_usage;
+             INSERT OR IGNORE INTO hist_user_usage SELECT * FROM srcreport.hist_user_usage;"
+        )?;
+        conn.execute("DETACH DATABASE srcreport", [])?;
+    }
+
+    // Ensure scan identity in meta
+    {
+        let tx = conn.transaction()?;
+        tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('scan_name', ?1)", rusqlite::params![view_name])?;
+        tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('scan_path', ?1)", rusqlite::params![view_path])?;
+        tx.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('scan_timestamp', ?1)", rusqlite::params![timestamp.to_string()])?;
+        tx.commit()?;
+    }
+
+    // Build indexes
+    conn.execute_batch(MERGED_INDEX_DDL)?;
+
+    // ANALYZE for query planner
+    conn.execute_batch("ANALYZE;")?;
+
+    // Close and atomically rename
+    drop(conn);
+    std::fs::rename(&tmp, merged_db)
+        .map_err(|e| rusqlite::Error::InvalidPath(PathBuf::from(format!("rename {} -> {}: {}", tmp.display(), merged_db.display(), e))))?;
+
+    Ok(())
+}
+
 
 fn apply_build_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     // page_size MUST be set before any table is created.

@@ -14,6 +14,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
 use std::cell::RefCell;
+use std::cell::Cell;
 
 use crate::config::Config;
 
@@ -63,7 +64,6 @@ enum InputKind {
     SetExportDir,
     SetWebhookUrl,
     // LSF Settings tab fields.
-    SetLsfEnabled,
     SetLsfCmd,
     SetLsfOs,
     SetLsfMemMb,
@@ -179,8 +179,8 @@ struct App {
     hist_sel: usize,
     /// Detail sub-view: selected user index (into the current target's users).
     detail_sel: usize,
-    /// Treemap navigation stack: (dir_id, name) from root to current node.
-    tm_stack: Vec<(i64, String)>,
+    /// Treemap navigation stack: (dir_id, name, total_size) from root to current node.
+    tm_stack: Vec<(i64, String, i64)>,
     /// Selected child index in the current treemap node.
     tm_sel: usize,
     /// Live filter string for long lists (user columns + treemap). Empty = no
@@ -198,14 +198,30 @@ struct App {
     cache_users: RefCell<Option<(String, Vec<crate::ReportUser>)>>,
     /// History snapshots keyed by target name.
     cache_history: RefCell<Option<(String, Vec<crate::HistorySnapshot>)>>,
-    /// User detail keyed by (target, username).
-    cache_detail: RefCell<Option<(String, String, crate::UserDetail)>>,
+    /// User detail keyed by (target, username). LRU Vec, most recent first.
+    cache_detail: RefCell<Vec<(String, String, crate::UserDetail)>>,
     /// User permissions keyed by (target, username).
-    cache_perm: RefCell<Option<(String, String, (i64, Vec<crate::PermIssue>))>>,
-    /// User inode keyed by (target, username).
-    cache_inode: RefCell<Option<(String, String, (i64, i64, Vec<crate::InodeDir>))>>,
+    cache_perm: RefCell<Vec<(String, String, i64, Vec<crate::PermIssue>)>>,
+    /// Users with permission issues (subset of report users), keyed by target.
+    cache_perm_users: RefCell<Option<(String, Vec<crate::ReportUser>)>>,
     /// Treemap children keyed by (target, node_id).
     cache_tm: RefCell<Option<(String, i64, Vec<crate::TreeEntry>)>>,
+    /// Persistent SQLite connection to the current target's report.db, reused
+    /// across queries instead of opening a new connection per query.
+    db_conn: RefCell<Option<(String, rusqlite::Connection)>>,
+    /// Virtual-scroll offsets so lists only render visible rows (avoids OOM
+    /// on reports with thousands of entries). Cell allows mutation during draw.
+    scroll_target: Cell<usize>,
+    scroll_team: Cell<usize>,
+    scroll_user: Cell<usize>,
+    scroll_hist: Cell<usize>,
+    scroll_detail: Cell<usize>,
+    scroll_tm: Cell<usize>,
+    scroll_settings: Cell<usize>,
+    scroll_scansync: Cell<usize>,
+    /// Cached directory listing for Tab completion (path → sorted names).
+    /// Cleared when the input buffer is modified so stale listings aren't reused.
+    tab_cache_dir: RefCell<Option<(String, Vec<String>)>>,
 }
 
 impl App {
@@ -237,10 +253,20 @@ impl App {
             filter_lower: String::new(),
             cache_users: RefCell::new(None),
             cache_history: RefCell::new(None),
-            cache_detail: RefCell::new(None),
-            cache_perm: RefCell::new(None),
-            cache_inode: RefCell::new(None),
+            cache_detail: RefCell::new(Vec::new()),
+            cache_perm: RefCell::new(Vec::new()),
+            cache_perm_users: RefCell::new(None),
             cache_tm: RefCell::new(None),
+            db_conn: RefCell::new(None),
+            scroll_target: Cell::new(0),
+            scroll_team: Cell::new(0),
+            scroll_user: Cell::new(0),
+            scroll_hist: Cell::new(0),
+            scroll_detail: Cell::new(0),
+            scroll_tm: Cell::new(0),
+            scroll_settings: Cell::new(0),
+            scroll_scansync: Cell::new(0),
+            tab_cache_dir: RefCell::new(None),
         }
     }
 
@@ -260,20 +286,79 @@ impl App {
     }
 
     /// Drop all report caches so the next access re-queries report.db. Called
-    /// on target switch, view switch, scan completion, and filter changes.
+    /// on target switch, scan completion, and filter changes.
     fn invalidate_report_cache(&self) {
         self.cache_users.replace(None);
         self.cache_history.replace(None);
-        self.cache_detail.replace(None);
-        self.cache_perm.replace(None);
-        self.cache_inode.replace(None);
+        self.cache_detail.replace(Vec::new());
+        self.cache_perm.replace(Vec::new());
+        self.cache_perm_users.replace(None);
         self.cache_tm.replace(None);
+        self.db_conn.replace(None);
+    }
+
+    /// Light cache invalidate for sub-view switches on the same target.
+    /// Keeps `cache_users`, `cache_history`, and `db_conn` — there's no
+    /// need to re-query the full user list just to switch from Detail→Inode.
+    fn invalidate_view_cache(&self) {
+        self.cache_detail.replace(Vec::new());
+        self.cache_perm.replace(Vec::new());
+        self.cache_perm_users.replace(None);
+        self.cache_tm.replace(None);
+    }
+
+    /// Get or open a persistent SQLite connection to the current target's
+    /// report.db. The connection is cached and reused until the target changes.
+    fn get_db_conn(&self) -> Option<std::cell::Ref<'_, rusqlite::Connection>> {
+        let target = self.current_target_name()?;
+        {
+            let cache = self.db_conn.borrow();
+            if cache.as_ref().map(|(t, _)| t == &target).unwrap_or(false) {
+                return None; // signal: already open, use Ref::map
+            }
+        }
+        let db_path = current_report_db(self)?;
+        let conn = rusqlite::Connection::open(&db_path).ok()?;
+        self.db_conn.replace(Some((target, conn)));
+        None // signal: just opened
+    }
+}
+
+/// Open or reuse the current target's report.db connection, calling `f` with it.
+/// Avoids the RefCell borrow issues of returning a Ref.
+fn with_db_conn<T>(app: &App, f: impl FnOnce(&rusqlite::Connection) -> T) -> Option<T> {
+    app.get_db_conn();
+    let cache = app.db_conn.borrow();
+    cache.as_ref().map(|(_, conn)| f(conn))
+}
+
+/// Return the visible window of `items` for the given area, and the adjusted
+/// selection index for the window. The `scroll` Cell tracks the top-of-window
+/// offset and is updated so `sel` stays on screen.
+fn visible_slice<T: Clone>(items: &[T], sel: usize, scroll: &Cell<usize>, area: Rect) -> (Vec<T>, usize) {
+    let vis = (area.height.saturating_sub(2)).max(1) as usize;
+    let total = items.len();
+    let mut off = scroll.get();
+    if off > sel { off = sel; }
+    if sel >= off + vis { off = sel.saturating_sub(vis.saturating_sub(1)); }
+    if total > 0 && off + vis > total { off = total.saturating_sub(vis); }
+    scroll.set(off);
+    let end = (off + vis).min(total);
+    if off >= end { return (Vec::new(), 0); }
+    let adj_sel = if sel >= off && sel < end { sel - off } else { 0 };
+    (items[off..end].to_vec(), adj_sel)
+}
+
+impl App {
+    /// True while a local scan is still running (not yet finished).
+    fn is_scanning(&self) -> bool {
+        self.scan.as_ref().map(|r| !r.all_finished()).unwrap_or(false)
     }
 
     /// Sync `filter_lower` when `filter` changes (typed char, backspace, clear).
     fn on_filter_changed(&mut self) {
         self.filter_lower = self.filter.to_lowercase();
-        self.invalidate_report_cache();
+        self.invalidate_view_cache();
     }
 
     /// Name of the currently selected target, if any.
@@ -643,16 +728,24 @@ fn is_path_input(kind: &InputKind) -> bool {
 }
 
 fn handle_browse_key(app: &mut App, key: event::KeyEvent) {
-    // While a filter is being typed, global keys (q/Esc/digits/Tab) must NOT
-    // fire — they are text for the filter. Route straight to the tab handler,
-    // which owns the filter-input state.
+    // While a filter is being typed, global navigation keys (q/Esc/Tab/digits/r/R)
+    // still work — they clear the filter and perform their action. Only text
+    // editing (chars, Backspace, Enter) is forwarded to the tab handler.
     if app.filtering {
-        match app.tab {
-            Tab::TeamsUsers => browse_teams_users(app, key),
-            Tab::Output => browse_output(app, key),
-            _ => app.filtering = false, // no filter on other tabs; drop the flag
+        match key.code {
+            // Filter-editing keys — forward to tab handler for context-aware reset.
+            KeyCode::Enter => { app.filtering = false; return; }
+            KeyCode::Backspace | KeyCode::Char(_) => {
+                match app.tab {
+                    Tab::TeamsUsers => browse_teams_users(app, key),
+                    Tab::Output => browse_output(app, key),
+                    _ => app.filtering = false,
+                }
+                return;
+            }
+            // All other keys: clear filter first, then fall through to global handling.
+            _ => app.clear_filter(),
         }
-        return;
     }
     // Global keys.
     match key.code {
@@ -737,6 +830,11 @@ fn prev_tab(t: Tab) -> Tab {
 }
 
 fn browse_targets(app: &mut App, key: event::KeyEvent) {
+    let editing = matches!(key.code, KeyCode::Char('a' | 'e' | 's' | 'p' | 'd'));
+    if editing && app.is_scanning() {
+        app.status = "Scan in progress — wait until it finishes before editing.".into();
+        return;
+    }
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => { if app.target_sel > 0 { app.target_sel -= 1; app.team_sel = 0; app.user_sel = 0; } }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -763,9 +861,11 @@ fn browse_targets(app: &mut App, key: event::KeyEvent) {
         }
         KeyCode::Char('d') => {
             if let Some(name) = app.current_target_name() {
+                let team_count = app.cfg.targets.get(app.target_sel).map(|t| t.teams.len()).unwrap_or(0);
+                let user_count = app.cfg.targets.get(app.target_sel).map(|t| t.users.len()).unwrap_or(0);
                 app.mode = Mode::Confirm {
                     action: ConfirmAction::DeleteTarget(name.clone()),
-                    prompt: format!("Delete target '{}' and its file? (y/n)", name),
+                    prompt: format!("Delete target '{}' ({} teams, {} users)? (y/n)", name, team_count, user_count),
                 };
             }
         }
@@ -777,6 +877,11 @@ fn browse_targets(app: &mut App, key: event::KeyEvent) {
 fn browse_teams_users(app: &mut App, key: event::KeyEvent) {
     if app.current_target_name().is_none() {
         app.status = "No target selected — add one on the Targets tab first.".into();
+        return;
+    }
+    let editing = matches!(key.code, KeyCode::Char('a' | 'd' | 'u' | 'x'));
+    if editing && app.is_scanning() {
+        app.status = "Scan in progress — wait until it finishes before editing.".into();
         return;
     }
     // ── Filter-input mode: keystrokes edit the user filter. ──
@@ -818,9 +923,16 @@ fn browse_teams_users(app: &mut App, key: event::KeyEvent) {
         KeyCode::Char('a') => begin_input(app, InputKind::NewTeam, "New team name:", ""),
         KeyCode::Char('d') => {
             if let Some(team) = app.current_team_name() {
+                let user_count = match app.cfg.targets.get(app.target_sel) {
+                    Some(tgt) => match tgt.teams.get(app.team_sel) {
+                        Some(tm) => tgt.users.iter().filter(|u| u.team_id == tm.team_id).count(),
+                        None => 0,
+                    },
+                    None => 0,
+                };
                 app.mode = Mode::Confirm {
                     action: ConfirmAction::DeleteTeam(team.clone()),
-                    prompt: format!("Delete team '{}' and its users? (y/n)", team),
+                    prompt: format!("Delete team '{}' ({} users)? (y/n)", team, user_count),
                 };
             }
         }
@@ -835,9 +947,10 @@ fn browse_teams_users(app: &mut App, key: event::KeyEvent) {
         KeyCode::Char('x') => {
             let users = app.filtered_team_users();
             if let Some(uname) = users.get(app.user_sel).cloned() {
+                let team = app.current_team_name().unwrap_or_default();
                 app.mode = Mode::Confirm {
                     action: ConfirmAction::DeleteUser(uname.clone()),
-                    prompt: format!("Remove user '{}'? (y/n)", uname),
+                    prompt: format!("Remove user '{}' from team '{}'? (y/n)", uname, team),
                 };
             }
         }
@@ -850,6 +963,11 @@ fn browse_teams_users(app: &mut App, key: event::KeyEvent) {
 fn browse_scansync(app: &mut App, key: event::KeyEvent) {
     if app.current_target_name().is_none() {
         app.status = "No target selected — add one on the Targets tab first.".into();
+        return;
+    }
+    let editing = matches!(key.code, KeyCode::Enter | KeyCode::Char('e'));
+    if editing && app.is_scanning() {
+        app.status = "Scan in progress — wait until it finishes before editing.".into();
         return;
     }
     match key.code {
@@ -944,10 +1062,7 @@ fn ensure_report_users(app: &App) {
     let target = app.current_target_name().unwrap_or_default();
     let stale = app.cache_users.borrow().as_ref().map(|(t, _)| *t != target).unwrap_or(true);
     if !stale { return; }
-    let users = match current_report_db(app) {
-        Some(db) => crate::query_report_users(&db),
-        None => Vec::new(),
-    };
+    let users = with_db_conn(app, |conn| crate::query_report_users_conn(conn)).unwrap_or_default();
     app.cache_users.replace(Some((target, users)));
 }
 
@@ -960,14 +1075,34 @@ fn cached_report_users(app: &App) -> Vec<crate::ReportUser> {
     }
 }
 
+fn ensure_perm_users(app: &App) {
+    let target = app.current_target_name().unwrap_or_default();
+    let stale = app.cache_perm_users.borrow().as_ref().map(|(t, _)| *t != target).unwrap_or(true);
+    if !stale { return; }
+    let all_users = cached_report_users(app);
+    let filtered = with_db_conn(app, |conn| crate::filter_users_with_perm_issues(conn, &all_users)).unwrap_or_default();
+    app.cache_perm_users.replace(Some((target, filtered)));
+}
+
+fn cached_perm_users(app: &App) -> Vec<crate::ReportUser> {
+    ensure_perm_users(app);
+    let cache = app.cache_perm_users.borrow();
+    match cache.as_ref() {
+        Some((_, users)) => users.clone(),
+        None => Vec::new(),
+    }
+}
+
+/// `cached_perm_users` narrowed by the active filter.
+fn filtered_perm_users(app: &App) -> Vec<crate::ReportUser> {
+    cached_perm_users(app).into_iter().filter(|u| app.matches_filter(&u.username)).collect()
+}
+
 fn ensure_history(app: &App) {
     let target = app.current_target_name().unwrap_or_default();
     let stale = app.cache_history.borrow().as_ref().map(|(t, _)| *t != target).unwrap_or(true);
     if !stale { return; }
-    let snaps = match current_report_db(app) {
-        Some(db) => crate::query_history(&db, 60),
-        None => Vec::new(),
-    };
+    let snaps = with_db_conn(app, |conn| crate::query_history_conn(conn, 60)).unwrap_or_default();
     app.cache_history.replace(Some((target, snaps)));
 }
 
@@ -982,74 +1117,52 @@ fn cached_history(app: &App) -> Vec<crate::HistorySnapshot> {
 
 fn ensure_user_detail(app: &App, username: &str) {
     let target = app.current_target_name().unwrap_or_default();
-    let stale = app.cache_detail.borrow().as_ref().map(|(t, u, _)| *t != target || u != username).unwrap_or(true);
-    if !stale { return; }
-    let detail = match current_report_db(app) {
-        Some(db) => crate::query_user_detail(&db, username, 15),
-        None => None,
-    };
+    let mut cache = app.cache_detail.borrow_mut();
+    if let Some(pos) = cache.iter().position(|(t, u, _)| *t == target && u == username) {
+        if pos != 0 { let e = cache.remove(pos); cache.insert(0, e); }
+        return;
+    }
+    let detail = with_db_conn(app, |conn| crate::query_user_detail_conn(conn, username, 10)).flatten();
     if let Some(d) = detail {
-        app.cache_detail.replace(Some((target, username.to_string(), d)));
-    } else {
-        app.cache_detail.replace(None);
+        cache.insert(0, (target, username.to_string(), d));
+        cache.truncate(10);
     }
 }
 
 fn cached_user_detail(app: &App, username: &str) -> Option<crate::UserDetail> {
     ensure_user_detail(app, username);
-    let cache = app.cache_detail.borrow();
-    cache.as_ref().map(|(_, _, d)| d.clone())
+    let target = app.current_target_name().unwrap_or_default();
+    app.cache_detail.borrow().iter()
+        .find(|(t, u, _)| *t == target && u == username)
+        .map(|(_, _, d)| d.clone())
 }
 
 fn ensure_user_perm(app: &App, username: &str) {
     let target = app.current_target_name().unwrap_or_default();
-    let stale = app.cache_perm.borrow().as_ref().map(|(t, u, _)| *t != target || u != username).unwrap_or(true);
-    if !stale { return; }
-    let (total, issues) = match current_report_db(app) {
-        Some(db) => crate::query_user_permissions(&db, username, 200),
-        None => (0, Vec::new()),
-    };
-    app.cache_perm.replace(Some((target, username.to_string(), (total, issues))));
+    let mut cache = app.cache_perm.borrow_mut();
+    if let Some(pos) = cache.iter().position(|(t, u, ..)| *t == target && u == username) {
+        if pos != 0 { let e = cache.remove(pos); cache.insert(0, e); }
+        return;
+    }
+    let (total, issues) = with_db_conn(app, |conn| crate::query_user_permissions_conn(conn, username, 1000)).unwrap_or((0, Vec::new()));
+    cache.insert(0, (target, username.to_string(), total, issues));
+    cache.truncate(10);
 }
 
 fn cached_user_perm(app: &App, username: &str) -> (i64, Vec<crate::PermIssue>) {
     ensure_user_perm(app, username);
-    let cache = app.cache_perm.borrow();
-    match cache.as_ref() {
-        Some((_, _, p)) => p.clone(),
-        None => (0, Vec::new()),
-    }
-}
-
-fn ensure_user_inode(app: &App, username: &str) {
     let target = app.current_target_name().unwrap_or_default();
-    let stale = app.cache_inode.borrow().as_ref().map(|(t, u, _)| *t != target || u != username).unwrap_or(true);
-    if !stale { return; }
-    let (files, dirs, items) = match current_report_db(app) {
-        Some(db) => crate::query_user_inode(&db, username, 100),
-        None => (0, 0, Vec::new()),
-    };
-    app.cache_inode.replace(Some((target, username.to_string(), (files, dirs, items))));
-}
-
-fn cached_user_inode(app: &App, username: &str) -> (i64, i64, Vec<crate::InodeDir>) {
-    ensure_user_inode(app, username);
-    let cache = app.cache_inode.borrow();
-    match cache.as_ref() {
-        Some((_, _, i)) => i.clone(),
-        None => (0, 0, Vec::new()),
-    }
+    app.cache_perm.borrow().iter()
+        .find(|(t, u, ..)| *t == target && u == username)
+        .map(|(_, _, t, i)| (*t, i.clone()))
+        .unwrap_or((0, Vec::new()))
 }
 
 fn ensure_tm_children(app: &App) {
     let target = app.current_target_name().unwrap_or_default();
     let node = match app.tm_stack.last() {
-        Some((id, _)) => *id,
-        None => {
-            // Root node: need to query root id to build the cache key.
-            // Use 0 as a sentinel; the loader below resolves root properly.
-            0
-        }
+        Some((id, _, _)) => *id,
+        None => 0,
     };
     let stale = app.cache_tm.borrow().as_ref().map(|(t, n, _)| *t != target || *n != node).unwrap_or(true);
     if !stale { return; }
@@ -1068,15 +1181,15 @@ fn cached_tm_children(app: &App) -> Vec<crate::TreeEntry> {
 
 /// Raw DB load for treemap children (no cache — used by the ensurer).
 fn load_tm_children_raw(app: &App) -> Vec<crate::TreeEntry> {
-    let Some(db) = current_report_db(app) else { return Vec::new() };
-    let Ok(conn) = rusqlite::Connection::open(&db) else { return Vec::new() };
-    let Some(tp) = crate::treemap_prefix(&conn) else { return Vec::new() };
-    let node = match app.tm_stack.last() {
-        Some((id, _)) => *id,
-        None => match crate::treemap_root(&conn, tp) { Some(r) => r, None => return Vec::new() },
-    };
-    let all = crate::treemap_children(&conn, tp, node, 500);
-    all.into_iter().filter(|e| app.matches_filter(&e.name)).collect()
+    with_db_conn(app, |conn| {
+        let Some(tp) = crate::treemap_prefix(conn) else { return Vec::new() };
+        let node = match app.tm_stack.last() {
+            Some((id, _, _)) => *id,
+            None => match crate::treemap_root(conn, tp) { Some(r) => r, None => return Vec::new() },
+        };
+        let all = crate::treemap_children(conn, tp, node, 2000);
+        all.into_iter().filter(|e| app.matches_filter(&e.name)).collect()
+    }).unwrap_or_default()
 }
 
 /// Export usage txt for the current target from the Output/Detail view.
@@ -1167,11 +1280,11 @@ fn browse_output(app: &mut App, key: event::KeyEvent) {
             return;
         }
         // Switch sub-view (each resets the filter — it's list-specific).
-        KeyCode::Char('h') => { app.output_view = OutputView::History; app.hist_sel = 0; app.clear_filter(); app.invalidate_report_cache(); return; }
-        KeyCode::Char('d') => { app.output_view = OutputView::Detail; app.detail_sel = 0; app.clear_filter(); app.invalidate_report_cache(); return; }
-        KeyCode::Char('p') => { app.output_view = OutputView::Permission; app.detail_sel = 0; app.clear_filter(); app.invalidate_report_cache(); return; }
-        KeyCode::Char('i') => { app.output_view = OutputView::Inode; app.detail_sel = 0; app.clear_filter(); app.invalidate_report_cache(); return; }
-        KeyCode::Char('t') => { app.output_view = OutputView::Treemap; reset_treemap(app); app.clear_filter(); app.invalidate_report_cache(); return; }
+        KeyCode::Char('h') => { app.output_view = OutputView::History; app.hist_sel = 0; app.clear_filter(); app.invalidate_view_cache(); return; }
+        KeyCode::Char('d') => { app.output_view = OutputView::Detail; app.detail_sel = 0; app.clear_filter(); app.invalidate_view_cache(); return; }
+        KeyCode::Char('p') => { app.output_view = OutputView::Permission; app.detail_sel = 0; app.clear_filter(); app.invalidate_view_cache(); return; }
+        KeyCode::Char('i') => { app.output_view = OutputView::Inode; app.detail_sel = 0; app.clear_filter(); app.invalidate_view_cache(); return; }
+        KeyCode::Char('t') => { app.output_view = OutputView::Treemap; reset_treemap(app); app.clear_filter(); app.invalidate_view_cache(); return; }
         _ => {}
     }
     match app.output_view {
@@ -1183,8 +1296,8 @@ fn browse_output(app: &mut App, key: event::KeyEvent) {
                 _ => {}
             }
         }
-        // Detail / Permission / Inode all navigate the same (filtered) user list.
-        OutputView::Detail | OutputView::Permission | OutputView::Inode => {
+        // Detail / Inode navigate the full (filtered) user list.
+        OutputView::Detail | OutputView::Inode => {
             let report_users = filtered_report_users(app);
             let nusers = report_users.len();
             match key.code {
@@ -1202,6 +1315,17 @@ fn browse_output(app: &mut App, key: event::KeyEvent) {
                 _ => {}
             }
         }
+        // Permission navigates only users with perm issues.
+        OutputView::Permission => {
+            let perm_users = filtered_perm_users(app);
+            let nusers = perm_users.len();
+            match key.code {
+                KeyCode::Char('/') => { app.filtering = true; app.detail_sel = 0; }
+                KeyCode::Up | KeyCode::Char('k') => { if app.detail_sel > 0 { app.detail_sel -= 1; } }
+                KeyCode::Down | KeyCode::Char('j') => { if app.detail_sel + 1 < nusers { app.detail_sel += 1; } }
+                _ => {}
+            }
+        }
         OutputView::Treemap => {
             let children = load_tm_children(app);
             match key.code {
@@ -1210,12 +1334,20 @@ fn browse_output(app: &mut App, key: event::KeyEvent) {
                 KeyCode::Down | KeyCode::Char('j') => { if app.tm_sel + 1 < children.len() { app.tm_sel += 1; } }
                 KeyCode::Enter | KeyCode::Right => {
                     if let Some(entry) = children.get(app.tm_sel) {
-                        app.tm_stack.push((entry.id, entry.name.clone()));
-                        app.tm_sel = 0;
-                        app.clear_filter();
-                        app.cache_tm.replace(None); // invalidate tm cache for new node
-                        if load_tm_children(app).is_empty() {
-                            app.tm_stack.pop();
+                        let entry_id = entry.id;
+                        let entry_name = entry.name.clone();
+                        let entry_size = entry.size;
+                        let has_children = with_db_conn(app, |conn| {
+                            let tp = crate::treemap_prefix(conn)?;
+                            let kids = crate::treemap_children(conn, tp, entry_id, 1);
+                            Some(!kids.is_empty())
+                        }).flatten().unwrap_or(false);
+                        if has_children {
+                            app.tm_stack.push((entry_id, entry_name, entry_size));
+                            app.tm_sel = 0;
+                            app.clear_filter();
+                            app.cache_tm.replace(None);
+                        } else {
                             app.status = "Leaf directory (no sub-dirs).".into();
                         }
                     }
@@ -1223,6 +1355,7 @@ fn browse_output(app: &mut App, key: event::KeyEvent) {
                 KeyCode::Backspace | KeyCode::Left => {
                     if app.tm_stack.pop().is_some() { app.tm_sel = 0; app.clear_filter(); app.cache_tm.replace(None); }
                 }
+                KeyCode::Home => { reset_treemap(app); app.clear_filter(); }
                 _ => {}
             }
         }
@@ -1241,7 +1374,14 @@ fn browse_settings(app: &mut App, key: event::KeyEvent) {
                 3 => begin_input(app, InputKind::SetNfsParallel, "nfs_parallel:", &app.cfg.nfs_parallel.to_string()),
                 4 => begin_input(app, InputKind::SetHddParallel, "hdd_parallel:", &app.cfg.hdd_parallel.to_string()),
                 5 => begin_input(app, InputKind::SetSsdParallel, "ssd_parallel (0=unlimited):", &app.cfg.ssd_parallel.to_string()),
-                6 => begin_input(app, InputKind::SetLsfEnabled, "lsf.enabled (yes/no):", &bool_str(&app.cfg.lsf.enabled)),
+                6 => {
+                    app.cfg.lsf.enabled = !app.cfg.lsf.enabled;
+                    app.bs_available = crate::which_in_path(&app.cfg.lsf.cmd).is_some();
+                    match save_globals(app) {
+                        Ok(_) => app.status = format!("lsf.enabled = {}", bool_str(&app.cfg.lsf.enabled)),
+                        Err(e) => app.status = format!("Error: {}", e),
+                    }
+                }
                 7 => begin_input(app, InputKind::SetLsfCmd, "lsf.cmd (submit wrapper):", &app.cfg.lsf.cmd.clone()),
                 8 => begin_input(app, InputKind::SetLsfOs, "lsf.os (e.g. RHEL8, empty=omit):", &app.cfg.lsf.os.clone()),
                 9 => begin_input(app, InputKind::SetLsfMemMb, "lsf.mem_mb (0=omit):", &app.cfg.lsf.mem_mb.to_string()),
@@ -1260,9 +1400,34 @@ fn handle_input_key(app: &mut App, key: event::KeyEvent) {
         KeyCode::Tab => try_complete_path(app),
         KeyCode::Backspace => {
             if let Mode::Input { buf, completions, .. } = &mut app.mode { buf.pop(); completions.clear(); }
+            app.tab_cache_dir.replace(None);
+        }
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+A: jump to start (no-op for single-line input without cursor pos)
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+E: jump to end (no-op for single-line input without cursor pos)
+        }
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Mode::Input { buf, completions, .. } = &mut app.mode {
+                completions.clear();
+                let trimmed_len = buf.trim_end().len();
+                buf.truncate(trimmed_len);
+                if let Some(pos) = buf.rfind(char::is_whitespace) {
+                    buf.truncate(pos + 1);
+                } else {
+                    buf.clear();
+                }
+            }
+            app.tab_cache_dir.replace(None);
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Mode::Input { buf, completions, .. } = &mut app.mode { buf.clear(); completions.clear(); }
+            app.tab_cache_dir.replace(None);
         }
         KeyCode::Char(c) => {
             if let Mode::Input { buf, completions, .. } = &mut app.mode { buf.push(c); completions.clear(); }
+            app.tab_cache_dir.replace(None);
         }
         _ => {}
     }
@@ -1304,19 +1469,38 @@ fn try_complete_path(app: &mut App) {
     };
     let list_dir = if dir.is_empty() { ".".to_string() } else { dir.clone() };
 
-    // Collect matching entries: directories always, files too when allow_files.
+    // Use cached directory listing when the directory hasn't changed.
     let mut names: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&list_dir) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if !name.starts_with(&prefix) { continue; }
-            let is_dir = e.metadata().map(|m| m.is_dir())
-                .or_else(|_| e.file_type().map(|t| t.is_dir()))
-                .unwrap_or(false);
-            if is_dir || allow_files { names.push(if is_dir { format!("{}/", name) } else { name }); }
+    {
+        let mut cache = app.tab_cache_dir.borrow_mut();
+        if cache.as_ref().map(|(d, _)| d != &list_dir).unwrap_or(true) {
+            // Read the directory and cache the sorted names.
+            let mut entries: Vec<String> = Vec::new();
+            if let Ok(dir_entries) = std::fs::read_dir(&list_dir) {
+                for e in dir_entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    entries.push(if is_dir { format!("{}/", name) } else { name });
+                }
+            }
+            entries.sort();
+            *cache = Some((list_dir.clone(), entries));
+        }
+        // Filter cached entries by the typed prefix.
+        if let Some((_, cached)) = cache.as_ref() {
+            for n in cached {
+                if !n.starts_with(&prefix) { continue; }
+                if n.ends_with('/') || allow_files {
+                    names.push(n.clone());
+                }
+            }
         }
     }
-    names.sort();
+
+    if allow_files {
+        // For @file completions, also filter directory-only entries out.
+        // (already handled by the ends_with('/') || allow_files check above)
+    }
 
     let head = buf[..region_start].to_string();
     if names.is_empty() {
@@ -1360,13 +1544,28 @@ fn longest_common_prefix(items: &[String]) -> String {
 /// stores unambiguous paths regardless of where duscan is later run.
 fn to_absolute(p: &str) -> String {
     if p.is_empty() { return String::new(); }
-    let path = std::path::Path::new(p);
+    let expanded = if p.starts_with('~') {
+        if let Ok(home) = std::env::var("HOME") {
+            if p.len() == 1 {
+                home
+            } else if p.starts_with("~/") {
+                format!("{}/{}", home, &p[2..])
+            } else {
+                p.to_string()
+            }
+        } else {
+            p.to_string()
+        }
+    } else {
+        p.to_string()
+    };
+    let path = std::path::Path::new(&expanded);
     if path.is_absolute() {
-        return p.to_string();
+        return expanded;
     }
     std::path::absolute(path)
         .map(|ab| ab.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| p.to_string())
+        .unwrap_or(expanded)
 }
 
 /// Absolute-ify the `@file` tokens in an add-users buffer, leaving literal
@@ -1453,19 +1652,23 @@ fn commit_input(app: &mut App) {
         InputKind::SetOutputDir => { app.cfg.output_dir = buf.clone(); save_globals(app).map(|_| "output_dir updated".into()) }
         InputKind::SetWorkers => { app.cfg.workers = buf.clone(); save_globals(app).map(|_| "workers updated".into()) }
         InputKind::SetMaxParallel => match buf.parse::<i64>() {
-            Ok(n) => { app.cfg.max_parallel_devices = n.max(0); save_globals(app).map(|_| "max_parallel_devices updated".into()) }
+            Ok(n) if n >= 0 => { app.cfg.max_parallel_devices = n; save_globals(app).map(|_| "max_parallel_devices updated".into()) }
+            Ok(_) => Err("must be >= 0".into()),
             Err(_) => Err("must be a number".into()),
         },
         InputKind::SetNfsParallel => match buf.parse::<i64>() {
-            Ok(n) => { app.cfg.nfs_parallel = n.max(1); save_globals(app).map(|_| "nfs_parallel updated".into()) }
+            Ok(n) if n >= 1 => { app.cfg.nfs_parallel = n; save_globals(app).map(|_| "nfs_parallel updated".into()) }
+            Ok(_) => Err("must be >= 1".into()),
             Err(_) => Err("must be a number".into()),
         },
         InputKind::SetHddParallel => match buf.parse::<i64>() {
-            Ok(n) => { app.cfg.hdd_parallel = n.max(1); save_globals(app).map(|_| "hdd_parallel updated".into()) }
+            Ok(n) if n >= 1 => { app.cfg.hdd_parallel = n; save_globals(app).map(|_| "hdd_parallel updated".into()) }
+            Ok(_) => Err("must be >= 1".into()),
             Err(_) => Err("must be a number".into()),
         },
         InputKind::SetSsdParallel => match buf.parse::<i64>() {
-            Ok(n) => { app.cfg.ssd_parallel = n.max(0); save_globals(app).map(|_| "ssd_parallel updated".into()) }
+            Ok(n) if n >= 0 => { app.cfg.ssd_parallel = n; save_globals(app).map(|_| "ssd_parallel updated".into()) }
+            Ok(_) => Err("must be >= 0".into()),
             Err(_) => Err("must be a number".into()),
         },
         // Per-target Scan/Sync fields (empty clears to None = default/disabled).
@@ -1498,11 +1701,6 @@ fn commit_input(app: &mut App) {
             edit_current_target(app, |t| t.webhook_url = v).map(|n| format!("Updated webhook_url of '{}'", n))
         }
         // LSF settings.
-        InputKind::SetLsfEnabled => {
-            let v = matches!(buf.as_str(), "yes" | "y" | "true" | "1");
-            app.cfg.lsf.enabled = v;
-            save_globals(app).map(|_| format!("lsf.enabled = {}", bool_str(&v)))
-        }
         InputKind::SetLsfCmd => {
             app.cfg.lsf.cmd = buf.clone();
             app.bs_available = crate::which_in_path(&app.cfg.lsf.cmd).is_some();
@@ -1513,7 +1711,8 @@ fn commit_input(app: &mut App) {
             save_globals(app).map(|_| if buf.is_empty() { "lsf.os cleared".into() } else { format!("lsf.os = {}", buf) })
         }
         InputKind::SetLsfMemMb => match buf.parse::<i64>() {
-            Ok(n) => { app.cfg.lsf.mem_mb = n.max(0); save_globals(app).map(|_| format!("lsf.mem_mb = {}", n.max(0))) }
+            Ok(n) if n >= 0 => { app.cfg.lsf.mem_mb = n; save_globals(app).map(|_| format!("lsf.mem_mb = {}", n)) }
+            Ok(_) => Err("must be >= 0".into()),
             Err(_) => Err("must be a number".into()),
         },
         InputKind::SetLsfQueue => {
@@ -1541,7 +1740,9 @@ fn edit_current_target(app: &mut App, f: impl FnOnce(&mut crate::config::Target)
 /// Parse an optional i64: empty string → None, otherwise a non-negative number.
 fn parse_opt_i64(s: &str) -> Result<Option<i64>, String> {
     if s.is_empty() { return Ok(None); }
-    s.parse::<i64>().map(Some).map_err(|_| "must be a number or empty".into())
+    let n: i64 = s.parse().map_err(|_| String::from("must be a number"))?;
+    if n < 0 { return Err(String::from("must be >= 0")); }
+    Ok(Some(n))
 }
 
 /// Add users to a team, expanding a leading `@file` token via the same reader
@@ -1588,6 +1789,10 @@ fn handle_confirm_key(app: &mut App, key: event::KeyEvent) {
             };
             app.clamp_selections();
             app.status = match res { Ok(m) => m, Err(e) => format!("Error: {}", e) };
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.mode = Mode::Browse;
+            app.status = "Cancelled.".into();
         }
         _ => { app.mode = Mode::Browse; app.status = "Cancelled.".into(); }
     }
@@ -1792,7 +1997,7 @@ fn footer_hint(app: &App) -> &'static str {
         Mode::Input { kind, .. } if is_path_input(kind) => "Type value · Tab complete dir · Enter confirm · Esc cancel",
         Mode::Input { kind, .. } if matches!(kind, InputKind::AddUsers { .. }) => "Type users (alice,bob or @file) · Tab complete @file · Enter confirm · Esc cancel",
         Mode::Input { .. } => "Type value · Enter confirm · Esc cancel",
-        Mode::Confirm { .. } => "y confirm · any other key cancel",
+        Mode::Confirm { .. } => "y confirm · n cancel · any other key cancel",
         Mode::Browse => match app.tab {
             Tab::Targets => "↑↓ move · a add · e path · s end-scan · p purge · d delete · r scan · R scan-all · ↹ tab · q quit",
             Tab::TeamsUsers => "[ ] target · ↑↓ team · ←→ user · / search · a add-team · d del-team · u add-users · x del-user · q quit",
@@ -1802,7 +2007,7 @@ fn footer_hint(app: &App) -> &'static str {
                 OutputView::Detail => "[ ] target · h/d/p/i/t · / search · ↑↓ user · x export · X export-all · r/R scan · q quit",
                 OutputView::Permission => "[ ] target · h/d/p/i/t · / search · ↑↓ user · perm issues · r/R scan · q quit",
                 OutputView::Inode => "[ ] target · h/d/p/i/t · / search · ↑↓ user · inode counts · r/R scan · q quit",
-                OutputView::Treemap => "[ ] target · h/d/p/i/t · / search · ↑↓ move · Enter open · Bksp up · q quit",
+                OutputView::Treemap => "[ ] target · h/d/p/i/t · / search · ↑↓ move · Enter open · Bksp up · Home root · q quit",
             },
             Tab::Settings => "↑↓ move · Enter/e edit · r/R scan · ↹ tab · q quit",
         },
@@ -1825,7 +2030,7 @@ fn draw_targets(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(hint, area);
         return;
     }
-    let items: Vec<ListItem> = app.cfg.targets.iter().map(|t| {
+    let all: Vec<ListItem> = app.cfg.targets.iter().map(|t| {
         let end = t.end_scan.clone().unwrap_or_else(|| "-".into());
         let purge = t.purge_time.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
         ListItem::new(format!(
@@ -1833,12 +2038,13 @@ fn draw_targets(frame: &mut Frame, app: &App, area: Rect) {
             t.name, t.path, t.teams.len(), t.users.len(), end, purge
         ))
     }).collect();
-
-    let list = List::new(items)
+    let (visible, adj_sel) = visible_slice(&all, app.target_sel, &app.scroll_target, area);
+    let has_vis = !visible.is_empty();
+    let list = List::new(visible)
         .block(block)
         .highlight_style(selected_style());
     let mut state = ListState::default();
-    if !app.cfg.targets.is_empty() { state.select(Some(app.target_sel)); }
+    if has_vis { state.select(Some(adj_sel)); }
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -1864,24 +2070,28 @@ fn draw_teams_users(frame: &mut Frame, app: &App, area: Rect) {
 
     // Left: teams of the current target (or a hint if there are none yet).
     let has_teams = app.cfg.targets.get(app.target_sel).map(|t| !t.teams.is_empty()).unwrap_or(false);
-    let team_items: Vec<ListItem> = match app.cfg.targets.get(app.target_sel) {
+    let team_all: Vec<ListItem> = match app.cfg.targets.get(app.target_sel) {
         Some(t) if has_teams => t.teams.iter().map(|tm| {
             let count = t.users.iter().filter(|u| u.team_id == tm.team_id).count();
             ListItem::new(format!("{:<20} ({} users)", tm.name, count))
         }).collect(),
         _ => vec![ListItem::new(Span::styled("Press  a  to add a team", Style::default().fg(Color::Cyan)))],
     };
-    let teams = List::new(team_items)
+    let (team_visible, team_adj) = if has_teams {
+        visible_slice(&team_all, app.team_sel, &app.scroll_team, cols[0])
+    } else {
+        (team_all, 0)
+    };
+    let teams = List::new(team_visible)
         .block(Block::default().borders(Borders::ALL).title(format!(" Teams — target: {} ", target_label)))
         .highlight_style(selected_style());
     let mut ts = ListState::default();
     if app.cfg.targets.get(app.target_sel).map(|t| !t.teams.is_empty()).unwrap_or(false) {
-        ts.select(Some(app.team_sel));
+        ts.select(Some(team_adj));
     }
     frame.render_stateful_widget(teams, cols[0], &mut ts);
 
     // Right: users of the selected team (filterable via `/`), or a hint if empty.
-    // Get filtered list once; total from the team's user count avoids iterating twice.
     let users = app.filtered_team_users();
     let total_users = app.cfg.targets.get(app.target_sel)
         .and_then(|tgt| tgt.teams.get(app.team_sel))
@@ -1890,7 +2100,7 @@ fn draw_teams_users(frame: &mut Frame, app: &App, area: Rect) {
             target.users.iter().filter(|u| u.team_id == tm.team_id).count()
         })
         .unwrap_or(0);
-    let user_items: Vec<ListItem> = if total_users == 0 {
+    let user_all: Vec<ListItem> = if total_users == 0 {
         if has_teams {
             vec![ListItem::new(Span::styled("Press  u  to add users (alice,bob or @file)", Style::default().fg(Color::Cyan)))]
         } else {
@@ -1900,18 +2110,22 @@ fn draw_teams_users(frame: &mut Frame, app: &App, area: Rect) {
         users.iter().map(|u| ListItem::new(u.clone())).collect()
     };
     let team_label = app.current_team_name().unwrap_or_else(|| "-".into());
-    // Title reflects the filter (shown/total) while it's active.
     let utitle = if app.filter.is_empty() && !app.filtering {
         format!(" Users — team: {} ", team_label)
     } else {
         let cursor = if app.filtering { "_" } else { "" };
         format!(" Users — team: {} ({}/{}) — /{}{} ", team_label, users.len(), total_users, app.filter, cursor)
     };
-    let ulist = List::new(user_items)
+    let (user_visible, user_adj) = if !users.is_empty() {
+        visible_slice(&user_all, app.user_sel, &app.scroll_user, cols[1])
+    } else {
+        (user_all, 0)
+    };
+    let ulist = List::new(user_visible)
         .block(Block::default().borders(Borders::ALL).title(utitle))
         .highlight_style(selected_style());
     let mut us = ListState::default();
-    if !users.is_empty() { us.select(Some(app.user_sel.min(users.len() - 1))); }
+    if !users.is_empty() { us.select(Some(user_adj)); }
     frame.render_stateful_widget(ulist, cols[1], &mut us);
 }
 
@@ -1981,22 +2195,25 @@ fn draw_out_history(frame: &mut Frame, app: &App, area: Rect) {
         empty_state(frame, area, "History", &["No history in this report.", "Press r to scan this target."]);
         return;
     }
-    let mut items: Vec<ListItem> = Vec::new();
+    let mut all: Vec<ListItem> = Vec::new();
     for s in &snaps {
         let pct = if s.used > 0 { s.used as f64 / s.total as f64 * 100.0 } else { 0.0 };
-        let head = format!("{}   used {} / {} ({:.1}%)   free {}",
-            fmt_date(s.scan_date), fmt_size(s.used), fmt_size(s.total), pct, fmt_size(s.available));
+        let head = format!("{}   used {} / {} ({:.1}%)   free {}   scanned {}",
+            fmt_date(s.scan_date), fmt_size(s.used), fmt_size(s.total), pct,
+            fmt_size(s.available), fmt_size(s.scanned_size));
         let mut lines = vec![Line::from(Span::styled(head, Style::default().fg(Color::White)))];
         for (name, size) in s.top_users.iter().take(5) {
             lines.push(Line::from(Span::styled(format!("      {:<16} {}", name, fmt_size(*size)), Style::default().fg(Color::DarkGray))));
         }
-        items.push(ListItem::new(lines));
+        all.push(ListItem::new(lines));
     }
-    let list = List::new(items)
+    let (visible, adj_sel) = visible_slice(&all, app.hist_sel, &app.scroll_hist, area);
+    let has_vis = !visible.is_empty();
+    let list = List::new(visible)
         .block(Block::default().borders(Borders::ALL).title(format!(" History ({} snapshots) ", snaps.len())))
         .highlight_style(selected_style());
     let mut st = ListState::default();
-    st.select(Some(app.hist_sel.min(snaps.len().saturating_sub(1))));
+    if has_vis { st.select(Some(adj_sel)); }
     frame.render_stateful_widget(list, area, &mut st);
 }
 
@@ -2061,16 +2278,19 @@ fn draw_user_column<'a>(
         empty_state(frame, cols[1], view_title, &[&format!("No user matches '{}'.", app.filter), "Esc to clear the filter."]);
         return None;
     }
-    let uitems: Vec<ListItem> = filtered.iter().map(|u| {
-        if u.has_team { ListItem::new(u.username.clone()) }
-        else { ListItem::new(Span::styled(format!("{}  (Other)", u.username), Style::default().fg(Color::DarkGray))) }
+    let all: Vec<ListItem> = filtered.iter().map(|u| {
+        let name = truncate(&u.username, 22);
+        if u.has_team { ListItem::new(name) }
+        else { ListItem::new(Span::styled(format!("{}  (Other)", name), Style::default().fg(Color::DarkGray))) }
     }).collect();
-    let ulist = List::new(uitems)
+    let sel = app.detail_sel.min(filtered.len().saturating_sub(1));
+    let (visible, adj_sel) = visible_slice(&all, sel, &app.scroll_detail, cols[0]);
+    let has_vis = !visible.is_empty();
+    let ulist = List::new(visible)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(selected_style());
-    let sel = app.detail_sel.min(filtered.len() - 1);
     let mut us = ListState::default();
-    us.select(Some(sel));
+    if has_vis { us.select(Some(adj_sel)); }
     frame.render_stateful_widget(ulist, cols[0], &mut us);
     Some((cols, filtered[sel].username.as_str()))
 }
@@ -2091,9 +2311,13 @@ fn draw_out_permission(frame: &mut Frame, app: &App, area: Rect) {
         empty_state(frame, area, "Permission", &["No report yet.", "Press r to scan this target first."]);
         return;
     };
-    let total_users = cached_report_users(app).len();
-    let filtered = filtered_report_users(app);
-    let Some((cols, uname)) = draw_user_column(frame, app, area, "Permission", &filtered, total_users) else { return };
+    let total_perm_users = cached_perm_users(app).len();
+    let filtered = filtered_perm_users(app);
+    if total_perm_users == 0 {
+        empty_state(frame, area, "Permission", &["No permission issues in this report.", "Every scanned path was accessible."]);
+        return;
+    }
+    let Some((cols, uname)) = draw_user_column(frame, app, area, "Permission", &filtered, total_perm_users) else { return };
 
     let (total, issues) = cached_user_perm(app, uname);
     if total == 0 {
@@ -2109,6 +2333,11 @@ fn draw_out_permission(frame: &mut Frame, app: &App, area: Rect) {
     for i in issues.iter() {
         lines.push(Line::from(format!("{:<8}  {:<20}  {}", i.item_type, i.error, i.path)));
     }
+    if (issues.len() as i64) < total {
+        lines.push(Line::from(Span::styled(
+            format!("  ... and {} more (use CLI for full list)", total - issues.len() as i64),
+            Style::default().fg(Color::DarkGray))));
+    }
     let para = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(format!(" Permission — {} ", uname)));
     frame.render_widget(para, cols[1]);
@@ -2123,23 +2352,28 @@ fn draw_out_inode(frame: &mut Frame, app: &App, area: Rect) {
     let filtered = filtered_report_users(app);
     let Some((cols, uname)) = draw_user_column(frame, app, area, "Inode", &filtered, total_users) else { return };
 
-    let (total_files, total_dirs, dirs) = cached_user_inode(app, uname);
-    if dirs.is_empty() {
+    let detail = cached_user_detail(app, uname);
+    let Some(d) = detail else {
         empty_state(frame, cols[1], "Inode",
-            &[&format!("No directory data for '{}'.", uname), "This user may have no files in the last scan."]);
+            &[&format!("No data for '{}'.", uname), "This user may have no files in the last scan."]);
         return;
-    }
-    let inodes = total_files + total_dirs;
-    let mut lines = vec![
-        Line::from(Span::styled(format!("{}  —  {} inodes ({} files + {} dirs)", uname, inodes, total_files, total_dirs),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
-        Line::from(Span::styled(format!("{:>9}  {:>9}  {}", "Files", "Size", "Directory"), Style::default().fg(Color::Yellow))),
+    };
+    let inodes = d.total_files + d.total_dirs;
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(format!("  {}", uname), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(format!("  Total inodes  : {}", inodes)),
+        Line::from(format!("    Files       : {}", d.total_files)),
+        Line::from(format!("    Directories : {}", d.total_dirs)),
+        Line::from(""),
+        Line::from(format!("  Total size    : {}", fmt_size(d.total_size))),
+        Line::from(""),
+        Line::from(Span::styled("  CLI: duscan detail --type inode --user <name>  for per-dir breakdown",
+            Style::default().fg(Color::DarkGray))),
     ];
-    for d in dirs.iter() {
-        lines.push(Line::from(format!("{:>9}  {:>9}  {}", d.files, fmt_size(d.size), d.path)));
-    }
     let para = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(format!(" Inode / file count — {} ", uname)));
+        .block(Block::default().borders(Borders::ALL).title(format!(" Inode — {} ", uname)));
     frame.render_widget(para, cols[1]);
 }
 
@@ -2170,9 +2404,14 @@ fn draw_out_treemap(frame: &mut Frame, app: &App, area: Rect) {
     // Breadcrumb: avoid intermediate Vec allocation by folding.
     let crumb: String = {
         let mut s = String::from("/");
-        for (i, (_, n)) in app.tm_stack.iter().enumerate() {
+        for (i, (_, n, _)) in app.tm_stack.iter().enumerate() {
             if i > 0 { s.push('/'); }
             s.push_str(n);
+        }
+        // Append the current node's total size if we're inside a directory.
+        if let Some((_, _, sz)) = app.tm_stack.last() {
+            use std::fmt::Write;
+            let _ = write!(s, "  ({})", fmt_size(*sz));
         }
         s
     };
@@ -2185,7 +2424,7 @@ fn draw_out_treemap(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     let maxsz = children.iter().map(|c| c.size).max().unwrap_or(1).max(1);
-    let items: Vec<ListItem> = children.iter().map(|c| {
+    let all: Vec<ListItem> = children.iter().map(|c| {
         let barlen = ((c.size as f64 / maxsz as f64) * 12.0).round() as usize;
         let bar = TM_BARS[barlen.min(12)];
         ListItem::new(format!("{:>9}  [{}]  {:<28}  {} files", fmt_size(c.size), bar, c.name, c.file_count))
@@ -2196,11 +2435,14 @@ fn draw_out_treemap(frame: &mut Frame, app: &App, area: Rect) {
         let cursor = if app.filtering { "_" } else { "" };
         format!(" Treemap — {} — /{}{} ", crumb, app.filter, cursor)
     };
-    let list = List::new(items)
+    let sel = app.tm_sel.min(children.len().saturating_sub(1));
+    let (visible, adj_sel) = visible_slice(&all, sel, &app.scroll_tm, area);
+    let has_vis = !visible.is_empty();
+    let list = List::new(visible)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(selected_style());
     let mut st = ListState::default();
-    st.select(Some(app.tm_sel.min(children.len().saturating_sub(1))));
+    if has_vis { st.select(Some(adj_sel)); }
     frame.render_stateful_widget(list, area, &mut st);
 }
 
@@ -2211,12 +2453,12 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(" [not found]", Style::default().fg(Color::Red))
     };
     let rows = [
-        format!("output_dir           = {}", app.cfg.output_dir),
-        format!("workers              = {}", app.cfg.workers),
-        format!("max_parallel_devices = {}", app.cfg.max_parallel_devices),
-        format!("nfs_parallel         = {}", app.cfg.nfs_parallel),
-        format!("hdd_parallel         = {}", app.cfg.hdd_parallel),
-        format!("ssd_parallel         = {}", app.cfg.ssd_parallel),
+        format!("output_dir           = {}  (default: reports)", app.cfg.output_dir),
+        format!("workers              = {}  (default: auto)", app.cfg.workers),
+        format!("max_parallel_devices = {}  (default: 0 = unlimited)", app.cfg.max_parallel_devices),
+        format!("nfs_parallel         = {}  (default: 64)", app.cfg.nfs_parallel),
+        format!("hdd_parallel         = {}  (default: 8)", app.cfg.hdd_parallel),
+        format!("ssd_parallel         = {}  (default: 0 = unlimited)", app.cfg.ssd_parallel),
     ];
     let lsf_rows = [
         Line::from(vec![
@@ -2228,15 +2470,18 @@ fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(format!("lsf.mem_mb           = {}", if app.cfg.lsf.mem_mb <= 0 { String::from("(omit)") } else { app.cfg.lsf.mem_mb.to_string() })),
         Line::from(format!("lsf.queue            = {}", if app.cfg.lsf.queue.is_empty() { String::from("(none)") } else { app.cfg.lsf.queue.clone() })),
     ];
-    let mut items: Vec<ListItem> = rows.iter().cloned().map(ListItem::new).collect();
+    let mut all: Vec<ListItem> = rows.iter().cloned().map(ListItem::new).collect();
     for r in &lsf_rows {
-        items.push(ListItem::new(r.clone()));
+        all.push(ListItem::new(r.clone()));
     }
-    let list = List::new(items)
+    let sel = app.settings_sel.min(all.len().saturating_sub(1));
+    let (visible, adj_sel) = visible_slice(&all, sel, &app.scroll_settings, area);
+    let has_vis = !visible.is_empty();
+    let list = List::new(visible)
         .block(Block::default().borders(Borders::ALL).title(" Global settings "))
         .highlight_style(selected_style());
     let mut state = ListState::default();
-    state.select(Some(app.settings_sel));
+    if has_vis { state.select(Some(adj_sel)); }
     frame.render_stateful_widget(list, area, &mut state);
 }
 
@@ -2264,12 +2509,15 @@ fn draw_scansync(frame: &mut Frame, app: &App, area: Rect) {
         format!("webhook_url   = {}", dash(&t.webhook_url)),
         format!("sync_pass     = {}", opt_bool_str(t.sync_pass)),
     ];
-    let items: Vec<ListItem> = rows.iter().cloned().map(ListItem::new).collect();
-    let list = List::new(items)
+    let all: Vec<ListItem> = rows.iter().cloned().map(ListItem::new).collect();
+    let sel = app.scansync_sel.min(all.len().saturating_sub(1));
+    let (visible, adj_sel) = visible_slice(&all, sel, &app.scroll_scansync, area);
+    let has_vis = !visible.is_empty();
+    let list = List::new(visible)
         .block(Block::default().borders(Borders::ALL).title(format!(" Scan / Sync — target: {} ", target_label)))
         .highlight_style(selected_style());
     let mut state = ListState::default();
-    state.select(Some(app.scansync_sel));
+    if has_vis { state.select(Some(adj_sel)); }
     frame.render_stateful_widget(list, area, &mut state);
 }
 

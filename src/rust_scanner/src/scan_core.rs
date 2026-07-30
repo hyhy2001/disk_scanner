@@ -399,11 +399,21 @@ pub(crate) fn run_scan_core(
     max_workers: Option<usize>,
     debug: bool,
     engine: &str,
+    tmp_base: Option<String>,
 ) -> PyResult<PyObject> {
-    let _tmpdir = tempfile::Builder::new()
-        .prefix("checkdisk_rust_")
-        .tempdir()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let _tmpdir = {
+        let mut b = tempfile::Builder::new();
+        b.prefix("checkdisk_rust_");
+        match tmp_base.as_deref() {
+            Some(base) => {
+                std::fs::create_dir_all(base)
+                    .map_err(|e| PyRuntimeError::new_err(format!("create tmp_base {}: {}", base, e)))?;
+                b.tempdir_in(base)
+            }
+            None => b.tempdir(),
+        }
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+    };
     let tmpdir_str = _tmpdir.path().to_string_lossy().to_string();
     let _ = _tmpdir.keep(); // persist tmp dir; Python side cleans up later
 

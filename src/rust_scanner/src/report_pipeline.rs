@@ -407,6 +407,7 @@ pub(crate) fn build_detail_db_impl(
     _max_workers: usize,
     build_treemap: bool,
     debug: bool,
+    path_prefix: Option<String>,
 ) -> PyResult<(u64, Option<PathBuf>)> {
     // Configure glibc allocator to reduce heap fragmentation during large
     // parallel workloads. M_MMAP_THRESHOLD forces allocations > 128KB to
@@ -423,6 +424,17 @@ pub(crate) fn build_detail_db_impl(
 
     py.allow_threads(move || -> PyResult<(u64, Option<PathBuf>)> {
         let t_all = Instant::now();
+        // Normalised prefix matcher: a record at `p` belongs to the subtree iff
+        // `p == prefix` or `p` starts with `prefix + "/"`. The trailing-slash
+        // guard prevents `/data` from spuriously matching `/database`.
+        let prefix_norm: Option<String> =
+            path_prefix.as_ref().map(|p| p.trim_end_matches('/').to_string());
+        let in_prefix = |p: &str| -> bool {
+            match &prefix_norm {
+                None => true,
+                Some(pre) => p == pre || p.starts_with(&format!("{}/", pre)),
+            }
+        };
         #[allow(unused_assignments)]
         let mut t_perm_tsv = 0.0f64;
         #[allow(unused_assignments)]
@@ -496,11 +508,14 @@ pub(crate) fn build_detail_db_impl(
             .into_par_iter()
             .fold(LocalAgg::default, |mut agg, path| {
                 let _ = for_each_scan_event_in_file(&path, |event| {
+                    let safe_path = crate::sanitise_path(&event.path);
+                    if !in_prefix(&safe_path) {
+                        return;
+                    }
                     let username = uids_map
                         .get(&event.uid)
                         .cloned()
                         .unwrap_or_else(|| format!("uid-{}", event.uid));
-                    let safe_path = crate::sanitise_path(&event.path);
                     let ext = crate::pipe_types::extension_for_path(&safe_path);
                     let added_bytes = 8 + safe_path.len() + ext.len() + 56; // u64 + 2×String payload + tuple overhead
                     agg.rows_by_user
@@ -570,6 +585,9 @@ pub(crate) fn build_detail_db_impl(
                 .fold(HashMap::new, |mut dir_sizes: HashMap<String, HashMap<u32, i64>>, path| {
                     let _ = for_each_dir_agg_in_file(&path, |event| {
                         if event.size > 0 {
+                            if !in_prefix(&event.path) {
+                                return;
+                            }
                             let user_sizes = dir_sizes.entry(event.path.clone()).or_default();
                             *user_sizes.entry(event.uid).or_insert(0) += event.size;
                         }
@@ -860,6 +878,9 @@ pub(crate) fn build_detail_db_impl(
             let mut ingested: u64 = 0;
             for path in &owner_paths {
                 let _ = for_each_dir_owner_in_file(path, |event| {
+                    if !in_prefix(&event.path) {
+                        return;
+                    }
                     if let Some(&dir_id) = path_tree.dir_id_of.get(&event.path) {
                         let username = uids_map
                             .get(&event.uid)
@@ -1337,6 +1358,9 @@ pub(crate) fn build_detail_db_impl(
 
         // ─── Permission issues ─────────────────────────────────────
         let t_perm = Instant::now();
+        if prefix_norm.is_some() {
+            perm_events.retain(|evt| in_prefix(&evt.path));
+        }
         perm_events.sort_by(|a, b| {
             a.uid
                 .cmp(&b.uid)

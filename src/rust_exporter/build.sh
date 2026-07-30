@@ -13,7 +13,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-OUT_DIR="$SCRIPT_DIR/.."
+OUT_DIR="$SCRIPT_DIR/../../legacy/src"
 LIB_NAME="export_rust"
 GLIBC_VER="${1:-2.17}"
 

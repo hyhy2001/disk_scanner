@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS hist_snapshots (
   total      INTEGER,
   used       INTEGER,
   available  INTEGER,
+  scanned_size INTEGER DEFAULT 0,       -- total bytes the scan actually visited
   -- Inode capacity, the count-side twin of total/used/available. The first
   -- three come from the same statvfs() call as the byte figures; the fourth is
   -- what the walk actually visited, so used-minus-scanned is the part of the
@@ -64,6 +65,8 @@ pub struct SnapshotMeta {
     pub total: i64,
     pub used: i64,
     pub available: i64,
+    /// Total bytes the scan actually visited (sum of all user sizes).
+    pub scanned_size: i64,
     /// Inode capacity from statvfs: `f_files`, `f_files - f_ffree`, `f_ffree`.
     pub inodes_total: i64,
     pub inodes_used: i64,
@@ -91,8 +94,8 @@ pub fn epoch_to_yyyymmdd(epoch: i64) -> i64 {
 /// Columns added to `hist_snapshots` after the table shipped. `CREATE TABLE IF
 /// NOT EXISTS` is a no-op on an existing table, so a report.db written by an
 /// older duscan keeps the old column set until it is widened here.
-const HIST_SNAPSHOT_ADDED_COLUMNS: [&str; 4] =
-    ["inodes_total", "inodes_used", "inodes_free", "inodes_scanned"];
+const HIST_SNAPSHOT_ADDED_COLUMNS: [&str; 5] =
+    ["inodes_total", "inodes_used", "inodes_free", "inodes_scanned", "scanned_size"];
 
 /// Add any missing `hist_snapshots` columns to a database written by an older
 /// duscan. New columns are nullable with no default, so existing rows read back
@@ -146,8 +149,8 @@ pub fn upsert_snapshot(
 
     conn.execute(
         "INSERT INTO hist_snapshots (scan_date, scanned_at, path, total, used, available,
-                                     inodes_total, inodes_used, inodes_free, inodes_scanned)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                                     scanned_size, inodes_total, inodes_used, inodes_free, inodes_scanned)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             scan_date,
             timestamp,
@@ -155,6 +158,7 @@ pub fn upsert_snapshot(
             meta.total,
             meta.used,
             meta.available,
+            meta.scanned_size,
             meta.inodes_total,
             meta.inodes_used,
             meta.inodes_free,
@@ -224,6 +228,7 @@ CREATE TABLE hist_snapshots (
             total: 1000,
             used: 400,
             available: 600,
+            scanned_size: 350,
             inodes_total: 500,
             inodes_used: 120,
             inodes_free: 380,

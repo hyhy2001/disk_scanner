@@ -531,11 +531,15 @@ fn write_history_snapshot(
         .collect();
 
     let fs = statvfs_meta(scan_path);
+    let scanned_size: i64 = conn
+        .query_row("SELECT COALESCE(SUM(total_size), 0) FROM detail_users", [], |r| r.get(0))
+        .unwrap_or(0);
     let meta = SnapshotMeta {
         path: scan_path.to_string(),
         total: fs.total,
         used: fs.used,
         available: fs.available,
+        scanned_size,
         inodes_total: fs.inodes_total,
         inodes_used: fs.inodes_used,
         inodes_free: fs.inodes_free,
@@ -967,6 +971,7 @@ pub struct HistorySnapshot {
     pub total: i64,
     pub used: i64,
     pub available: i64,
+    pub scanned_size: i64,
     pub top_users: Vec<(String, i64)>,
 }
 
@@ -1001,33 +1006,58 @@ pub fn resolve_report_db(out: &str, target: &str) -> Option<std::path::PathBuf> 
 /// report.db. Empty vec if the DB is missing or has no history.
 pub fn query_history(db: &std::path::Path, days: i64) -> Vec<HistorySnapshot> {
     let Ok(conn) = rusqlite::Connection::open(db) else { return Vec::new() };
-    let snaps: Vec<(i64, i64, String, i64, i64, i64)> = {
-        let Ok(mut stmt) = conn.prepare(
-            "SELECT id, scan_date, path, total, used, available \
-             FROM hist_snapshots ORDER BY scan_date DESC LIMIT ?1",
-        ) else { return Vec::new() };
+    query_history_conn(&conn, days)
+}
+
+/// Same as `query_history` but reuses an open connection.
+pub fn query_history_conn(conn: &rusqlite::Connection, days: i64) -> Vec<HistorySnapshot> {
+    let mut stmt = match conn.prepare(
+        "SELECT h.id, h.scan_date, h.path, h.total, h.used, h.available, \
+         COALESCE(h.scanned_size, 0), uu.name, uu.size \
+         FROM hist_snapshots h \
+         LEFT JOIN hist_user_usage uu ON uu.snapshot_id = h.id AND uu.kind = 'user' \
+         WHERE h.id IN (SELECT id FROM hist_snapshots ORDER BY scan_date DESC LIMIT ?1) \
+         ORDER BY h.scan_date DESC, uu.size DESC",
+    ) { Ok(s) => s, Err(_) => return Vec::new() };
+    let rows: Vec<(i64, i64, String, i64, i64, i64, i64, Option<String>, Option<i64>)> =
         stmt.query_map(rusqlite::params![days.max(1)], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?,
-                r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?))
-        }).map(|rows| rows.flatten().collect()).unwrap_or_default()
-    };
-    snaps.into_iter().map(|(id, scan_date, path, total, used, available)| {
-        HistorySnapshot { scan_date, path, total, used, available, top_users: top_users_for_snapshot(&conn, id) }
-    }).collect()
+                r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, Option<String>>(7)?, r.get::<_, Option<i64>>(8)?))
+        }).map(|rows| rows.flatten().collect()).unwrap_or_default();
+    let mut snaps: Vec<HistorySnapshot> = Vec::new();
+    let mut current: Option<HistorySnapshot> = None;
+    for (_id, scan_date, path, total, used, available, scanned_size, uname, usize) in rows {
+        if current.as_ref().map(|s: &HistorySnapshot| s.scan_date != scan_date).unwrap_or(true) {
+            if let Some(s) = current.take() { snaps.push(s); }
+            current = Some(HistorySnapshot { scan_date, path, total, used, available, scanned_size, top_users: Vec::new() });
+        }
+        if let (Some(name), Some(size)) = (uname, usize) {
+            current.as_mut().unwrap().top_users.push((name, size));
+        }
+    }
+    if let Some(s) = current.take() { snaps.push(s); }
+    snaps
 }
 
 /// Query one user's detail (totals + top dirs/files) from a report.db.
 pub fn query_user_detail(db: &std::path::Path, username: &str, top: usize) -> Option<UserDetail> {
     let conn = rusqlite::Connection::open(db).ok()?;
-    let prefix = detail_prefix(&conn);
+    query_user_detail_conn(&conn, username, top)
+}
+
+/// Same as `query_user_detail` but reuses an open connection.
+pub fn query_user_detail_conn(conn: &rusqlite::Connection, username: &str, top: usize) -> Option<UserDetail> {
+    let prefix = detail_prefix(conn);
     let sql = format!("SELECT uid, total_files, total_dirs, total_size FROM {}users WHERE username = ?1", prefix);
     let mut stmt = conn.prepare(&sql).ok()?;
     let (uid, total_files, total_dirs, total_size) = stmt.query_row([username], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
     }).ok()?;
-    let top_dirs = query_top(&conn, &format!(
+    let top_dirs = query_top(conn, &format!(
         "SELECT d.size, d.path FROM {}dirs d WHERE d.uid = ?1 ORDER BY d.size DESC LIMIT ?2", prefix), uid, top);
-    let top_files = query_top(&conn, &format!(
+    let top_files = query_top(conn, &format!(
         "SELECT f.size, n.name FROM {}files f JOIN {}file_names n ON f.name_id = n.id \
          WHERE f.uid = ?1 ORDER BY f.size DESC LIMIT ?2", prefix, prefix), uid, top);
     Some(UserDetail { uid, total_files, total_dirs, total_size, top_dirs, top_files })
@@ -1049,7 +1079,12 @@ pub struct ReportUser {
 /// DB is missing or has no detail_users.
 pub fn query_report_users(db: &std::path::Path) -> Vec<ReportUser> {
     let Ok(conn) = rusqlite::Connection::open(db) else { return Vec::new() };
-    let prefix = detail_prefix(&conn);
+    query_report_users_conn(&conn)
+}
+
+/// Same as `query_report_users` but reuses an open connection.
+pub fn query_report_users_conn(conn: &rusqlite::Connection) -> Vec<ReportUser> {
+    let prefix = detail_prefix(conn);
     let sql = format!("SELECT username, total_size, team_id FROM {}users", prefix);
     let Ok(mut stmt) = conn.prepare(&sql) else { return Vec::new() };
     let rows = stmt.query_map([], |r| {
@@ -1059,9 +1094,21 @@ pub fn query_report_users(db: &std::path::Path) -> Vec<ReportUser> {
         Ok(ReportUser { username, size, has_team: !team_id.trim().is_empty() })
     });
     let mut users: Vec<ReportUser> = rows.map(|it| it.flatten().collect()).unwrap_or_default();
-    // Team users first, then Other; each group sorted by size desc.
     users.sort_by(|a, b| b.has_team.cmp(&a.has_team).then(b.size.cmp(&a.size)));
     users
+}
+
+/// Filter `all_users` to only those who have entries in `perm_issues`.
+/// Returns them in the same order as `all_users` (team users first, then Other).
+pub fn filter_users_with_perm_issues(conn: &rusqlite::Connection, all_users: &[ReportUser]) -> Vec<ReportUser> {
+    let mut has_issue: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT DISTINCT user FROM perm_issues") {
+        if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for name in rows.flatten() { has_issue.insert(name); }
+        }
+    }
+    if has_issue.is_empty() { return Vec::new(); }
+    all_users.iter().filter(|u| has_issue.contains(&u.username)).cloned().collect()
 }
 
 /// One permission issue row (Type / Error / Path). Shared by the TUI Output tab.
@@ -1076,7 +1123,12 @@ pub struct PermIssue {
 /// `(total, rows)`; empty when the DB has no perm_issues table or none match.
 pub fn query_user_permissions(db: &std::path::Path, user: &str, top: usize) -> (i64, Vec<PermIssue>) {
     let Ok(conn) = rusqlite::Connection::open(db) else { return (0, Vec::new()) };
-    if !has_perm_issues(&conn) { return (0, Vec::new()); }
+    query_user_permissions_conn(&conn, user, top)
+}
+
+/// Same as `query_user_permissions` but reuses an open connection.
+pub fn query_user_permissions_conn(conn: &rusqlite::Connection, user: &str, top: usize) -> (i64, Vec<PermIssue>) {
+    if !has_perm_issues(conn) { return (0, Vec::new()); }
     let total: i64 = conn.query_row(
         "SELECT COUNT(*) FROM perm_issues WHERE user = ?1",
         rusqlite::params![user], |r| r.get(0)).unwrap_or(0);
@@ -1103,7 +1155,12 @@ pub struct InodeDir {
 /// Returns `(total_files, total_dirs, rows)`; empty rows when the user is absent.
 pub fn query_user_inode(db: &std::path::Path, user: &str, top: usize) -> (i64, i64, Vec<InodeDir>) {
     let Ok(conn) = rusqlite::Connection::open(db) else { return (0, 0, Vec::new()) };
-    let prefix = detail_prefix(&conn);
+    query_user_inode_conn(&conn, user, top)
+}
+
+/// Same as `query_user_inode` but reuses an open connection.
+pub fn query_user_inode_conn(conn: &rusqlite::Connection, user: &str, top: usize) -> (i64, i64, Vec<InodeDir>) {
+    let prefix = detail_prefix(conn);
     let sql = format!("SELECT uid, total_files, total_dirs FROM {}users WHERE username = ?1", prefix);
     let (uid, tf, td): (i64, i64, i64) = match conn.query_row(
         &sql, rusqlite::params![user], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))) {
