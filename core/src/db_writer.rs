@@ -261,12 +261,21 @@ const MERGED_INDEX_DDL: &str = "
 -- dashboard's detail tab filters by extension (ext IN (?)), which needs an
 -- index leading with (uid, ext) for a fast range seek instead of a full user
 -- scan. It costs ~3.8s of CREATE INDEX time and ~60MB per report.
+--
+-- ix_detail_files_name_id / ix_treemap_dirs_name_id serve the name search's
+-- join from an FTS hit back to the file/dir rows: without them the planner
+-- falls back to scanning every row, which at 30M files is seconds. Leading with
+-- name_id turns that into a per-hit lookup.
 CREATE INDEX IF NOT EXISTS ix_detail_files_uid_size_dir_name
     ON detail_files(uid, size DESC, dir_id ASC, name_id ASC);
 CREATE INDEX IF NOT EXISTS ix_detail_files_uid_ext_size_dir_name
     ON detail_files(uid, ext, size DESC, dir_id ASC, name_id ASC);
 CREATE INDEX IF NOT EXISTS ix_detail_dirs_uid_size_dir
     ON detail_dirs(uid, size DESC, id ASC);
+CREATE INDEX IF NOT EXISTS ix_detail_files_name_id
+    ON detail_files(name_id, size DESC, dir_id ASC);
+CREATE INDEX IF NOT EXISTS ix_treemap_dirs_name_id
+    ON treemap_dirs(name_id, total_size DESC);
 CREATE INDEX IF NOT EXISTS ix_detail_file_names_name
     ON detail_file_names(name);
 CREATE INDEX IF NOT EXISTS ix_treemap_dirs_parent_size
@@ -283,6 +292,36 @@ CREATE INDEX IF NOT EXISTS ix_hist_team_snap
     ON hist_team_usage(snapshot_id);
 CREATE INDEX IF NOT EXISTS ix_hist_user_snap
     ON hist_user_usage(snapshot_id);
+";
+
+/// FTS5 trigram search indexes for the dashboard's name search.
+///
+/// `content=` makes these external-content tables: they store only the trigram
+/// index, and the `name` values are read from the base tables on demand, so a
+/// report gains ~the size of the index (a few tens of MB) rather than a second
+/// copy of every name. Trigram (SQLite >= 3.34) is what makes infix `LIKE` a
+/// lookup: plain FTS5 only indexes whole tokens, and a B-tree index cannot serve
+/// a `%…%` pattern.
+///
+/// The rebuild directives populate the index from the content tables. This is
+/// deliberately separate from MERGED_INDEX_DDL so it can run once, after the
+/// rows are copied and the regular indexes are up; FTS shadow tables need the
+/// content rows to already exist.
+const MERGED_FTS_DDL: &str = "
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_file_names USING fts5(
+  name,
+  content='detail_file_names',
+  content_rowid='id',
+  tokenize='trigram'
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_dir_names USING fts5(
+  name,
+  content='treemap_names',
+  content_rowid='id',
+  tokenize='trigram'
+);
+INSERT INTO fts_file_names(fts_file_names) VALUES('rebuild');
+INSERT INTO fts_dir_names(fts_dir_names) VALUES('rebuild');
 ";
 
 /// Create or open a merged report.db, initialising schema if needed.
@@ -410,6 +449,14 @@ pub fn merge_into_single_db(
 
     // Build indexes
     conn.execute_batch(MERGED_INDEX_DDL)?;
+
+    // Build FTS5 trigram indexes so the dashboard's name search is a lookup
+    // instead of a LIKE scan of every interned name. External-content tables
+    // store only the index (the names already live in detail_file_names /
+    // treemap_names), and trigram gives infix matching with an index. The
+    // dashboard reads the report readonly, so this has to be built here, at
+    // scan time. Rebuild populates the index from the content tables.
+    conn.execute_batch(MERGED_FTS_DDL)?;
 
     // ANALYZE for query planner
     conn.execute_batch("ANALYZE;")?;

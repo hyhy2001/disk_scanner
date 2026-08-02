@@ -2,8 +2,7 @@
 
 > High-performance disk-usage scanner for Linux, written in Rust. Built for
 > filesystems with tens of millions of files: parallel walk, bounded RAM,
-> per-target history, an interactive config/report TUI, optional LSF batch
-> submit, and atomic remote sync.
+> per-target history, an interactive config/report TUI, and atomic remote sync.
 
 `duscan` walks a Linux filesystem in parallel, classifies usage by configured
 teams/users, and writes a single SQLite `report.db` per target (detail, treemap,
@@ -98,11 +97,10 @@ is optional once configured.
 ### Scan + read
 
 ```bash
-./duscan run [--target <name>] [--tree-map] [--workers N] [--level N] [--debug] [--no-lsf]
+./duscan run [--target <name>] [--tree-map] [--workers N] [--level N] [--debug]
 #   Headless text output: per-target phases, live files/dirs/s + elapsed + memory.
 #   --workers N: explicit workers bypass device-class caps (use full budget).
 #   --debug: Phase 1/2/3 profiling + RSS diagnostics.
-#   --no-lsf: force a local scan even when [lsf] is enabled.
 #   per-target webhook_url auto-sends a Teams card after each scan (no separate step).
 #
 #   Example output:
@@ -115,8 +113,8 @@ is optional once configured.
 #     Scan complete: 1506009 files, 225996 dirs | 26.5s
 
 ./duscan status [--target <name>] [--watch] [--json]
-#   reads scan_status.json (stage/running/files/dirs/size/elapsed). Works for local,
-#   background, and LSF-submitted scans (status file is on shared storage).
+#   reads scan_status.json (stage/running/files/dirs/size/elapsed). Works for local
+#   and background scans (status file is on shared storage).
 #   --watch redraws every 2s; a heartbeat >30s old is flagged "running (stale)".
 
 ./duscan detail --user <user> [--target <name>] [--top N] [--json]
@@ -146,7 +144,7 @@ working directory (no cwd or `~/.config` lookup). This makes cron reliable: a jo
 running from `$HOME` or `/` finds the same config as an interactive shell.
 
 ```
-duscan.toml            # globals: output_dir, workers, max_parallel_devices, nfs_parallel, [lsf]
+duscan.toml            # globals: output_dir, workers, max_parallel_devices, nfs_parallel
 targets/
 ├── backend.toml       # one target per file (teams carry users, no team_id)
 ├── frontend.toml
@@ -187,35 +185,6 @@ rsync'd to the remote automatically after each scan. A cron entry is just:
 ```cron
 0 2 * * * /path/to/duscan run --target backend
 ```
-
----
-
-## LSF batch submit (optional)
-
-On an LSF cluster a scan should run on a compute node, not the login node. Add an
-`[lsf]` table and a headless `duscan run` will **re-submit itself** as a batch job
-via the `bs` wrapper (a site-local `bsub`) instead of scanning in place:
-
-```toml
-[lsf]
-enabled = true      # master switch (default false = always scan locally)
-cmd = "bs"          # submit wrapper (default "bs")
-os = "RHEL8"        # -os <os>   (empty = omit)
-mem_mb = 20000      # -M <mem>   (0 = omit)
-queue = ""          # -q <queue> (empty = omit)
-extra_args = []     # extra raw args before the binary, e.g. ["-n", "4"]
-```
-
-`duscan run --target backend` then submits
-`bs -os RHEL8 -M 20000 /abs/path/duscan run --level 3 --target backend` and exits
-(fire-and-forget). The submitted job carries `DUSCAN_VIA_LSF=1` so it scans
-locally instead of re-submitting (no loop). Fallbacks: if `bs` isn't on `PATH`,
-duscan warns and scans locally; `--no-lsf` forces a local scan even when enabled.
-The TUI `r`/`R` scan always runs in-place, never via LSF.
-
-**Tracking:** the compute-node job writes `scan_status.json` (on shared storage)
-with a live heartbeat. Poll it from anywhere with
-`duscan status --target backend [--watch]`; `bjobs` still shows the LSF job state.
 
 ---
 
@@ -266,7 +235,7 @@ space. Dirs that couldn't be stat'd fall back to the smallest known uid.
 │   ├── db_writer.rs        # DDL, bulk insert, merge, atomic rename
 │   └── pipe_*.rs           # Spill format, permission, treemap helpers
 ├── cli/src/                # CLI binary (duscan)
-│   ├── main.rs             # Clap dispatch + scan orchestration + status/LSF
+│   ├── main.rs             # Clap dispatch + scan orchestration + status
 │   ├── config.rs           # TOML config CRUD
 │   ├── scheduler.rs        # Device-aware scan plan (classify + cap workers)
 │   └── config_tui.rs       # Ratatui config + report TUI
@@ -350,7 +319,7 @@ export PATH=$PWD/.rust/cargo/bin:$PATH
 
 ```bash
 make test                                    # workspace tests
-./duscan run --target <name> --debug --no-lsf   # Phase 1/2/3 profiling + RSS
+./duscan run --target <name> --debug          # Phase 1/2/3 profiling + RSS
 sqlite3 reports/<name>/report.db ".tables"   # inspect the merged DB
 sqlite3 reports/<name>/report.db "SELECT * FROM meta"
 ```

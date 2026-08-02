@@ -92,11 +92,6 @@ pub struct Globals {
     pub hdd_parallel: i64,
     #[serde(default = "default_ssd_parallel")]
     pub ssd_parallel: i64,
-    /// Optional LSF batch-submit settings. When `enabled`, a headless
-    /// `duscan run` re-submits itself to the cluster via the `bs` wrapper
-    /// (a site-local `bsub`) instead of scanning on the login node.
-    #[serde(default)]
-    pub lsf: LsfConfig,
 }
 
 impl Default for Globals {
@@ -108,54 +103,9 @@ impl Default for Globals {
             nfs_parallel: default_nfs_parallel(),
             hdd_parallel: default_hdd_parallel(),
             ssd_parallel: default_ssd_parallel(),
-            lsf: LsfConfig::default(),
         }
     }
 }
-
-/// LSF submit settings (the `[lsf]` table in duscan.toml). A headless
-/// `duscan run` with `enabled = true` and the `cmd` wrapper on PATH re-submits
-/// itself as a batch job: `bs -os <os> -M <mem_mb> [-q <queue>] [extra_args…]
-/// <abs duscan> run <original args>`. Anything left empty is simply omitted
-/// from the command line, so a minimal `[lsf]` (just `enabled = true`) submits
-/// with the cluster defaults.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LsfConfig {
-    /// Master switch. When false (default) `duscan run` always scans locally.
-    #[serde(default)]
-    pub enabled: bool,
-    /// The submit wrapper to invoke. Site default is `bs` (a custom `bsub`).
-    #[serde(default = "default_lsf_cmd")]
-    pub cmd: String,
-    /// OS selector passed as `-os <os>` (e.g. "RHEL8"). Empty = omit.
-    #[serde(default)]
-    pub os: String,
-    /// Memory reservation in MB passed as `-M <mem_mb>` (e.g. 20000). 0 = omit.
-    #[serde(default)]
-    pub mem_mb: i64,
-    /// Optional queue passed as `-q <queue>`. Empty = omit.
-    #[serde(default)]
-    pub queue: String,
-    /// Extra raw args inserted before the binary (e.g. ["-n", "4"]). Each entry
-    /// is passed as its own argument (no shell splitting).
-    #[serde(default)]
-    pub extra_args: Vec<String>,
-}
-
-impl Default for LsfConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            cmd: default_lsf_cmd(),
-            os: String::new(),
-            mem_mb: 0,
-            queue: String::new(),
-            extra_args: Vec::new(),
-        }
-    }
-}
-
-fn default_lsf_cmd() -> String { "bs".into() }
 
 /// Ergonomic on-disk shape of one `targets/<name>.toml` file: teams carry their
 /// member usernames directly and `team_id` is never written — it's assigned
@@ -207,7 +157,6 @@ pub struct Config {
     pub nfs_parallel: i64,
     pub hdd_parallel: i64,
     pub ssd_parallel: i64,
-    pub lsf: LsfConfig,
     pub targets: Vec<Target>,
 }
 
@@ -238,7 +187,6 @@ impl Default for Config {
             nfs_parallel: g.nfs_parallel,
             hdd_parallel: g.hdd_parallel,
             ssd_parallel: g.ssd_parallel,
-            lsf: g.lsf,
             targets: Vec::new(),
         }
     }
@@ -384,7 +332,6 @@ impl Config {
             nfs_parallel: globals.nfs_parallel,
             hdd_parallel: globals.hdd_parallel,
             ssd_parallel: globals.ssd_parallel,
-            lsf: globals.lsf,
             targets: Vec::new(),
         };
 
@@ -435,7 +382,6 @@ impl Config {
             nfs_parallel: self.nfs_parallel,
             hdd_parallel: self.hdd_parallel,
             ssd_parallel: self.ssd_parallel,
-            lsf: self.lsf.clone(),
         };
         let content = toml::to_string_pretty(&globals).map_err(|e| format!("serialize: {}", e))?;
         let tmp = p.with_extension("toml.tmp");

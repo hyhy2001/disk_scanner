@@ -6,6 +6,14 @@ use clap::Parser;
 use config::Config;
 use scheduler::build_scan_plan;
 
+// Replace the system allocator with mimalloc: large parallel workloads that
+// churn millions of short-lived allocations (Phase 1/2 spill buffers, interning
+// maps, per-row FileRows) fragment glibc's heap badly; mimalloc returns freed
+// pages to the OS more aggressively and shows consistently lower RSS + higher
+// throughput. Validated against glibc on production reports (see AGENTS.md).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser)]
 #[command(name = "duscan", version = "0.1.0")]
 struct Cli {
@@ -30,13 +38,9 @@ enum Command {
         /// Emit core Phase 2/3 profiling + RSS diagnostics to the per-scan log.
         #[arg(long)]
         debug: bool,
-        /// Force a local scan even when [lsf] is enabled (skip batch submit).
-        /// Automatically implied inside a submitted job (DUSCAN_VIA_LSF set).
-        #[arg(long)]
-        no_lsf: bool,
     },
     /// Show the latest scan status per target (reads each target's
-    /// scan_status.json). Works for local, background, and LSF-submitted scans.
+    /// scan_status.json). Works for local and background scans.
     Status {
         #[arg(long)]
         output_dir: Option<String>,
@@ -286,7 +290,7 @@ fn statvfs_meta(path: &str) -> FsCapacity {
 /// Atomically write `<target_dir>/scan_status.json` so a dashboard — or another
 /// duscan process (`duscan status`) — can poll scan progress. Mirrors the legacy
 /// Python heartbeat fields, plus live `files`/`dirs`/`size_bytes` counts so a
-/// reader can show progress even when the scan runs elsewhere (e.g. an LSF job).
+/// reader can show progress even when the scan runs elsewhere.
 #[allow(clippy::too_many_arguments)]
 fn write_scan_status(
     target_dir: &std::path::Path,
@@ -370,7 +374,7 @@ pub(crate) fn read_target_status(out: &str, target: &str) -> Option<TargetStatus
 
 /// `duscan status`: print the latest scan status for each configured target by
 /// reading its `scan_status.json`. Works regardless of WHERE the scan runs —
-/// local, background, or an LSF job — because the status file is on shared
+/// local or background — because the status file is on shared
 /// storage. `--watch` polls every 2s until Ctrl+C; `--json` emits a JSON array.
 fn show_status(cfg: &Config, out: &str, target: Option<&str>, watch: bool, json: bool) {
     // Which targets to report: a single --target, else every configured target.
@@ -689,13 +693,7 @@ fn main() {
                 }
             }
         }
-        Command::Run { output_dir, tree_map, workers, level, target, debug, no_lsf } => {
-            // If [lsf] is enabled and we're not already inside a submitted job,
-            // re-submit this exact invocation to the cluster and exit. When the
-            // wrapper is missing (or --no-lsf), fall through to a local scan.
-            if maybe_submit_via_lsf(&cfg, output_dir, *tree_map, *workers, *level, target, *debug, *no_lsf) {
-                return;
-            }
+        Command::Run { output_dir, tree_map, workers, level, target, debug } => {
             run_scan(&mut cfg, output_dir.clone(), *tree_map, *workers, *level, target, *debug);
         }
         Command::Status { output_dir, target, watch, json } => {
@@ -1801,264 +1799,6 @@ impl ScanRun {
     }
 }
 
-/// Environment guard set on the submitted job so it scans locally instead of
-/// re-submitting itself (which would loop forever).
-const LSF_GUARD_ENV: &str = "DUSCAN_VIA_LSF";
-
-/// When `[lsf].enabled` and we're not already inside a submitted job, re-submit
-/// this `duscan run` invocation to the cluster via the `bs` wrapper and return
-/// `true` (the caller then exits). Returns `false` — meaning "scan locally
-/// here" — when LSF is disabled, `--no-lsf` was given, we're already inside a
-/// job, or the wrapper is not on PATH.
-///
-/// Fire-and-forget: the wrapper's own stdout/stderr (typically a job id) is
-/// Submit one LSF job per target so each target runs independently on its own
-/// compute node. When no targets are specified (scan all), submit one job for
-/// all targets combined (the scheduler on the compute node will handle grouping).
-#[allow(clippy::too_many_arguments)]
-fn maybe_submit_via_lsf(
-    cfg: &Config,
-    output_dir: &Option<String>,
-    tree_map: bool,
-    workers: Option<usize>,
-    level: usize,
-    target: &[String],
-    debug: bool,
-    no_lsf: bool,
-) -> bool {
-    let lsf = &cfg.lsf;
-    if !lsf.enabled || no_lsf {
-        return false;
-    }
-    if std::env::var_os(LSF_GUARD_ENV).is_some() {
-        return false;
-    }
-    if which_in_path(&lsf.cmd).is_none() {
-        eprintln!(
-            "Warning: [lsf].enabled but '{}' not found on PATH — scanning locally.",
-            lsf.cmd
-        );
-        return false;
-    }
-
-    let exe = match std::env::current_exe() {
-        Ok(p) => p.to_string_lossy().into_owned(),
-        Err(e) => {
-            eprintln!("Warning: cannot resolve duscan path ({}) — scanning locally.", e);
-            return false;
-        }
-    };
-
-    // Build the LSF prefix args once (shared across all targets).
-    let mut lsf_prefix: Vec<String> = Vec::new();
-    if !lsf.os.is_empty() {
-        lsf_prefix.push("-os".into());
-        lsf_prefix.push(lsf.os.clone());
-    }
-    if lsf.mem_mb > 0 {
-        lsf_prefix.push("-M".into());
-        lsf_prefix.push(lsf.mem_mb.to_string());
-    }
-    if !lsf.queue.is_empty() {
-        lsf_prefix.push("-q".into());
-        lsf_prefix.push(lsf.queue.clone());
-    }
-    lsf_prefix.extend(lsf.extra_args.iter().cloned());
-
-    // Resolve output dir so we can show the log path per target.
-    let out = output_dir.clone().unwrap_or_else(|| cfg.resolved_output_dir());
-
-    // Per-target submission (one job each) or single job if scanning all.
-    let submit_one = |t: &[String], compact: bool| -> bool {
-        let mut argv = lsf_prefix.clone();
-        argv.push(exe.clone());
-        argv.extend(reconstruct_run_args(output_dir, tree_map, workers, level, t, debug));
-
-        let label: String = if t.is_empty() {
-            "all targets".into()
-        } else {
-            t.join(", ")
-        };
-        let log_dir = if t.len() == 1 {
-            format!("{}/{}/logs/", out, t[0])
-        } else {
-            format!("{}/logs/", out)
-        };
-
-        if compact {
-            // Submit silently — caller handles display.
-        } else {
-            let pretty = format!("{} {}", lsf.cmd, argv.join(" "));
-            println!("Submitting scan to LSF: {}", pretty);
-            println!("  target : {}", label);
-            println!("  log    : {}scan_*.log", log_dir);
-        }
-
-        let status = std::process::Command::new(&lsf.cmd)
-            .args(&argv)
-            .env(LSF_GUARD_ENV, "1")
-            .status();
-        match status {
-            Ok(s) if s.success() => true,
-            Ok(s) => {
-                eprintln!("LSF submit '{}' exited with {} — skip.", lsf.cmd, s);
-                false
-            }
-            Err(e) => {
-                eprintln!("Warning: failed to run '{}' ({})", lsf.cmd, e);
-                false
-            }
-        }
-    };
-
-    if target.is_empty() {
-        return submit_one(&[], false);
-    }
-
-    let total = target.len();
-    println!("Submitting {} scan(s) to LSF:", total);
-
-    // Show the submission command format once (same for all targets).
-    let sample_argv = {
-        let mut a = lsf_prefix.clone();
-        a.push(exe.clone());
-        a.extend(reconstruct_run_args(output_dir, tree_map, workers, level, &[target[0].clone()], debug));
-        a
-    };
-    println!("  {} {}", lsf.cmd, sample_argv.join(" "));
-    println!();
-
-    let mut any_ok = false;
-    for (i, t) in target.iter().enumerate() {
-        let single = vec![t.clone()];
-        let log_dir = format!("{}/{}/logs/", out, t);
-        eprintln!("  [{}/{}] {} -> {}", i + 1, total, t, log_dir);
-        if submit_one(&single, true) {
-            any_ok = true;
-        }
-    }
-    if !any_ok {
-        eprintln!("All LSF submits failed — NOT scanning locally (fix the submit or use --no-lsf).");
-    }
-    // Always treat as handled: failed submits should never silently fall back to
-    // a heavy local scan on the login node.
-    true
-}
-
-/// Submit a single target to LSF. Returns true on success. Used by both the
-/// CLI (per-target loop) and the TUI (r/R keys when LSF is enabled).
-pub(crate) fn submit_lsf_target(
-    cfg: &Config, exe: &str, lsf_prefix: &[String],
-    target_name: &str, level: usize, workers: Option<usize>, tree_map: bool,
-    output_dir: Option<&str>,
-) -> Result<(), String> {
-    let mut argv = lsf_prefix.to_vec();
-    argv.push(exe.to_string());
-    argv.extend(reconstruct_run_args(
-        &output_dir.map(|s| s.to_string()), tree_map, workers, level,
-        &[target_name.to_string()], false,
-    ));
-    match std::process::Command::new(&cfg.lsf.cmd)
-        .args(&argv)
-        .env(LSF_GUARD_ENV, "1")
-        .spawn()
-    {
-        Ok(mut child) => {
-            for _ in 0..60 {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        if status.success() {
-                            return Ok(());
-                        }
-                        return Err(format!("{} exited with {}", cfg.lsf.cmd, status));
-                    }
-                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(500)),
-                    Err(e) => return Err(format!("{}: {}", cfg.lsf.cmd, e)),
-                }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
-            Err(format!("{} timed out", cfg.lsf.cmd))
-        }
-        Err(e) => Err(format!("{}: {}", cfg.lsf.cmd, e)),
-    }
-}
-
-/// Build the LSF prefix args (shared across targets). Returns empty if LSF is not ready.
-pub(crate) fn lsf_prefix_args(cfg: &Config) -> Option<Vec<String>> {
-    let lsf = &cfg.lsf;
-    if !lsf.enabled { return None; }
-    if std::env::var_os(LSF_GUARD_ENV).is_some() { return None; }
-    if which_in_path(&lsf.cmd).is_none() { return None; }
-    let mut args: Vec<String> = Vec::new();
-    if !lsf.os.is_empty() { args.push("-os".into()); args.push(lsf.os.clone()); }
-    if lsf.mem_mb > 0 { args.push("-M".into()); args.push(lsf.mem_mb.to_string()); }
-    if !lsf.queue.is_empty() { args.push("-q".into()); args.push(lsf.queue.clone()); }
-    args.extend(lsf.extra_args.iter().cloned());
-    Some(args)
-}
-
-/// Rebuild the `run` subcommand arguments. Only emits non-default values so the
-/// compute node reads per-target overrides from its own config files.
-fn reconstruct_run_args(
-    output_dir: &Option<String>,
-    tree_map: bool,
-    workers: Option<usize>,
-    level: usize,
-    target: &[String],
-    debug: bool,
-) -> Vec<String> {
-    let mut args = vec!["run".to_string()];
-    if let Some(od) = output_dir {
-        args.push("--output-dir".into());
-        args.push(od.clone());
-    }
-    if tree_map {
-        args.push("--tree-map".into());
-    }
-    if let Some(w) = workers {
-        args.push("--workers".into());
-        args.push(w.to_string());
-    }
-    if level != 3 {
-        args.push("--level".into());
-        args.push(level.to_string());
-    }
-    for t in target {
-        args.push("--target".into());
-        args.push(t.clone());
-    }
-    if debug {
-        args.push("--debug".into());
-    }
-    args.push("--no-lsf".into());
-    args
-}
-
-/// Minimal `which`: return the first PATH entry containing an executable named
-/// `cmd`, or `None`. Absolute/relative paths with a separator are checked
-/// directly. Avoids a dependency for a one-off lookup.
-pub(crate) fn which_in_path(cmd: &str) -> Option<std::path::PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-    let is_exec = |p: &std::path::Path| {
-        p.metadata()
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    };
-    if cmd.contains('/') {
-        let p = std::path::PathBuf::from(cmd);
-        return if is_exec(&p) { Some(p) } else { None };
-    }
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let cand = dir.join(cmd);
-        if is_exec(&cand) {
-            return Some(cand);
-        }
-    }
-    None
-}
-
 /// Set up the TUI, build the device-aware plan, and run each device group on
 /// its own thread (groups = distinct physical devices → real parallelism;
 /// roots within a group run sequentially to avoid thrashing one disk). The
@@ -2435,7 +2175,7 @@ fn scan_one_view(
     // counts. Because `run_scan_core` blocks, spawn a heartbeat thread that
     // snapshots the sink and rewrites scan_status.json every ~2s: this is what
     // lets `duscan status` show near-live file/dir counts even when the scan is
-    // an LSF job (a different process the in-memory sink can't reach).
+    // a separate process the in-memory sink can't reach.
     let progress = sink.scan.clone();
     let hb_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let heartbeat = {
@@ -3092,26 +2832,5 @@ mod tests {
     fn parse_team_specs_dedups_users() {
         let specs = parse_team_specs(&["dev=alice,alice,bob".into()]).unwrap();
         assert_eq!(specs[0].users, vec!["alice".to_string(), "bob".to_string()]);
-    }
-
-    #[test]
-    fn reconstruct_run_args_roundtrip() {
-        // Full set of options: every flag should be reproduced for the job.
-        let args = reconstruct_run_args(
-            &Some("/tmp/out".into()), true, Some(8), 5,
-            &["ABC".to_string(), "Test".to_string()], true,
-        );
-        assert_eq!(args, vec![
-            "run", "--output-dir", "/tmp/out", "--tree-map",
-            "--workers", "8", "--level", "5",
-            "--target", "ABC", "--target", "Test", "--debug", "--no-lsf",
-        ]);
-    }
-
-    #[test]
-    fn reconstruct_run_args_minimal() {
-        // No options: only the run subcommand + the always-emitted level default.
-        let args = reconstruct_run_args(&None, false, None, 3, &[], false);
-        assert_eq!(args, vec!["run", "--no-lsf"]);
     }
 }

@@ -202,13 +202,18 @@ fn write_compact_row(
     Ok(())
 }
 
-// Helper: read compact spill rows back into Vec
-fn read_compact_spill(path: &Path) -> PyResult<Vec<(u64, u32, u32, u16)>> {
+/// Stream a compact spill file one row at a time, invoking `on_row` for each
+/// `(size, dir_id, name_id, ext_id)`. Never materialises the whole file in
+/// memory, so per-user aggregation and the SQLite insert pass can both stay
+/// O(1) RAM regardless of file count.
+fn for_each_compact_row<F>(path: &Path, mut on_row: F) -> PyResult<()>
+where
+    F: FnMut((u64, u32, u32, u16)) -> PyResult<()>,
+{
     let file = std::fs::File::open(path).map_err(|e| PyRuntimeError::new_err(format!(
-        "read_compact_spill open {}: {}", path.display(), e
+        "for_each_compact_row open {}: {}", path.display(), e
     )))?;
     let mut decoder = FrameDecoder::new(file);
-    let mut rows = Vec::new();
     let mut buf_size = [0u8; 8];
     let mut buf_dir = [0u8; 4];
     let mut buf_name = [0u8; 4];
@@ -219,27 +224,27 @@ fn read_compact_spill(path: &Path) -> PyResult<Vec<(u64, u32, u32, u16)>> {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(PyRuntimeError::new_err(format!(
-                "read_compact_spill: size at row {} in {}: {}", row_idx, path.display(), e
+                "for_each_compact_row: size at row {} in {}: {}", row_idx, path.display(), e
             ))),
         }
         decoder.read_exact(&mut buf_dir).map_err(|e| PyRuntimeError::new_err(format!(
-            "read_compact_spill: dir_id at row {} in {}: {}", row_idx, path.display(), e
+            "for_each_compact_row: dir_id at row {} in {}: {}", row_idx, path.display(), e
         )))?;
         decoder.read_exact(&mut buf_name).map_err(|e| PyRuntimeError::new_err(format!(
-            "read_compact_spill: name_id at row {} in {}: {}", row_idx, path.display(), e
+            "for_each_compact_row: name_id at row {} in {}: {}", row_idx, path.display(), e
         )))?;
         decoder.read_exact(&mut buf_ext).map_err(|e| PyRuntimeError::new_err(format!(
-            "read_compact_spill: ext_id at row {} in {}: {}", row_idx, path.display(), e
+            "for_each_compact_row: ext_id at row {} in {}: {}", row_idx, path.display(), e
         )))?;
-        rows.push((
+        on_row((
             u64::from_le_bytes(buf_size),
             u32::from_le_bytes(buf_dir),
             u32::from_le_bytes(buf_name),
             u16::from_le_bytes(buf_ext),
-        ));
+        ))?;
         row_idx += 1;
     }
-    Ok(rows)
+    Ok(())
 }
 
 // ─── Path tree assembly ───────────────────────────────────────────────
@@ -989,24 +994,19 @@ pub fn build_detail_db_impl(
             }
         }
 
-        // ─── STAGE 3a/3b combined — single pass over spill files ──
-        // Optimization: previously we did Pass 0 (intern names + ext, aggregate
-        // per-user/per-dir totals) and Pass 1 (insert files). That re-read the
-        // entire spill payload twice. Now we do everything in ONE pass:
+        // ─── STAGE 3a/3b combined — two streaming passes over spill files ──
+        // Memory note: rows are NEVER accumulated in RAM. `dir_size` and
+        // per-user totals are the only aggregates held here (bounded by #dirs×#users),
+        // and file rows are inserted straight from the compact spills in the
+        // serial insert pass below. No `Vec<FileRow>` per user, no per-user
+        // `dfs` — both used to blow up RSS to ~1 pipeline at multi-million-file
+        // scale (a per-user dfs of dir_count i64s × #users alone was gigabytes).
         //
-        //   • Open detail.db, set up DDL.
-        //   • Stream each spill row -> intern basename into path_tree.names,
-        //     intern ext, aggregate user_dir_size/totals, push
-        //     FileRow into a chunk buffer (flushed every FILE_INSERT_CHUNK
-        //     rows), maintain top-K heap per user.
-        //   • Once spill stream is done, build treemap.db (path_tree.names is
-        //     now complete with both dir segments and file basenames).
-        //   • Insert top_files, dict tables, finalize.
-        //
-        // detail.db.files references tm.names.id by integer — the FK isn't
-        // enforced and consumers ATTACH treemap.db at query time, so writing
-        // treemap.db AFTER detail.db.files is fine: both DBs are atomic-renamed
-        // at the very end of build_pipeline_dbs_impl.
+        //   • Pass A (parallel): aggregate per-user totals + (uid,dir)->(size,files)
+        //     while streaming each compact spill.
+        //   • Pass B (serial): stream the same spills again, pushing each row
+        //     into a fixed-size chunk flushed every FILE_INSERT_CHUNK rows into
+        //     detail.db, and folding direct_file_count globally (single Vec).
         let t_pipeline = Instant::now();
 
         let mut detail_handle = db_writer::detail_open(&detail_db_pb, &detail_work_root, debug)?;
@@ -1062,18 +1062,16 @@ pub fn build_detail_db_impl(
             uid_to_username.entry(*uid).or_insert(u.clone());
         }
 
-        // Parallel: aggregate per-user stats from spill files.
-        let dir_count = direct_file_count.len();
+        // Pass A — parallel per-user aggregation. Streams spills, keeps only
+        // totals + (uid,dir)->(size,files). O(1) RAM in number of rows.
         let ext_ref = &ext_string_by_id;
         let spills_ref = &user_spill_paths;
         let user_aggregates: Vec<(i64, String, UserTotals, HashMap<(i64,i64),(i64,i64)>,
-                                  Vec<FileRow>, Vec<i64>, i64, i64, u64)> =
+                                  i64, i64, u64)> =
             sorted_users.par_iter().map(|username| {
                 let uid = uid_of[username];
                 let mut totals = UserTotals::default();
                 let mut dir_size: HashMap<(i64,i64),(i64,i64)> = HashMap::new();
-                let mut file_rows: Vec<FileRow> = Vec::new();
-                let mut dfs = vec![0i64; dir_count];
                 let mut docs: i64 = 0;
                 let mut size_sum: i64 = 0;
                 let mut spill_bytes: u64 = 0;
@@ -1083,43 +1081,30 @@ pub fn build_detail_db_impl(
                         if let Ok(meta) = fs::metadata(spill_path) {
                             spill_bytes += meta.len();
                         }
-                        let rows = match read_compact_spill(spill_path) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                eprintln!("Warning: read_compact_spill {}: {:?}", spill_path.display(), e);
-                                continue;
-                            }
-                        };
-                        for (size, dir_id_u32, name_id_u32, ext_id_u16) in rows {
+                        let _ = for_each_compact_row(spill_path, |(size, dir_id_u32, name_id_u32, _ext_id_u16)| {
                             let size_i64 = size as i64;
                             let dir_id = dir_id_u32 as i64;
                             let name_id = name_id_u32 as i64;
-                            let ext_id = ext_id_u16 as i64;
 
                             let dus = dir_size.entry((uid, dir_id)).or_insert((0, 0));
                             dus.0 += size_i64;
                             dus.1 += 1;
 
-                            if (dir_id as usize) < dir_count {
-                                dfs[dir_id as usize] += 1;
-                            }
-
                             totals.files += 1;
                             totals.size += size_i64;
                             docs += 1;
                             size_sum += size_i64;
-
-                            let ext_str = ext_ref.get(ext_id as usize)
-                                .cloned().unwrap_or_default();
-                            file_rows.push(FileRow { dir_id, name_id, ext: ext_str, uid, size: size_i64 });
-                        }
+                            let _ = name_id; // name_id not needed for aggregates
+                            Ok(())
+                        });
                     }
                 }
-                (uid, username.clone(), totals, dir_size, file_rows, dfs, docs, size_sum, spill_bytes)
+                (uid, username.clone(), totals, dir_size, docs, size_sum, spill_bytes)
             }).collect();
 
-        // Serial merge of per-user aggregates into global state.
-        for (uid, uname, totals, dir_size, file_rows, dfs, docs, size_sum, spill_bytes) in &user_aggregates {
+        // Serial merge of per-user aggregates into global state. Spill files are
+        // NOT deleted here — the streaming insert pass below still needs them.
+        for (uid, _uname, totals, dir_size, docs, size_sum, spill_bytes) in &user_aggregates {
             let ut = user_totals.entry(*uid).or_default();
             ut.files += totals.files;
             ut.size += totals.size;
@@ -1130,39 +1115,41 @@ pub fn build_detail_db_impl(
                 e.1 += c;
             }
 
-            for (i, c) in dfs.iter().enumerate() {
-                if i < direct_file_count.len() {
-                    direct_file_count[i] += c;
-                }
-            }
-
             total_docs += docs;
             total_size += size_sum;
             total_spill_read += spill_bytes;
-
-            // Delete spill files after processing.
-            if let Some(spills) = user_spill_paths.get(uname) {
-                for p in spills {
-                    let _ = fs::remove_file(p);
-                }
-            }
         }
+        // Free the per-user aggregate maps before the serial insert pass.
+        drop(user_aggregates);
 
-        // Serial SQLite insert pass.
+        // Pass B — serial streaming insert. Re-reads each user's compact spills
+        // and pushes rows into a fixed chunk buffer (FILE_INSERT_CHUNK rows),
+        // so memory stays bounded regardless of file count. direct_file_count is
+        // folded into the single global Vec here (was a per-user Vec before).
         let mut chunk: Vec<FileRow> = Vec::with_capacity(FILE_INSERT_CHUNK);
-        for (_uid, _uname, _totals, _dir_size, file_rows, _dfs, _docs, _size_sum, _spill_bytes) in &user_aggregates {
-            for row in file_rows {
-                chunk.push(FileRow {
-                    dir_id: row.dir_id,
-                    name_id: row.name_id,
-                    ext: row.ext.clone(),
-                    uid: row.uid,
-                    size: row.size,
-                });
-                if chunk.len() >= FILE_INSERT_CHUNK {
-                    db_writer::detail_insert_files_chunk(&mut detail_handle, &chunk)?;
-                    chunk.clear();
-                }
+        for (username, spills) in &user_spill_paths {
+            let uid = uid_of[username];
+            for spill_path in spills {
+                for_each_compact_row(spill_path, |(size, dir_id_u32, name_id_u32, ext_id_u16)| {
+                    let size_i64 = size as i64;
+                    let dir_id = dir_id_u32 as i64;
+                    let name_id = name_id_u32 as i64;
+                    if (dir_id as usize) < direct_file_count.len() {
+                        direct_file_count[dir_id as usize] += 1;
+                    }
+                    let ext_str = ext_ref.get(ext_id_u16 as usize)
+                        .cloned().unwrap_or_default();
+                    chunk.push(FileRow { dir_id, name_id, ext: ext_str, uid, size: size_i64 });
+                    if chunk.len() >= FILE_INSERT_CHUNK {
+                        db_writer::detail_insert_files_chunk(&mut detail_handle, &chunk)?;
+                        chunk.clear();
+                    }
+                    Ok(())
+                })?;
+            }
+            // Delete this user's spill files only after their rows are inserted.
+            for p in spills {
+                let _ = fs::remove_file(p);
             }
         }
         if !chunk.is_empty() {
