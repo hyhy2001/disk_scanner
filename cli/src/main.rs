@@ -643,16 +643,28 @@ fn main() {
             if *json {
                 let arr: Vec<serde_json::Value> = cfg.targets.iter()
                     .filter(|t| target.as_deref().map(|w| t.name == w).unwrap_or(true))
-                    .map(|t| serde_json::json!({
-                        "name": t.name,
-                        "path": t.path,
-                        "end_scan": t.end_scan,
-                        "purge_time": t.purge_time,
-                        "teams": t.teams.iter().map(|tm| serde_json::json!({"name": tm.name, "team_id": tm.team_id})).collect::<Vec<_>>(),
-                        "users": t.users.iter()
-                            .filter(|u| team.as_ref().map(|tn| t.teams.iter().any(|tm| tm.name == *tn && tm.team_id == u.team_id)).unwrap_or(true))
-                            .map(|u| serde_json::json!({"name": u.name, "team_id": u.team_id})).collect::<Vec<_>>(),
-                    }))
+                    .map(|t| {
+                        // Unassigned users found in the report (team_id empty),
+                        // mirroring the "Other" bucket the dashboard shows.
+                        let report = std::path::Path::new(&cfg.resolved_output_dir())
+                            .join(&t.name).join("report.db");
+                        let other_users: Vec<serde_json::Value> = query_report_users(&report)
+                            .into_iter()
+                            .filter(|u| !u.has_team)
+                            .map(|u| serde_json::json!({"name": u.username, "size": u.size}))
+                            .collect();
+                        serde_json::json!({
+                            "name": t.name,
+                            "path": t.path,
+                            "end_scan": t.end_scan,
+                            "purge_time": t.purge_time,
+                            "teams": t.teams.iter().map(|tm| serde_json::json!({"name": tm.name, "team_id": tm.team_id})).collect::<Vec<_>>(),
+                            "users": t.users.iter()
+                                .filter(|u| team.as_ref().map(|tn| t.teams.iter().any(|tm| tm.name == *tn && tm.team_id == u.team_id)).unwrap_or(true))
+                                .map(|u| serde_json::json!({"name": u.name, "team_id": u.team_id})).collect::<Vec<_>>(),
+                            "other_users": other_users,
+                        })
+                    })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&serde_json::json!(arr)).unwrap_or_else(|_| "[]".into()));
             } else if let Some(tname) = target {
@@ -679,6 +691,26 @@ fn main() {
                                     .map(|u| u.name.as_str())
                                     .collect();
                                 println!("  {} ({}): {}", tm.name, members.len(), members.join(", "));
+                            }
+                        }
+                        // Unassigned users found in the report (team_id empty)
+                        // are shown as "Other" — the same bucket the dashboard
+                        // uses. Reads the report directly so it works whether or
+                        // not those users were configured before the scan.
+                        if team.is_none() {
+                            let report = std::path::Path::new(&cfg.resolved_output_dir())
+                                .join(&t.name).join("report.db");
+                            let others: Vec<ReportUser> = query_report_users(&report)
+                                .into_iter()
+                                .filter(|u| !u.has_team)
+                                .collect();
+                            if !others.is_empty() {
+                                println!("\nOther (unassigned): {} users", others.len());
+                                for u in others {
+                                    println!("  {:>12}  {}", crate::fmt_size(u.size), u.username);
+                                }
+                            } else if report.exists() {
+                                println!("\nOther (unassigned): 0 users");
                             }
                         }
                     }
@@ -2765,6 +2797,30 @@ mod tests {
         assert_eq!(fmt_size(1_500), "1.5 KB");
         assert_eq!(fmt_size(2_000_000), "2.0 MB");
         assert_eq!(fmt_size(3_000_000_000), "3.0 GB");
+    }
+
+    #[test]
+    fn report_users_split_team_vs_other() {
+        // detail_users rows with a team_id vs empty/NULL team_id must bucket
+        // into has_team=true and has_team=false ("Other") respectively.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE detail_users (username TEXT, total_size INTEGER, team_id TEXT);
+             INSERT INTO detail_users VALUES
+               ('alice', 1000, '1'),
+               ('bob',   2000, '1'),
+               ('carol', 3000, ''),
+               ('dave',  4000, NULL);",
+        )
+        .unwrap();
+        let users = query_report_users_conn(&conn);
+        // Sorted team-first (by size), then Other (by size).
+        let names: Vec<&str> = users.iter().map(|u| u.username.as_str()).collect();
+        assert_eq!(names, vec!["bob", "alice", "dave", "carol"]);
+        assert_eq!(users[0].has_team, true);
+        assert_eq!(users[1].has_team, true);
+        assert_eq!(users[2].has_team, false); // dave (NULL) -> Other
+        assert_eq!(users[3].has_team, false); // carol ('') -> Other
     }
 
     #[test]

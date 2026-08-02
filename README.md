@@ -91,6 +91,9 @@ is optional once configured.
 ./duscan add-user <user> [user...] --team <team> --target <target>
 ./duscan remove-user <user> [user...] --target <target>
 ./duscan list [--target <name>] [--team <name>] [--json]
+#   --target shows the configured teams plus "Other (unassigned)" — users found
+#   in the report that have no team yet (mirrors the dashboard's Other bucket).
+#   --json adds an "other_users" array per target.
 ./duscan import-legacy --dir <configs_dir> [--force]   # migrate legacy JSON configs
 ```
 

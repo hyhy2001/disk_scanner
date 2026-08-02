@@ -74,7 +74,7 @@ target's `report.db`; empty states point you to press `r` to scan first.
 ./duscan add-team <name> --target <target>
 ./duscan add-user <user> [user...] --team <team> --target <target>
 ./duscan remove-user <user> [user...] --target <target>
-./duscan list [--target <name>] [--team <name>] [--json]
+./duscan list [--target <name>] [--team <name>] [--json]   # --target also shows "Other (unassigned)" users from the report; --json adds other_users
 
 # Scan + read (all reader commands fall back to output_dir from duscan.toml — no need to repeat --output-dir)
 ./duscan run [--output-dir DIR] [--tree-map] [--workers N] [--level N] [--target <name>] [--debug]
