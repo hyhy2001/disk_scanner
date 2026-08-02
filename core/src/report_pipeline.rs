@@ -30,6 +30,14 @@ const ROW_SPILL_THRESHOLD: usize = 200_000;
 /// Production at 64MB still peaked at 9.5GB stage 1; estimate underestimates
 /// real RAM by ~2-3x due to Vec capacity slack and allocator overhead.
 const ROW_SPILL_BYTES: usize = 16 * 1024 * 1024;
+/// Adaptive Phase 2 insert: when the re-encoded compact spill payload is at or
+/// below this many rows, the pipeline keeps per-user `Vec<FileRow>` in RAM and
+/// inserts from memory (single read of the spills — fast). Above it, the
+/// streaming two-pass path is used instead (aggregate in pass A, re-read the
+/// spills for a serial chunked insert in pass B) so RSS stays O(1) in file
+/// count. ~5M rows ≈ ~450 MB of FileRow at ~90 B/row — the crossover where
+/// holding every row in RAM starts to compete with the rest of the pipeline.
+const SINGLE_PASS_MAX_ROWS: u64 = 5_000_000;
 const TREEMAP_AGG_VERSION: u32 = 2;
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -681,6 +689,9 @@ pub fn build_detail_db_impl(
         ext_id_map.insert(String::new(), 0u16);
 
         let spill_seq_compact = Arc::new(AtomicU64::new(1_000_000));
+        // Total rows written to compact spills — drives the adaptive single-pass
+        // vs streaming two-pass decision after re-encode.
+        let total_compact_rows = Arc::new(AtomicU64::new(0));
 
         let compact_entries: Vec<(String, Vec<PathBuf>)> = row_spills
             .par_iter()
@@ -772,6 +783,7 @@ pub fn build_detail_db_impl(
                             .map_err(|e| PyRuntimeError::new_err(format!(
                                 "re-encode write row {} to {}: {}", row_idx_local, compact_path.display(), e
                             )))?;
+                        total_compact_rows.fetch_add(1, Ordering::Relaxed);
                         row_idx_local += 1;
                     }
 
@@ -789,6 +801,16 @@ pub fn build_detail_db_impl(
 
         let compact_row_spills: HashMap<String, Vec<PathBuf>> = compact_entries.into_iter().collect();
         drop(row_spills); // free original spill map
+
+        let total_compact_rows = total_compact_rows.load(Ordering::Relaxed);
+        let single_pass = total_compact_rows <= SINGLE_PASS_MAX_ROWS;
+        if debug {
+            println!(
+                "[Phase 2] compact rows={} — {} insert path",
+                total_compact_rows,
+                if single_pass { "single-pass (in-RAM)" } else { "streaming two-pass" }
+            );
+        }
 
         let total_names = next_name_id.load(Ordering::Relaxed) as usize;
         let mut file_names: Vec<String> = vec![String::new(); total_names];
@@ -994,19 +1016,22 @@ pub fn build_detail_db_impl(
             }
         }
 
-        // ─── STAGE 3a/3b combined — two streaming passes over spill files ──
-        // Memory note: rows are NEVER accumulated in RAM. `dir_size` and
-        // per-user totals are the only aggregates held here (bounded by #dirs×#users),
-        // and file rows are inserted straight from the compact spills in the
-        // serial insert pass below. No `Vec<FileRow>` per user, no per-user
-        // `dfs` — both used to blow up RSS to ~1 pipeline at multi-million-file
-        // scale (a per-user dfs of dir_count i64s × #users alone was gigabytes).
+        // ─── STAGE 3a/3b combined — adaptive insert path ───────────
+        // Two modes, chosen by the compact-spill row count:
         //
-        //   • Pass A (parallel): aggregate per-user totals + (uid,dir)->(size,files)
-        //     while streaming each compact spill.
-        //   • Pass B (serial): stream the same spills again, pushing each row
-        //     into a fixed-size chunk flushed every FILE_INSERT_CHUNK rows into
-        //     detail.db, and folding direct_file_count globally (single Vec).
+        //   • single-pass (rows ≤ SINGLE_PASS_MAX_ROWS): Pass A keeps each
+        //     user's rows in RAM (`file_rows`) while aggregating, and the insert
+        //     pass consumes them from memory — the spills are read exactly once.
+        //     Fast, at the cost of RSS ≈ total_rows × FileRow (~90 B/row).
+        //
+        //   • streaming two-pass (rows > SINGLE_PASS_MAX_ROWS): Pass A keeps
+        //     only aggregates (totals + (uid,dir)->(size,files)), then Pass B
+        //     re-reads the spills into a fixed FILE_INSERT_CHUNK buffer. RSS
+        //     stays O(1) in file count — no Vec<FileRow> per user, no per-user
+        //     dfs (dir_count i64s × #users was gigabytes at scale).
+        //
+        // Either way `direct_file_count` is folded into a single global Vec
+        // during the insert pass (was a per-user Vec before).
         let t_pipeline = Instant::now();
 
         let mut detail_handle = db_writer::detail_open(&detail_db_pb, &detail_work_root, debug)?;
@@ -1042,7 +1067,7 @@ pub fn build_detail_db_impl(
 
         let total_users = sorted_users.len();
         if debug {
-            println!("[RSS checkpoint] before streaming insert: {:.1} MB", crate::pipe_types::get_rss_mb());
+            println!("[RSS checkpoint] before insert: {:.1} MB", crate::pipe_types::get_rss_mb());
         }
         println!(
             "[Phase 2] Building user detail for {} users...",
@@ -1062,16 +1087,18 @@ pub fn build_detail_db_impl(
             uid_to_username.entry(*uid).or_insert(u.clone());
         }
 
-        // Pass A — parallel per-user aggregation. Streams spills, keeps only
-        // totals + (uid,dir)->(size,files). O(1) RAM in number of rows.
+        // Pass A — parallel per-user aggregation. In single-pass mode it also
+        // keeps the rows in RAM (`file_rows`); in streaming mode it keeps only
+        // totals + (uid,dir)->(size,files).
         let ext_ref = &ext_string_by_id;
         let spills_ref = &user_spill_paths;
         let user_aggregates: Vec<(i64, String, UserTotals, HashMap<(i64,i64),(i64,i64)>,
-                                  i64, i64, u64)> =
+                                  Vec<FileRow>, i64, i64, u64)> =
             sorted_users.par_iter().map(|username| {
                 let uid = uid_of[username];
                 let mut totals = UserTotals::default();
                 let mut dir_size: HashMap<(i64,i64),(i64,i64)> = HashMap::new();
+                let mut file_rows: Vec<FileRow> = Vec::new();
                 let mut docs: i64 = 0;
                 let mut size_sum: i64 = 0;
                 let mut spill_bytes: u64 = 0;
@@ -1081,7 +1108,7 @@ pub fn build_detail_db_impl(
                         if let Ok(meta) = fs::metadata(spill_path) {
                             spill_bytes += meta.len();
                         }
-                        let _ = for_each_compact_row(spill_path, |(size, dir_id_u32, name_id_u32, _ext_id_u16)| {
+                        let _ = for_each_compact_row(spill_path, |(size, dir_id_u32, name_id_u32, ext_id_u16)| {
                             let size_i64 = size as i64;
                             let dir_id = dir_id_u32 as i64;
                             let name_id = name_id_u32 as i64;
@@ -1094,17 +1121,26 @@ pub fn build_detail_db_impl(
                             totals.size += size_i64;
                             docs += 1;
                             size_sum += size_i64;
-                            let _ = name_id; // name_id not needed for aggregates
+
+                            // Keep the row only in single-pass mode; the
+                            // streaming path discards it (Pass B re-reads).
+                            if single_pass {
+                                let ext_str = ext_ref.get(ext_id_u16 as usize)
+                                    .cloned().unwrap_or_default();
+                                file_rows.push(FileRow { dir_id, name_id, ext: ext_str, uid, size: size_i64 });
+                            }
+                            let _ = name_id;
                             Ok(())
                         });
                     }
                 }
-                (uid, username.clone(), totals, dir_size, docs, size_sum, spill_bytes)
+                (uid, username.clone(), totals, dir_size, file_rows, docs, size_sum, spill_bytes)
             }).collect();
 
-        // Serial merge of per-user aggregates into global state. Spill files are
-        // NOT deleted here — the streaming insert pass below still needs them.
-        for (uid, _uname, totals, dir_size, docs, size_sum, spill_bytes) in &user_aggregates {
+        // Serial merge of per-user aggregates into global state. In single-pass
+        // mode the rows now live in RAM, so this user's spills can be deleted
+        // right away; in streaming mode Pass B still needs them.
+        for (uid, uname, totals, dir_size, _file_rows, docs, size_sum, spill_bytes) in &user_aggregates {
             let ut = user_totals.entry(*uid).or_default();
             ut.files += totals.files;
             ut.size += totals.size;
@@ -1118,38 +1154,61 @@ pub fn build_detail_db_impl(
             total_docs += docs;
             total_size += size_sum;
             total_spill_read += spill_bytes;
-        }
-        // Free the per-user aggregate maps before the serial insert pass.
-        drop(user_aggregates);
 
-        // Pass B — serial streaming insert. Re-reads each user's compact spills
-        // and pushes rows into a fixed chunk buffer (FILE_INSERT_CHUNK rows),
-        // so memory stays bounded regardless of file count. direct_file_count is
-        // folded into the single global Vec here (was a per-user Vec before).
-        let mut chunk: Vec<FileRow> = Vec::with_capacity(FILE_INSERT_CHUNK);
-        for (username, spills) in &user_spill_paths {
-            let uid = uid_of[username];
-            for spill_path in spills {
-                for_each_compact_row(spill_path, |(size, dir_id_u32, name_id_u32, ext_id_u16)| {
-                    let size_i64 = size as i64;
-                    let dir_id = dir_id_u32 as i64;
-                    let name_id = name_id_u32 as i64;
-                    if (dir_id as usize) < direct_file_count.len() {
-                        direct_file_count[dir_id as usize] += 1;
+            if single_pass {
+                if let Some(spills) = user_spill_paths.get(uname) {
+                    for p in spills {
+                        let _ = fs::remove_file(p);
                     }
-                    let ext_str = ext_ref.get(ext_id_u16 as usize)
-                        .cloned().unwrap_or_default();
-                    chunk.push(FileRow { dir_id, name_id, ext: ext_str, uid, size: size_i64 });
+                }
+            }
+        }
+
+        // Insert pass — shared chunk buffer for both modes.
+        let mut chunk: Vec<FileRow> = Vec::with_capacity(FILE_INSERT_CHUNK);
+        if single_pass {
+            // Single-pass: consume the in-RAM rows. The spills were already
+            // read once (during Pass A) and deleted — no re-read.
+            for (uid, _uname, _totals, _dir_size, file_rows, _docs, _size_sum, _spill_bytes) in user_aggregates {
+                for row in file_rows {
+                    if (row.dir_id as usize) < direct_file_count.len() {
+                        direct_file_count[row.dir_id as usize] += 1;
+                    }
+                    chunk.push(row);
                     if chunk.len() >= FILE_INSERT_CHUNK {
                         db_writer::detail_insert_files_chunk(&mut detail_handle, &chunk)?;
                         chunk.clear();
                     }
-                    Ok(())
-                })?;
+                }
             }
-            // Delete this user's spill files only after their rows are inserted.
-            for p in spills {
-                let _ = fs::remove_file(p);
+        } else {
+            // Streaming two-pass: re-read each user's compact spills and push
+            // rows into the fixed chunk buffer, so memory stays bounded
+            // regardless of file count. direct_file_count folded here too.
+            for (username, spills) in &user_spill_paths {
+                let uid = uid_of[username];
+                for spill_path in spills {
+                    for_each_compact_row(spill_path, |(size, dir_id_u32, name_id_u32, ext_id_u16)| {
+                        let size_i64 = size as i64;
+                        let dir_id = dir_id_u32 as i64;
+                        let name_id = name_id_u32 as i64;
+                        if (dir_id as usize) < direct_file_count.len() {
+                            direct_file_count[dir_id as usize] += 1;
+                        }
+                        let ext_str = ext_ref.get(ext_id_u16 as usize)
+                            .cloned().unwrap_or_default();
+                        chunk.push(FileRow { dir_id, name_id, ext: ext_str, uid, size: size_i64 });
+                        if chunk.len() >= FILE_INSERT_CHUNK {
+                            db_writer::detail_insert_files_chunk(&mut detail_handle, &chunk)?;
+                            chunk.clear();
+                        }
+                        Ok(())
+                    })?;
+                }
+                // Delete this user's spill files only after their rows are inserted.
+                for p in spills {
+                    let _ = fs::remove_file(p);
+                }
             }
         }
         if !chunk.is_empty() {
@@ -1157,9 +1216,9 @@ pub fn build_detail_db_impl(
             chunk.clear();
         }
         if debug {
-            println!("[RSS checkpoint] after streaming insert: {:.1} MB", crate::pipe_types::get_rss_mb());
+            println!("[RSS checkpoint] after insert: {:.1} MB", crate::pipe_types::get_rss_mb());
         }
-        // Streaming pass is done — compact spill map can be dropped now.
+        // Insert pass is done — compact spill map can be dropped now.
         drop(compact_row_spills);
         t_files_db = t_pipeline.elapsed().as_secs_f64();
 
