@@ -472,7 +472,7 @@ use crate::scan_constants::{
 };
 use crate::scan_state::{GlobalStats, ThreadLocalState};
 use crate::scan_utils::{
-    error_code_from_message, format_num, format_rate, format_size, get_rss_mb,
+    error_code_from_message, format_num, format_rate, format_size, get_mem_stats,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -1085,12 +1085,12 @@ pub fn run_scan_core(
             // line — the consumer renders progress itself and stray prints would
             // corrupt the alternate screen.
             if !has_external_progress {
-                let mem_mb = get_rss_mb();
+                let mem = get_mem_stats();
                 println!(
-                    "[{:02}:{:02}:{:02}] Files: {} | Dirs: {} | Size: {} | Rate: {} files/s | Mem: {:.1} MB",
+                    "[{:02}:{:02}:{:02}] Files: {} | Dirs: {} | Size: {} | Rate: {} files/s | RSS: {:.1} MB | VSZ: {:.1} MB",
                     total_elapsed / 3600, (total_elapsed % 3600) / 60, total_elapsed % 60,
                     format_num(total_files), format_num(total_dirs),
-                    format_size(total_size), format_rate(rate), mem_mb
+                    format_size(total_size), format_rate(rate), mem.rss_mb, mem.vsz_mb
                 );
             }
             last_report = now;

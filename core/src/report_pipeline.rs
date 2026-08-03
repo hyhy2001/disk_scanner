@@ -625,7 +625,7 @@ pub fn build_detail_db_impl(
         // bytes_in_flight for merged_agg is no longer needed after final spill.
         t_ingest = t1.elapsed().as_secs_f64();
         if debug {
-            println!("[RSS checkpoint] after stage 1 ingest: {:.1} MB", crate::pipe_types::get_rss_mb());
+            println!("{}", crate::pipe_types::mem_checkpoint("after stage 1 ingest"));
         }
 
         // Trim glibc heap after stage 1 ingest — rows_by_user and dir_sizes
@@ -655,7 +655,7 @@ pub fn build_detail_db_impl(
         );
         let mut path_tree = PathTree::build(&root, &dir_paths_set);
         if debug {
-            println!("[RSS checkpoint] after path tree built: {:.1} MB", crate::pipe_types::get_rss_mb());
+            println!("{}", crate::pipe_types::mem_checkpoint("after path tree built"));
         }
 
         // Trim after PathTree build — dir_paths_set and intermediate BFS
@@ -839,7 +839,7 @@ pub fn build_detail_db_impl(
         if debug {
             println!("[Phase 2] Re-encoded spills in {:.2}s ({} users, parallel)",
                 t_reencode.elapsed().as_secs_f64(), compact_row_spills.len());
-            println!("[RSS checkpoint] after re-encode: {:.1} MB", crate::pipe_types::get_rss_mb());
+            println!("{}", crate::pipe_types::mem_checkpoint("after re-encode"));
         }
 
         // username -> uid (POSIX preferred; for unknown users keep negative slot.)
@@ -1067,7 +1067,7 @@ pub fn build_detail_db_impl(
 
         let total_users = sorted_users.len();
         if debug {
-            println!("[RSS checkpoint] before insert: {:.1} MB", crate::pipe_types::get_rss_mb());
+            println!("{}", crate::pipe_types::mem_checkpoint("before insert"));
         }
         println!(
             "[Phase 2] Building user detail for {} users...",
@@ -1216,7 +1216,7 @@ pub fn build_detail_db_impl(
             chunk.clear();
         }
         if debug {
-            println!("[RSS checkpoint] after insert: {:.1} MB", crate::pipe_types::get_rss_mb());
+            println!("{}", crate::pipe_types::mem_checkpoint("after insert"));
         }
         // Insert pass is done — compact spill map can be dropped now.
         drop(compact_row_spills);
@@ -1385,12 +1385,12 @@ pub fn build_detail_db_impl(
             }
             let rss_before = crate::pipe_types::get_rss_mb();
             if debug {
-                println!("[RSS checkpoint] before malloc_trim: {:.1} MB", rss_before);
+                println!("{}", crate::pipe_types::mem_checkpoint("before malloc_trim"));
             }
             let trim_result = unsafe { malloc_trim(0) };
             let rss_after = crate::pipe_types::get_rss_mb();
             if debug {
-                println!("[RSS checkpoint] after malloc_trim: {:.1} MB", rss_after);
+                println!("{}", crate::pipe_types::mem_checkpoint("after malloc_trim"));
                 println!(
                     "[Phase 2] malloc_trim(0)={} RSS: {:.1} MB -> {:.1} MB (delta: {:+.1} MB)",
                     trim_result, rss_before, rss_after, rss_after - rss_before
@@ -1504,7 +1504,7 @@ pub fn build_detail_db_impl(
         cleanup_legacy_artifacts(&detail_root, &treemap_root_dir);
 
         if debug {
-            let rss_mb = crate::pipe_types::get_rss_mb();
+            let mem = crate::pipe_types::get_mem_stats();
             println!(
                 "SQLite outputs built in {:.2}s. Total files: {}, perms: {}",
                 t_all.elapsed().as_secs_f64(),
@@ -1521,7 +1521,9 @@ pub fn build_detail_db_impl(
             println!("  detail files build: {:.4}s", t_files_db);
             println!("  detail finalize:    {:.4}s", t_finalize_detail);
             println!("  Perm JSON write:    {:.4}s", t_perm_write);
-            println!("  Peak RSS:           {:.1} MB", rss_mb);
+            println!("  RSS:                {:.1} MB", mem.rss_mb);
+            println!("  VSZ:                {:.1} MB", mem.vsz_mb);
+            println!("  VmPeak:             {:.1} MB", mem.peak_mb);
         }
         Ok((files_inserted as u64, agg_path_out))
     }

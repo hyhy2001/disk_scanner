@@ -1,5 +1,3 @@
-use std::fs;
-
 pub(crate) fn format_num(mut n: u64) -> String {
     if n == 0 {
         return "0".to_string();
@@ -42,20 +40,8 @@ pub(crate) fn format_rate(rate: f64) -> String {
     format!("{}.{}", format_num(int_part), frac)
 }
 
-pub(crate) fn get_rss_mb() -> f64 {
-    if let Ok(status) = fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if line.starts_with("VmRSS:") {
-                let kb: u64 = line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                return kb as f64 / 1024.0;
-            }
-        }
-    }
-    0.0
+pub(crate) fn get_mem_stats() -> crate::pipe_types::MemStats {
+    crate::pipe_types::get_mem_stats()
 }
 
 pub(crate) fn error_code_from_message(msg: &str) -> &'static str {

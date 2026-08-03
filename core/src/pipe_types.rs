@@ -114,3 +114,55 @@ pub fn get_rss_mb() -> f64 {
 pub fn get_rss_mb() -> f64 {
     0.0
 }
+
+/// Memory stats from `/proc/self/status` in MB.
+/// `vsz_mb` is the virtual address space (`VmSize`) — the value `RLIMIT_AS`
+/// caps, so under LSF/cgroup limits it is what kills the process even when
+/// RSS looks small. `peak_mb` is the high-water mark (`VmPeak`), the largest
+/// virtual size the process has ever held.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemStats {
+    pub rss_mb: f64,
+    pub vsz_mb: f64,
+    pub peak_mb: f64,
+}
+
+#[cfg(target_os = "linux")]
+pub fn get_mem_stats() -> MemStats {
+    let mut s = MemStats::default();
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            let field = line.split_whitespace().collect::<Vec<_>>();
+            if field.len() >= 2 {
+                let kb: f64 = match field[1].parse() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let mb = kb / 1024.0;
+                match field[0] {
+                    "VmRSS:" => s.rss_mb = mb,
+                    "VmSize:" => s.vsz_mb = mb,
+                    "VmPeak:" => s.peak_mb = mb,
+                    _ => {}
+                }
+            }
+        }
+    }
+    s
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn get_mem_stats() -> MemStats {
+    MemStats::default()
+}
+
+/// Formatted `[MEM checkpoint]` line for --debug output: RSS | VSZ | Peak.
+/// VSZ (`VmSize`) is what RLIMIT_AS caps, so a crash with low RSS but a
+/// capped virtual limit shows up here as VSZ approaching the ceiling.
+pub fn mem_checkpoint(label: &str) -> String {
+    let s = get_mem_stats();
+    format!(
+        "[MEM checkpoint] {}: RSS {:.1} MB | VSZ {:.1} MB | VmPeak {:.1} MB",
+        label, s.rss_mb, s.vsz_mb, s.peak_mb
+    )
+}
