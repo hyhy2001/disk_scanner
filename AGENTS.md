@@ -188,6 +188,49 @@ things keep it fast on NFS:
   latency; raise it for high-latency mounts, lower it if the NFS server is the
   bottleneck. HDDs stay capped low (seek-bound); SSD/NVMe get the full budget.
 
+## Memory / VSZ under virtual-memory caps (LSF `-M`, cgroups)
+
+The binary uses **mimalloc** as its global allocator. This is great for RSS and
+throughput (see `cli/src/main.rs`), but two mimalloc behaviours can push the
+**virtual** address space (VSZ) far above real RSS — which then **kills the
+process under a `RLIMIT_AS` / `ulimit -v` cap** even though RSS is low:
+
+- **Arena pre-reservation.** mimalloc reserves arenas in 1GiB blocks and grows
+  each new reservation exponentially (`1 << arena_count/8`, up to 2^16×). With
+  many walker threads this balloons VSZ (observed ~27GB) while RSS stays low
+  (~10GB). The next arena `mmap` then fails with `ENOMEM`, and Rust aborts with
+  `memory allocation of N bytes failed` → SIGABRT → core dump (exit 134), even
+  though real RAM is plentiful.
+- **Allocation churn.** Freed segments are not returned to the OS eagerly; under
+  heavy allocation the VmPeak keeps climbing.
+
+Duscan mitigates both in code (`cli/src/main.rs` `configure_mimalloc()`,
+`core/src/report_pipeline.rs` `PathTree::build`):
+
+- `mi_option_set(mi_option_arena_reserve /*23*/, 0)` at startup — disables arena
+  pre-reservation; large allocations fall back to exact-size OS mmaps, keeping
+  VSZ ≈ RSS.
+- `trim_heap()` = `mi_collect(true)` at phase boundaries instead of `malloc_trim`
+  (a **no-op** with mimalloc — glibc's trim does nothing) — forces freed
+  segments back to the OS.
+- `PathTree::build` walks ancestors **only until a known dir key** instead of all
+  the way to root, cutting `~2×depth×N` String allocations down to `~2×N` on
+  deep trees (millions of dirs at depth 15-20 used to balloon VSZ past the cap).
+
+Diagnostics: run with `--debug` and grep the `[MEM checkpoint]` lines — each
+prints `RSS | VSZ | VmPeak`. VSZ is what a `ulimit -v` cap enforces, not RSS. A
+`memory allocation of <small-bytes> failed` message means the process is out of
+**address space** (cap hit), not out of RAM.
+
+Operational notes:
+- A full-scan VmPeak of ~17-18GB is normal at 58M files / 9.1M dirs. LSF
+  `-M 20000` (→ `ulimit -v` ~24GB) is sufficient after the fixes above; if VSZ
+  still approaches the cap, raise `-M` (e.g. `-M 40000`) — it widens RLIMIT_AS,
+  not RSS.
+- If `memory allocation of N bytes failed` appears with a **small** N while RSS
+  is low, it is an address-space cap, not an OOM: check `ulimit -v` / `ulimit -d`
+  inside the job, and `vm.overcommit_memory` / `CommitLimit` on shared nodes.
+
 ## Build notes
 
 - Toolchain: `make setup-env` (project-local rustup/cargo in `./.rust`; hermetic).
