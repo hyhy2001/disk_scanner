@@ -14,6 +14,33 @@ use scheduler::build_scan_plan;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// mimalloc option index for `mi_option_arena_reserve` (mimalloc v2 options.c
+/// table: ... 22=destroy_on_exit, 23=arena_reserve). Value is in KiB; 0
+/// disables arena pre-reservation so large allocations fall back to direct
+/// OS mmap. See `configure_mimalloc`.
+const MI_OPTION_ARENA_RESERVE: i32 = 23;
+
+extern "C" {
+    fn mi_option_set(option: i32, value: std::os::raw::c_long);
+}
+
+/// Cap mimalloc's virtual address-space footprint.
+///
+/// By default mimalloc reserves arenas in 1GiB blocks and grows the per-arena
+/// reserve exponentially (`1 << arena_count/8`, up to 2^16×). With many walker
+/// threads this balloons VSZ (observed ~27GB) while RSS stays low (~10GB) — the
+/// arenas are reserved but never committed. Under a virtual-memory cap
+/// (RLIMIT_AS, e.g. LSF `-M 20000` → `ulimit -v` 24GB) the next arena mmap
+/// fails with ENOMEM and Rust aborts with "memory allocation of N bytes
+/// failed" (SIGABRT / core dump), even though real RSS is well under the cap.
+/// Disabling arena pre-reservation routes large allocations straight to the OS
+/// in exact-size mmaps, keeping VSZ close to RSS.
+fn configure_mimalloc() {
+    unsafe {
+        mi_option_set(MI_OPTION_ARENA_RESERVE, 0);
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "duscan", version = "0.1.0")]
 struct Cli {
@@ -563,6 +590,7 @@ fn write_history_snapshot(
 }
 
 fn main() {
+    configure_mimalloc();
     let cli = Cli::parse();
     let mut cfg = Config::load();
 
