@@ -601,13 +601,17 @@ pub fn build_detail_db_impl(
                 .into_par_iter()
                 .fold(HashMap::new, |mut dir_sizes: HashMap<String, HashMap<u32, i64>>, path| {
                     let _ = for_each_dir_agg_in_file(&path, |event| {
-                        if event.size > 0 {
-                            if !in_prefix(&event.path) {
-                                return;
-                            }
-                            let user_sizes = dir_sizes.entry(event.path.clone()).or_default();
-                            *user_sizes.entry(event.uid).or_insert(0) += event.size;
+                        if !in_prefix(&event.path) {
+                            return;
                         }
+                        // Keep zero-size entries too. dir_sizes_by_user keys are the
+                        // PathTree's directory set, and a directory whose files are ALL
+                        // zero bytes must still be in the tree — otherwise every file in
+                        // it falls through the re-encode lookup (`unwrap_or(0)`) and is
+                        // misattributed to the scan root. Size accounting downstream
+                        // already skips `size <= 0`, so the extra entries are harmless.
+                        let user_sizes = dir_sizes.entry(event.path.clone()).or_default();
+                        *user_sizes.entry(event.uid).or_insert(0) += event.size;
                     });
                     dir_sizes
                 })
@@ -1854,5 +1858,37 @@ mod path_tree_tests {
         // /app/www/a and its parents were synthesized (not keys) but still present.
         assert!(tree.dir_id_of.contains_key("/app/www/a"));
         assert!(tree.dir_id_of.contains_key("/app/www/a/b"));
+    }
+
+    #[test]
+    fn build_keeps_dirs_whose_files_are_all_zero_bytes() {
+        // Regression: a directory that only holds zero-byte files must still get
+        // a dir_id. The re-encode resolves a file's parent through dir_id_of and
+        // falls back to the scan root (0) when the key is missing — so a
+        // zero-size-only directory used to have every one of its files dumped at
+        // the scan root. size<=0 entries reaching the tree must keep the dir.
+        let root = "/";
+        let mut dirs = HashMap::new();
+        dirs.insert("/app".to_string(), HashMap::new()); // no sized files at all
+        dirs.insert("/app/log".to_string(), {
+            let mut m = HashMap::new();
+            m.insert(0u32, 0i64); // files exist, but all zero bytes
+            m
+        });
+
+        let tree = PathTree::build(root, &dirs);
+        assert_eq!(*tree.dir_id_of.get("/app").unwrap(), 1);
+        assert_eq!(*tree.dir_id_of.get("/app/log").unwrap(), 2);
+
+        // A file whose parent is /app/log resolves to /app/log, not to root.
+        assert_ne!(*tree.dir_id_of.get("/app/log").unwrap(), 0);
+        assert_eq!(
+            tree.dirs_in_order
+                .iter()
+                .find(|d| d.id == *tree.dir_id_of.get("/app/log").unwrap())
+                .unwrap()
+                .parent_id,
+            Some(*tree.dir_id_of.get("/app").unwrap()),
+        );
     }
 }
