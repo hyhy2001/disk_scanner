@@ -1,3 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "cli", "src/rust_scanner", "src/rust_exporter"]
+# src/rust_scanner (fast_scanner) and src/rust_exporter (export_rust) are the
+# legacy PyO3 crates — reference copies kept on disk, no longer built or
+# exercised by the active pipeline (make build only builds -p duscan).
+members = ["core", "cli"]

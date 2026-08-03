@@ -9,23 +9,6 @@ pub const FILE_PART_RECORDS: usize = 100_000;
 
 /// Internal event structures
 
-#[allow(dead_code)]
-#[derive(Default)]
-pub struct UserOutputMeta {
-    pub team_id: String,
-    pub total_dirs: i64,
-    pub total_used: i64,
-}
-
-#[allow(dead_code)]
-pub struct UserBuildResult {
-    pub username: String,
-    pub team_id: String,
-    pub total_dirs: i64,
-    pub total_files: i64,
-    pub total_used: i64,
-}
-
 #[derive(Clone)]
 pub struct PermissionEvent {
     pub uid: u32,

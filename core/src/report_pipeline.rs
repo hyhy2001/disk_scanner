@@ -265,9 +265,6 @@ struct PathTree {
     dir_id_of: HashMap<String, i64>,
     /// dir path stored alongside parent_id for downstream metadata building.
     dirs_in_order: Vec<DirRowDraft>,
-    /// segment string -> name_id (extended later with file basenames)
-    #[allow(dead_code)]
-    name_id_of: HashMap<String, i64>,
     /// names[i] is the segment string for name_id == i (extended later).
     names: Vec<String>,
 }
@@ -385,7 +382,6 @@ impl PathTree {
         Self {
             dir_id_of,
             dirs_in_order,
-            name_id_of,
             names,
         }
     }

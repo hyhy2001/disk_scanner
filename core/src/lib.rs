@@ -13,7 +13,6 @@ pub mod report_history;
 pub mod report_pipeline;
 pub mod scan_constants;
 pub mod scan_core;
-pub mod scan_orchestrator;
 pub mod scan_state;
 pub mod scan_utils;
 

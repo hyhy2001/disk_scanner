@@ -7,9 +7,6 @@ use crate::config::{Config, Target};
 #[derive(Debug, Clone)]
 pub struct ScanPlan {
     pub groups: Vec<DeviceGroup>,
-    // Retained for callers/inspection even though run_scan reads `out` directly.
-    #[allow(dead_code)]
-    pub output_dir: PathBuf,
 }
 
 #[derive(Debug, Clone)]
@@ -29,14 +26,9 @@ pub struct PhysicalRoot {
 #[derive(Debug, Clone)]
 pub struct TargetView {
     pub name: String,
-    // Full configured path of the view; run_scan uses scan_path + prefix.
-    #[allow(dead_code)]
-    pub view_path: PathBuf,
     pub prefix: Option<PathBuf>,
     pub team_map: HashMap<String, i64>,
     pub team_names: HashMap<i64, String>,
-    #[allow(dead_code)]
-    pub output_subdir: PathBuf,
     pub end_scan: Option<String>,
     pub purge_time: Option<i64>,
     // Per-target scan overrides + sync config (None = global default).
@@ -54,8 +46,6 @@ pub struct TargetView {
 /// When `explicit_workers` is true, `--workers` was passed on the CLI and
 /// device-class caps are skipped — the full budget is used per group.
 pub fn build_scan_plan(config: &Config, budget: usize, explicit_workers: bool) -> ScanPlan {
-    let output_dir = PathBuf::from(&config.output_dir);
-
     // Resolve targets: stat each, group by device
     let mount_info = read_mount_info();
     let mut by_dev: HashMap<u64, Vec<&Target>> = HashMap::new();
@@ -116,11 +106,9 @@ pub fn build_scan_plan(config: &Config, budget: usize, explicit_workers: bool) -
                     .collect();
                 TargetView {
                     name: t.name.clone(),
-                    view_path: tp.clone(),
                     prefix,
                     team_map,
                     team_names,
-                    output_subdir: output_dir.join(&t.name),
                     end_scan: t.end_scan.clone(),
                     purge_time: t.purge_time,
                     tree_map: t.tree_map,
@@ -159,7 +147,7 @@ pub fn build_scan_plan(config: &Config, budget: usize, explicit_workers: bool) -
         });
     }
 
-    ScanPlan { groups, output_dir }
+    ScanPlan { groups }
 }
 
 /// Parse /proc/self/mountinfo into a map `st_dev -> fstype`. Field 3 of each
