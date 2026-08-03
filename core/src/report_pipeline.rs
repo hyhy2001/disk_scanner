@@ -285,37 +285,37 @@ struct DirRowDraft {
 }
 
 impl PathTree {
-    fn build(root: &str, dir_paths: &HashSet<String>) -> Self {
-        let mut all_paths: HashSet<String> = HashSet::new();
-        all_paths.insert(root.to_string());
-        for dp in dir_paths {
-            let mut cur = dp.clone();
+    fn build(
+        root: &str,
+        dir_sizes_by_user: &HashMap<String, HashMap<u32, i64>>,
+    ) -> Self {
+        // Parent -> children index. Built in a single pass by walking each dir
+        // up to the root, so we never hold a separate all_paths set (which
+        // previously kept a second full copy of every dir + ancestor path
+        // string in memory) nor a cloned dir_paths_set. Each ancestor is
+        // inserted under its own parent as we climb, so the whole tree is
+        // discovered without extra structures.
+        let mut by_parent: HashMap<String, Vec<String>> = HashMap::new();
+        for dp in dir_sizes_by_user.keys() {
+            let mut cur: &str = dp;
             loop {
-                if !all_paths.insert(cur.clone()) {
-                    break;
-                }
-                if cur == root {
-                    break;
-                }
-                let parent = tm_parent(&cur).to_string();
+                let parent = tm_parent(cur);
                 if parent == cur {
+                    break; // "/" or a single-component path: top of the tree
+                }
+                by_parent
+                    .entry(parent.to_string())
+                    .or_default()
+                    .push(cur.to_string());
+                if parent == root {
                     break;
                 }
                 cur = parent;
             }
         }
-
-        // BFS from root: ensures parent_id < id, gives varint locality.
-        let mut by_parent: HashMap<String, Vec<String>> = HashMap::new();
-        for p in &all_paths {
-            if p == root {
-                continue;
-            }
-            let parent = tm_parent(p).to_string();
-            by_parent.entry(parent).or_default().push(p.clone());
-        }
         for v in by_parent.values_mut() {
             v.sort();
+            v.dedup();
         }
 
         let mut name_id_of: HashMap<String, i64> = HashMap::new();
@@ -647,19 +647,17 @@ pub fn build_detail_db_impl(
         let _t2 = Instant::now();
         let root = normalize_root(&treemap_root);
 
-        let dir_paths_set: HashSet<String> =
-            dir_sizes_by_user.keys().cloned().collect();
         println!(
             "[Phase 2] Building path tree for {} directories...",
-            dir_paths_set.len()
+            dir_sizes_by_user.len()
         );
-        let mut path_tree = PathTree::build(&root, &dir_paths_set);
+        let mut path_tree = PathTree::build(&root, &dir_sizes_by_user);
         if debug {
             println!("{}", crate::pipe_types::mem_checkpoint("after path tree built"));
         }
 
-        // Trim after PathTree build — dir_paths_set and intermediate BFS
-        // structures have been dropped; free pages before re-encode allocates.
+        // Trim after PathTree build — the path-keyed aggregates and intermediate
+        // BFS structures are consumed/dropped; free pages before re-encode.
         #[cfg(target_os = "linux")]
         {
             extern "C" { fn malloc_trim(pad: usize) -> i32; }
@@ -671,9 +669,7 @@ pub fn build_detail_db_impl(
                     _rss_before, _rss_after, _rss_after - _rss_before);
             }
         }
-        // Free the path-keyed set now — path_tree owns the canonical layout
-        // and lookups go through dir_id_of from here on.
-        drop(dir_paths_set);
+        // The tree is owned by path_tree now; lookups go through dir_id_of.
 
         // ─── STAGE 2b: re-encode full-path spills -> compact ID spills ─────
         // Replaces (size, path_str, ext_str) rows with (size, dir_id, name_id, ext_id).
@@ -1683,5 +1679,126 @@ fn cleanup_legacy_artifacts(detail_dir: &Path, treemap_dir: &Path) {
         } else if p.is_file() {
             let _ = fs::remove_file(&p);
         }
+    }
+}
+
+#[cfg(test)]
+mod path_tree_tests {
+    use super::*;
+
+    fn sizes(paths: &[&str]) -> HashMap<String, HashMap<u32, i64>> {
+        paths
+            .iter()
+            .map(|p| (p.to_string(), {
+                let mut m = HashMap::new();
+                m.insert(0u32, 1i64);
+                m
+            }))
+            .collect()
+    }
+
+    #[test]
+    fn build_matches_bfs_parent_child_ids() {
+        // Tree: / -> /a -> /a/b, /a/c ; /a/b -> /a/b/d
+        let root = "/";
+        let dirs = sizes(&["/a", "/a/b", "/a/b/d", "/a/c"]);
+        let tree = PathTree::build(root, &dirs);
+
+        // Root always id 0.
+        assert_eq!(tree.dir_id_of.get("/"), Some(&0));
+        // Every input dir present.
+        for p in ["/a", "/a/b", "/a/b/d", "/a/c"] {
+            assert!(tree.dir_id_of.contains_key(p), "missing {}", p);
+        }
+        // Ancestors discovered even if not in input (here all in input).
+        assert!(tree.dir_id_of.contains_key("/a/b/d"));
+
+        // parent_id of a child == id of its parent.
+        let pid_of = |child: &str| -> i64 {
+            let id = *tree.dir_id_of.get(child).unwrap();
+            tree.dirs_in_order
+                .iter()
+                .find(|d| d.id == id)
+                .unwrap()
+                .parent_id
+                .unwrap_or(-1)
+        };
+        assert_eq!(pid_of("/a"), 0); // direct child of root
+        assert_eq!(pid_of("/a/b"), *tree.dir_id_of.get("/a").unwrap());
+        assert_eq!(pid_of("/a/c"), *tree.dir_id_of.get("/a").unwrap());
+        assert_eq!(pid_of("/a/b/d"), *tree.dir_id_of.get("/a/b").unwrap());
+    }
+
+    #[test]
+    fn build_includes_missing_ancestors() {
+        // Only the deepest dir is in the input; ancestors must be synthesized.
+        let root = "/";
+        let dirs = sizes(&["/x/y/z"]);
+        let tree = PathTree::build(root, &dirs);
+
+        assert_eq!(tree.dir_id_of.get("/"), Some(&0));
+        assert!(tree.dir_id_of.contains_key("/x"));
+        assert!(tree.dir_id_of.contains_key("/x/y"));
+        assert!(tree.dir_id_of.contains_key("/x/y/z"));
+
+        // Root must have exactly one child: /x.
+        let root_row = &tree.dirs_in_order[0];
+        assert_eq!(root_row.id, 0);
+        let children: Vec<i64> = tree
+            .dirs_in_order
+            .iter()
+            .filter(|d| d.parent_id == Some(0))
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(children.len(), 1);
+        let x_id = *tree.dir_id_of.get("/x").unwrap();
+        assert_eq!(children[0], x_id);
+    }
+
+    #[test]
+    fn build_root_has_no_children() {
+        // dir_sizes_by_user empty: only the root node exists.
+        let tree = PathTree::build("/", &HashMap::new());
+        assert_eq!(tree.dir_id_of.len(), 1);
+        assert_eq!(tree.dirs_in_order.len(), 1);
+        assert_eq!(tree.dirs_in_order[0].parent_id, None);
+    }
+
+    #[test]
+    fn build_dedups_shared_ancestors() {
+        // Two deep branches share ancestors; each dir must have exactly one
+        // node and one parent edge even though both branches walk through it.
+        let root = "/";
+        let dirs = sizes(&["/s/a/x", "/s/a/y", "/s/b/z"]);
+        let tree = PathTree::build(root, &dirs);
+
+        assert_eq!(tree.dir_id_of.len(), 7); // /, /s, /s/a, /s/b, x, y, z
+        assert_eq!(tree.dirs_in_order.len(), 7);
+
+        // Children of root: exactly /s.
+        let root_id = 0;
+        let root_children: Vec<i64> = tree
+            .dirs_in_order
+            .iter()
+            .filter(|d| d.parent_id == Some(root_id))
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(root_children.len(), 1);
+        assert_eq!(root_children[0], *tree.dir_id_of.get("/s").unwrap());
+
+        // Children of /s/a: exactly /s/a/x and /s/a/y.
+        let a_id = *tree.dir_id_of.get("/s/a").unwrap();
+        let a_children: Vec<i64> = tree
+            .dirs_in_order
+            .iter()
+            .filter(|d| d.parent_id == Some(a_id))
+            .map(|d| d.id)
+            .collect();
+        let mut names: Vec<String> = a_children
+            .iter()
+            .map(|&id| tree.names[tree.dirs_in_order.iter().find(|d| d.id == id).unwrap().name_id as usize].clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["x".to_string(), "y".to_string()]);
     }
 }
