@@ -166,3 +166,30 @@ pub fn mem_checkpoint(label: &str) -> String {
         label, s.rss_mb, s.vsz_mb, s.peak_mb
     )
 }
+
+/// Force the allocator to release freed memory back to the OS.
+///
+/// The build uses mimalloc as its global allocator, so glibc's `malloc_trim`
+/// is a no-op here — freed segments stay mapped in the process's address
+/// space (VSZ) even though RSS is low. Under a virtual-memory cap (RLIMIT_AS,
+/// e.g. LSF `-M`), that reserved-but-unused VSZ accumulates across phases and
+/// a later `mmap` fails with "memory allocation of N bytes failed". Calling
+/// `mi_collect(true)` returns those segments to the OS immediately, keeping
+/// VSZ close to RSS at every phase boundary.
+///
+/// The symbol lives in mimalloc, which only the `duscan` binary links (the
+/// core lib itself does not depend on mimalloc). It is safe to declare the
+/// extern here: the reference is only created when this function is actually
+/// called, so core unit tests (which don't call it) still link fine.
+#[cfg(target_os = "linux")]
+pub fn trim_heap() {
+    extern "C" {
+        fn mi_collect(force: bool);
+    }
+    unsafe { mi_collect(true) }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn trim_heap() {
+    // No mimalloc on other platforms; nothing to trim.
+}

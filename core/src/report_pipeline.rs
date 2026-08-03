@@ -628,17 +628,17 @@ pub fn build_detail_db_impl(
             println!("{}", crate::pipe_types::mem_checkpoint("after stage 1 ingest"));
         }
 
-        // Trim glibc heap after stage 1 ingest — rows_by_user and dir_sizes
-        // have been spilled/drained; freed pages can be returned to OS before
-        // PathTree build allocates fresh memory.
+        // Trim heap after stage 1 ingest — rows_by_user and dir_sizes have
+        // been spilled/drained; freed segments can be returned to OS before
+        // PathTree build allocates fresh memory. Uses mi_collect (mimalloc),
+        // not malloc_trim, which is a no-op with the mimalloc global allocator.
         #[cfg(target_os = "linux")]
         {
-            extern "C" { fn malloc_trim(pad: usize) -> i32; }
             let _rss_before = crate::pipe_types::get_rss_mb();
-            unsafe { malloc_trim(0); }
+            crate::pipe_types::trim_heap();
             if debug {
                 let _rss_after = crate::pipe_types::get_rss_mb();
-                println!("[Phase 2] malloc_trim after ingest: {:.1} MB -> {:.1} MB (delta: {:+.1} MB)",
+                println!("[Phase 2] mi_collect after ingest: {:.1} MB -> {:.1} MB (delta: {:+.1} MB)",
                     _rss_before, _rss_after, _rss_after - _rss_before);
             }
         }
@@ -656,16 +656,16 @@ pub fn build_detail_db_impl(
             println!("{}", crate::pipe_types::mem_checkpoint("after path tree built"));
         }
 
-        // Trim after PathTree build — the path-keyed aggregates and intermediate
-        // BFS structures are consumed/dropped; free pages before re-encode.
+        // Trim heap after PathTree build — the path-keyed aggregates and
+        // intermediate BFS structures are consumed/dropped; return freed
+        // segments to the OS before re-encode allocates.
         #[cfg(target_os = "linux")]
         {
-            extern "C" { fn malloc_trim(pad: usize) -> i32; }
             let _rss_before = crate::pipe_types::get_rss_mb();
-            unsafe { malloc_trim(0); }
+            crate::pipe_types::trim_heap();
             if debug {
                 let _rss_after = crate::pipe_types::get_rss_mb();
-                println!("[Phase 2] malloc_trim after path tree: {:.1} MB -> {:.1} MB (delta: {:+.1} MB)",
+                println!("[Phase 2] mi_collect after path tree: {:.1} MB -> {:.1} MB (delta: {:+.1} MB)",
                     _rss_before, _rss_after, _rss_after - _rss_before);
             }
         }
@@ -1376,20 +1376,17 @@ pub fn build_detail_db_impl(
 
         #[cfg(target_os = "linux")]
         {
-            unsafe extern "C" {
-                fn malloc_trim(pad: usize) -> i32;
-            }
             let rss_before = crate::pipe_types::get_rss_mb();
             if debug {
-                println!("{}", crate::pipe_types::mem_checkpoint("before malloc_trim"));
+                println!("{}", crate::pipe_types::mem_checkpoint("before mi_collect"));
             }
-            let trim_result = unsafe { malloc_trim(0) };
+            crate::pipe_types::trim_heap();
             let rss_after = crate::pipe_types::get_rss_mb();
             if debug {
-                println!("{}", crate::pipe_types::mem_checkpoint("after malloc_trim"));
+                println!("{}", crate::pipe_types::mem_checkpoint("after mi_collect"));
                 println!(
-                    "[Phase 2] malloc_trim(0)={} RSS: {:.1} MB -> {:.1} MB (delta: {:+.1} MB)",
-                    trim_result, rss_before, rss_after, rss_after - rss_before
+                    "[Phase 2] mi_collect RSS: {:.1} MB -> {:.1} MB (delta: {:+.1} MB)",
+                    rss_before, rss_after, rss_after - rss_before
                 );
             }
         }
