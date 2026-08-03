@@ -289,13 +289,19 @@ impl PathTree {
         root: &str,
         dir_sizes_by_user: &HashMap<String, HashMap<u32, i64>>,
     ) -> Self {
-        // Parent -> children index. Built in a single pass by walking each dir
-        // up to the root, so we never hold a separate all_paths set (which
-        // previously kept a second full copy of every dir + ancestor path
-        // string in memory) nor a cloned dir_paths_set. Each ancestor is
-        // inserted under its own parent as we climb, so the whole tree is
-        // discovered without extra structures.
+        // Parent -> children index.
+        //
+        // In a full scan, every ancestor of a dir is itself a dir that appears
+        // as a key in dir_sizes_by_user. We exploit that to avoid the O(depth)
+        // ancestor walk: each dir is inserted under its own parent, and the
+        // walk stops as soon as the parent is already a known key (it will be
+        // inserted under ITS parent when its own turn comes). Only ancestors
+        // that are NOT keys (e.g. filtered empty dirs) are synthesized, which
+        // is rare. This keeps the total number of String allocations to ~2×
+        // the dir count instead of ~2×depth×dir count — a huge VSZ saving at
+        // multi-million-dir scale (deep trees were ballooning to 18GB+ VSZ).
         let mut by_parent: HashMap<String, Vec<String>> = HashMap::new();
+        let known: HashSet<&str> = dir_sizes_by_user.keys().map(|s| s.as_str()).collect();
         for dp in dir_sizes_by_user.keys() {
             let mut cur: &str = dp;
             loop {
@@ -308,6 +314,11 @@ impl PathTree {
                     .or_default()
                     .push(cur.to_string());
                 if parent == root {
+                    break;
+                }
+                // Ancestor is a known dir key: it will register itself under
+                // its own parent when processed. Stop walking here.
+                if known.contains(parent) {
                     break;
                 }
                 cur = parent;
@@ -1797,5 +1808,51 @@ mod path_tree_tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["x".to_string(), "y".to_string()]);
+    }
+
+    #[test]
+    fn build_stops_at_known_ancestor_but_keeps_branch() {
+        // Most ancestors ARE keys in a real scan. The walk must stop early at
+        // a known ancestor (avoiding O(depth) allocation churn) WITHOUT
+        // dropping the branch that leads down to it.
+        let root = "/";
+        // /app, /app/log, /app/log/2024 are all keys; deep leaves under them.
+        let dirs = sizes(&[
+            "/app",
+            "/app/log",
+            "/app/log/2024",
+            "/app/log/2024/01",
+            "/app/log/2024/01/errors.log.dir",
+            "/app/www",
+            "/app/www/a/b/c",
+        ]);
+        let tree = PathTree::build(root, &dirs);
+
+        // Every path present, with correct parent linkage down the chain.
+        let pid_of = |child: &str| -> i64 {
+            let id = *tree.dir_id_of.get(child).unwrap();
+            tree.dirs_in_order
+                .iter()
+                .find(|d| d.id == id)
+                .unwrap()
+                .parent_id
+                .unwrap_or(-1)
+        };
+        assert_eq!(pid_of("/app"), 0);
+        assert_eq!(pid_of("/app/log"), *tree.dir_id_of.get("/app").unwrap());
+        assert_eq!(pid_of("/app/log/2024"), *tree.dir_id_of.get("/app/log").unwrap());
+        assert_eq!(pid_of("/app/log/2024/01"), *tree.dir_id_of.get("/app/log/2024").unwrap());
+        assert_eq!(
+            pid_of("/app/log/2024/01/errors.log.dir"),
+            *tree.dir_id_of.get("/app/log/2024/01").unwrap()
+        );
+        assert_eq!(pid_of("/app/www"), *tree.dir_id_of.get("/app").unwrap());
+        assert_eq!(pid_of("/app/www/a"), *tree.dir_id_of.get("/app/www").unwrap());
+        assert_eq!(pid_of("/app/www/a/b"), *tree.dir_id_of.get("/app/www/a").unwrap());
+        assert_eq!(pid_of("/app/www/a/b/c"), *tree.dir_id_of.get("/app/www/a/b").unwrap());
+
+        // /app/www/a and its parents were synthesized (not keys) but still present.
+        assert!(tree.dir_id_of.contains_key("/app/www/a"));
+        assert!(tree.dir_id_of.contains_key("/app/www/a/b"));
     }
 }
