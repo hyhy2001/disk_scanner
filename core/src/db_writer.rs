@@ -106,9 +106,15 @@ CREATE TABLE file_names (
 -- id = dir entity id (same dir shared across users).
 -- uid = file owner who has files inside this dir.
 -- path = pre-computed full path e.g. '/var/log/apache2'.
--- owner_uid = reserved placeholder, always 0 (not populated; the dashboard
---             never reads it). The real directory inode owner lives in
---             treemap.db's dirs.owner_uid.
+-- owner_uid = real owner of the directory inode itself, captured in Phase 1
+--             (dirowner_t*.bin) and filled in by report_pipeline.rs; 0 means
+--             unknown (the dir was never stat'd successfully). Do NOT treat
+--             this as dead weight: the dashboard filters on it
+--             (server/src/db/detail.ts, `WHERE uid = ? AND owner_uid = ?`) to
+--             show only the dirs a user owns, so dropping it empties every
+--             user's directory list and CSV export. treemap.db's
+--             dirs.owner_uid is the same value but falls back to a known uid
+--             instead of 0.
 -- size = total size of uid's files in this dir.
 -- files = count of uid's files in this dir.
 CREATE TABLE dirs (
