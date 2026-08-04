@@ -227,36 +227,11 @@ CREATE TABLE IF NOT EXISTS perm_issues (
   path        TEXT NOT NULL
 );
 
--- History tables (prefixed hist_, survive rebuild)
-CREATE TABLE IF NOT EXISTS hist_snapshots (
-  id         INTEGER PRIMARY KEY,
-  scan_date  INTEGER NOT NULL UNIQUE,
-  scanned_at INTEGER,
-  path       TEXT,
-  total      INTEGER,
-  used       INTEGER,
-  available  INTEGER,
-  inodes_total   INTEGER,
-  inodes_used    INTEGER,
-  inodes_free    INTEGER,
-  inodes_scanned INTEGER,
-  scanned_size INTEGER
-);
-CREATE TABLE IF NOT EXISTS hist_team_usage (
-  snapshot_id INTEGER NOT NULL,
-  name        TEXT,
-  team_id     INTEGER,
-  size        INTEGER,
-  FOREIGN KEY(snapshot_id) REFERENCES hist_snapshots(id) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS hist_user_usage (
-  snapshot_id INTEGER NOT NULL,
-  name        TEXT,
-  team_id     INTEGER,
-  size        INTEGER,
-  kind        TEXT,
-  FOREIGN KEY(snapshot_id) REFERENCES hist_snapshots(id) ON DELETE CASCADE
-);
+-- The hist_* tables are NOT declared here. They are created from
+-- report_history::HISTORY_DDL, which owns them, because this file used to carry
+-- a second copy of the same three CREATE TABLE statements and the two drifted:
+-- the column order of hist_snapshots disagreed, which broke the positional
+-- carry-over below.
 ";
 
 const MERGED_INDEX_DDL: &str = "
@@ -332,6 +307,15 @@ INSERT INTO fts_dir_names(fts_dir_names) VALUES('rebuild');
 
 /// Create or open a merged report.db, initialising schema if needed.
 /// Returns the connection with WAL mode, cache, and mmap configured.
+///
+/// WAL is set for the write side, but note who reads this file afterwards: the
+/// dashboard opens report.db readonly with `journal_mode=OFF`
+/// (`server/src/db/open.ts`). That is safe only because the merge writes to a
+/// `.tmp` file and `rename()`s it into place, so a reader always has a complete,
+/// quiescent database and never has to replay a `-wal` sidecar. If this ever
+/// starts writing report.db in place, the dashboard's pragma has to change with
+/// it — a readonly `journal_mode=OFF` connection cannot see committed data that
+/// still lives in the WAL.
 pub fn open_merged_db(merged_db_path: &Path) -> rusqlite::Result<Connection> {
     let exists = merged_db_path.exists();
     let conn = Connection::open(merged_db_path)?;
@@ -350,26 +334,53 @@ pub fn open_merged_db(merged_db_path: &Path) -> rusqlite::Result<Connection> {
         // round-trips exactly instead of being clamped to 0.
         conn.pragma_update(None, "application_id", MERGED_APP_ID)?;
     }
+    // The hist_* tables come from report_history, which owns them; on an existing
+    // file this also widens hist_snapshots if it predates a column.
+    crate::report_history::ensure_schema(&conn)?;
     Ok(conn)
 }
 
-/// Add missing `hist_snapshots` columns to databases written by an older duscan.
-fn migrate_hist_snapshots(conn: &Connection) -> rusqlite::Result<()> {
-    let new_cols: &[&str] = &["inodes_total", "inodes_used", "inodes_free", "inodes_scanned"];
-    for col in new_cols {
-        let exists = conn
-            .prepare(&format!("PRAGMA table_info(hist_snapshots)"))
-            .and_then(|mut s| {
-                Ok(s.query_map([], |r| r.get::<_, String>(1))?
-                    .flatten()
-                    .any(|c| c == *col))
-            })
-            .unwrap_or(true);
-        if !exists {
-            conn.execute(&format!("ALTER TABLE hist_snapshots ADD COLUMN {} INTEGER", col), [])?;
-        }
+/// Columns a table actually has, in declared order.
+fn table_columns(conn: &Connection, qualified_table: &str) -> rusqlite::Result<Vec<String>> {
+    let stmt = conn.prepare(&format!("SELECT * FROM {} LIMIT 0", qualified_table))?;
+    let names: Vec<String> = stmt.column_names().into_iter().map(str::to_string).collect();
+    // `stmt` borrows `conn`; drop before returning so callers can reuse it.
+    drop(stmt);
+    Ok(names)
+}
+
+/// Carry one history table over from a previous report.db.
+///
+/// Naming both sides explicitly is what makes this safe. `SELECT *` matched
+/// columns by position, so an older report missing a column failed the whole
+/// merge ("table has 12 columns but 11 values were supplied" — which also skips
+/// writing the new snapshot), and a report whose columns were declared in a
+/// different order was copied with the values silently shifted one place. Only
+/// the columns present in both are copied; anything the source lacks keeps its
+/// default.
+fn carry_history_table(conn: &Connection, table: &str) -> rusqlite::Result<()> {
+    let has_source: bool = conn.query_row(
+        "SELECT COUNT(*) FROM srcreport.sqlite_master WHERE type = 'table' AND name = ?1",
+        rusqlite::params![table],
+        |r| r.get::<_, i64>(0),
+    )? > 0;
+    if !has_source {
+        return Ok(());
     }
-    Ok(())
+    let target = table_columns(conn, table)?;
+    let source = table_columns(conn, &format!("srcreport.{}", table))?;
+    let shared: Vec<&str> = target
+        .iter()
+        .filter(|c| source.iter().any(|s| s == *c))
+        .map(String::as_str)
+        .collect();
+    if shared.is_empty() {
+        return Ok(());
+    }
+    let cols = shared.join(", ");
+    conn.execute_batch(&format!(
+        "INSERT OR IGNORE INTO {table} ({cols}) SELECT {cols} FROM srcreport.{table};"
+    ))
 }
 
 /// Copy all rows from source DBs into a merged report.db.
@@ -390,10 +401,6 @@ pub fn merge_into_single_db(
 
     // Build schemas + pragmas
     let mut conn = open_merged_db(&tmp)?;
-
-    // Migrate hist_snapshots if this report.db was created by an older duscan
-    // (before inode columns were added).
-    migrate_hist_snapshots(&conn)?;
 
     // ATTACH all 4 source DBs
     let source_detail = source_dir.join("data_detail.db");
@@ -436,11 +443,9 @@ pub fn merge_into_single_db(
 
     if source_report.exists() {
         conn.execute("ATTACH DATABASE ?1 AS srcreport", rusqlite::params![source_report.to_string_lossy().as_ref()])?;
-        conn.execute_batch(
-            "INSERT OR IGNORE INTO hist_snapshots SELECT * FROM srcreport.hist_snapshots;
-             INSERT OR IGNORE INTO hist_team_usage SELECT * FROM srcreport.hist_team_usage;
-             INSERT OR IGNORE INTO hist_user_usage SELECT * FROM srcreport.hist_user_usage;"
-        )?;
+        for table in ["hist_snapshots", "hist_team_usage", "hist_user_usage"] {
+            carry_history_table(&conn, table)?;
+        }
         conn.execute("DETACH DATABASE srcreport", [])?;
     }
 
@@ -1092,4 +1097,90 @@ pub fn detail_finalize(handle: DetailBuildHandle, for_merge: bool) -> PyResult<i
     // moved into place, because the merge reads it by name.
     finalize_db(conn, &build_path, &final_path, for_merge)?;
     Ok(files_inserted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Read a snapshot row back by column name, which is how the dashboard reads it.
+    fn snapshot_by_name(db: &Path, col: &str) -> Option<i64> {
+        let conn = Connection::open(db).unwrap();
+        conn.query_row(
+            &format!("SELECT {} FROM hist_snapshots WHERE scan_date = 20240101", col),
+            [],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .unwrap()
+    }
+
+    /// Write a previous-generation report.db whose hist_snapshots has the given
+    /// columns, then merge over it and return the merged path.
+    fn merge_over_source(dir: &Path, columns: &str, values: &str) -> std::path::PathBuf {
+        let source = dir.join("report.db");
+        {
+            let conn = Connection::open(&source).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE hist_snapshots ({columns});
+                 INSERT INTO hist_snapshots VALUES ({values});"
+            ))
+            .unwrap();
+        }
+        let merged = dir.join("merged.db");
+        merge_into_single_db(dir, &merged, "t", "/t", 1_700_000_000).unwrap();
+        merged
+    }
+
+    #[test]
+    fn carries_history_from_a_report_missing_newer_columns() {
+        // A report written before scanned_size and the inode columns existed.
+        // Positional SELECT * failed the whole merge on this, which also cost the
+        // run its new snapshot.
+        let dir = tempfile::tempdir().unwrap();
+        let merged = merge_over_source(
+            dir.path(),
+            "id INTEGER PRIMARY KEY, scan_date INTEGER NOT NULL UNIQUE, scanned_at INTEGER, \
+             path TEXT, total INTEGER, used INTEGER, available INTEGER",
+            "1, 20240101, 1704067200, '/', 10000, 6000, 4000",
+        );
+
+        assert_eq!(snapshot_by_name(&merged, "used"), Some(6000));
+        // Absent in the source, so it stays unset rather than borrowing a neighbour.
+        assert_eq!(snapshot_by_name(&merged, "inodes_total"), None);
+    }
+
+    #[test]
+    fn carries_history_from_a_report_whose_columns_are_declared_in_another_order() {
+        // Same column set, different declaration order: this is the case that used
+        // to succeed while shifting every value one position.
+        let dir = tempfile::tempdir().unwrap();
+        let merged = merge_over_source(
+            dir.path(),
+            "id INTEGER PRIMARY KEY, scan_date INTEGER NOT NULL UNIQUE, scanned_at INTEGER, \
+             path TEXT, total INTEGER, used INTEGER, available INTEGER, \
+             inodes_total INTEGER, inodes_used INTEGER, inodes_free INTEGER, \
+             inodes_scanned INTEGER, scanned_size INTEGER",
+            "1, 20240101, 1704067200, '/', 10000, 6000, 4000, 8000, 3000, 5000, 31, 777",
+        );
+
+        assert_eq!(snapshot_by_name(&merged, "scanned_size"), Some(777));
+        assert_eq!(snapshot_by_name(&merged, "inodes_total"), Some(8000));
+        assert_eq!(snapshot_by_name(&merged, "inodes_scanned"), Some(31));
+    }
+
+    #[test]
+    fn merges_a_report_with_no_history_tables_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("report.db");
+        drop(Connection::open(&source).unwrap());
+        let merged = dir.path().join("merged.db");
+
+        merge_into_single_db(dir.path(), &merged, "t", "/t", 1_700_000_000).unwrap();
+
+        let conn = Connection::open(&merged).unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM hist_snapshots", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
 }
