@@ -420,6 +420,10 @@ pub fn build_detail_db_impl(
     max_level: usize,
     min_size_bytes: i64,
     timestamp: i64,
+    // Directories the walk actually visited. The PathTree drops empty leaf
+    // dirs, so `dirs_in_order.len()` undercounts what was scanned; meta
+    // `total_dirs` must reflect the walk, not the tree.
+    total_dirs_walked: u64,
     _max_workers: usize,
     build_treemap: bool,
     debug: bool,
@@ -597,7 +601,14 @@ pub fn build_detail_db_impl(
                 .into_par_iter()
                 .fold(HashMap::new, |mut dir_sizes: HashMap<String, HashMap<u32, i64>>, path| {
                     let _ = for_each_dir_agg_in_file(&path, |event| {
-                        if !in_prefix(&event.path) {
+                        // Sanitise like the file-ingest path below, or a directory
+                        // whose name contains a control char would key the tree
+                        // raw while files under it resolve to the sanitised
+                        // parent — every one of those files then falls through
+                        // the re-encode lookup (`unwrap_or(0)`) and is
+                        // misattributed to the scan root.
+                        let safe_path = crate::sanitise_path(&event.path);
+                        if !in_prefix(&safe_path) {
                             return;
                         }
                         // Keep zero-size entries too. dir_sizes_by_user keys are the
@@ -606,7 +617,7 @@ pub fn build_detail_db_impl(
                         // it falls through the re-encode lookup (`unwrap_or(0)`) and is
                         // misattributed to the scan root. Size accounting downstream
                         // already skips `size <= 0`, so the extra entries are harmless.
-                        let user_sizes = dir_sizes.entry(event.path.clone()).or_default();
+                        let user_sizes = dir_sizes.entry(safe_path).or_default();
                         *user_sizes.entry(event.uid).or_insert(0) += event.size;
                     });
                     dir_sizes
@@ -1425,7 +1436,7 @@ pub fn build_detail_db_impl(
             ("total_files".to_string(), total_docs.to_string()),
             (
                 "total_dirs".to_string(),
-                dirs_in_order_arc.len().to_string(),
+                total_dirs_walked.to_string(),
             ),
             ("total_size".to_string(), total_size.to_string()),
             // Generation 2 added detail_users.owned_dirs.

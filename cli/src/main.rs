@@ -2413,6 +2413,7 @@ fn scan_one_view(
         tmpdir, uids_map, team_map,
         detail_db, treemap_db,
         dir_str.clone(), level, 0, timestamp,
+        dirs,
         // `debug` was hard-coded false here, so `run --debug` never reached
         // Phase 2 and its [Phase 2 Profile] block could never print.
         1, tree_map, debug, job.prefix.clone(),

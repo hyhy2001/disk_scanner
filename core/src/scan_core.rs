@@ -15,6 +15,19 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Pull the offending path out of an `ignore::Error`. Directory read errors are
+/// tagged `WithPath`; this unwraps that (and any nesting) so the permission-issue
+/// row records the real path instead of a truncated parse of the message.
+fn ignore_error_path(err: &ignore::Error) -> Option<String> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path.to_string_lossy().into_owned()),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            ignore_error_path(err)
+        }
+        _ => None,
+    }
+}
+
 /// Live progress counters shared between the scan engine and an external
 /// consumer (e.g. the CLI's TUI thread). When a caller passes one of these to
 /// `run_scan_core`, the engine updates these atomics in place instead of
@@ -592,6 +605,10 @@ pub fn run_scan_core(
     let ps_clone = prog_size.clone();
     let d_clone = done.clone();
     let cancel_walk = cancel.clone();
+    // Set when a spill write fails (disk full, etc.); the walk aborts on it and
+    // run_scan_core returns an error instead of a silently incomplete scan.
+    let write_error_flag: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let write_error_flag_clone = write_error_flag.clone();
     let dir_clone = directory.clone();
     let skips = skip_dirs.clone();
     let tmpdir_clone = tmpdir_str.clone();
@@ -692,6 +709,7 @@ pub fn run_scan_core(
                     perm_writer: None,
                     dir_agg_writer: None,
                     dir_owner_writer: None,
+                    write_error: write_error_flag_clone.clone(),
                 };
                 let skips = skips.clone();
                 let hardlinks_shared = hardlink_inodes.clone();
@@ -701,12 +719,15 @@ pub fn run_scan_core(
                 let visited_dirs = visited_dirs_clone.clone();
                 let foreign_mnt_logged = foreign_mnt_logged_clone.clone();
                 let cancel = cancel_walk.clone();
+                let write_error = write_error_flag_clone.clone();
 
                 Box::new(move |entry_res| {
                     // Cooperative cancellation: the TUI (or any consumer) sets
                     // the cancel flag on quit; bail out of the walk promptly so
                     // teardown doesn't block for the rest of a large tree.
-                    if cancel.load(Ordering::Relaxed) {
+                    // A failed spill write aborts the walk too: continuing would
+                    // produce a scan that claims success with events missing.
+                    if cancel.load(Ordering::Relaxed) || write_error.load(Ordering::Relaxed) {
                         return WalkState::Quit;
                     }
 
@@ -715,11 +736,19 @@ pub fn run_scan_core(
                         Ok(e) => e,
                         Err(err) => {
                             let err_str = err.to_string();
-                            // ignore::Error formats as: "/path/to/dir: Permission denied (os error 13)"
-                            let path_str = err_str
-                                .find(": ")
-                                .map(|idx| err_str[..idx].to_string())
-                                .unwrap_or_default();
+                            // Prefer the error's structured path. ignore::Error
+                            // tags directory errors with WithPath, which knows
+                            // the offending path directly; parsing the formatted
+                            // message ("/path: Permission denied ...") truncates
+                            // at the first ": " — a directory whose name
+                            // contains ": " would record a wrong path.
+                            let path_str = ignore_error_path(&err)
+                                .unwrap_or_else(|| {
+                                    err_str
+                                        .find(": ")
+                                        .map(|idx| err_str[..idx].to_string())
+                                        .unwrap_or_default()
+                                });
 
                             state.t_perm_issues += 1;
                             state.flush_permission_issue(
@@ -1111,6 +1140,14 @@ pub fn run_scan_core(
             .or_else(|| e.downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "scan walk thread panicked".to_string());
         return Err(PyRuntimeError::new_err(format!("scan walk failed: {}", msg)));
+    }
+
+    // A spill write failed (disk full) and the walk aborted: report it as an
+    // error rather than a clean scan with events silently missing.
+    if write_error_flag.load(Ordering::Relaxed) {
+        return Err(PyRuntimeError::new_err(
+            "scan aborted: a scan-data write failed (disk full?) — no report was produced".to_string(),
+        ));
     }
 
     // --- Build return value ---

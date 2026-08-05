@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -61,6 +61,15 @@ pub(crate) struct ThreadLocalState {
     pub(crate) perm_writer: Option<BufWriter<fs::File>>,
     pub(crate) dir_agg_writer: Option<BufWriter<fs::File>>,
     pub(crate) dir_owner_writer: Option<BufWriter<fs::File>>,
+    /// Set when a spill write fails (e.g. disk full). The walk aborts on it so
+    /// a scan cannot silently complete with events that were never recorded.
+    pub(crate) write_error: Arc<AtomicBool>,
+}
+
+fn mark_write_error(flag: &Arc<AtomicBool>, result: std::io::Result<()>) {
+    if result.is_err() {
+        flag.store(true, Ordering::Relaxed);
+    }
 }
 
 impl ThreadLocalState {
@@ -194,13 +203,17 @@ impl ThreadLocalState {
                     let write_header = f.metadata().map(|m| m.len() == 0).unwrap_or(false);
                     let mut writer = BufWriter::with_capacity(16 * 1024 * 1024, f);
                     if write_header {
-                        let _ = writer.write_all(&SCAN_EVENT_BIN_MAGIC_V1);
+                        mark_write_error(&self.write_error, writer.write_all(&SCAN_EVENT_BIN_MAGIC_V1));
                     }
                     self.event_bin_writers[bucket] = Some(writer);
+                } else {
+                    // Could not open the spill file at all: record the failure
+                    // rather than silently dropping every buffered event.
+                    self.write_error.store(true, Ordering::Relaxed);
                 }
             }
             if let Some(writer) = self.event_bin_writers[bucket].as_mut() {
-                let _ = writer.write_all(&self.t_event_bin_bufs[bucket]);
+                mark_write_error(&self.write_error, writer.write_all(&self.t_event_bin_bufs[bucket]));
                 bytes_written += self.t_event_bin_bufs[bucket].len() as u64;
                 self.t_event_bin_bufs[bucket].clear();
                 self.t_event_buf_records[bucket] = 0;
@@ -245,7 +258,11 @@ impl ThreadLocalState {
             } else {
                 fs::symlink_metadata(path).map(|m| m.uid()).unwrap_or(0)
             };
-            let _ = writeln!(writer, "P\t{}\t{}\t{}\t{}", uid, kind, error_code, path);
+            if writeln!(writer, "P\t{}\t{}\t{}\t{}", uid, kind, error_code, path).is_err() {
+                self.write_error.store(true, Ordering::Relaxed);
+            }
+        } else {
+            self.write_error.store(true, Ordering::Relaxed);
         }
     }
 
@@ -259,9 +276,11 @@ impl ThreadLocalState {
                 let write_header = f.metadata().map(|m| m.len() == 0).unwrap_or(false);
                 let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, f);
                 if write_header {
-                    let _ = writer.write_all(&DIR_AGG_BIN_MAGIC_V1);
+                    mark_write_error(&self.write_error, writer.write_all(&DIR_AGG_BIN_MAGIC_V1));
                 }
                 self.dir_agg_writer = Some(writer);
+            } else {
+                self.write_error.store(true, Ordering::Relaxed);
             }
         }
         if let Some(writer) = self.dir_agg_writer.as_mut() {
@@ -269,10 +288,10 @@ impl ThreadLocalState {
                 let path_bytes = path.as_bytes();
                 let len = u32::try_from(path_bytes.len()).unwrap_or(u32::MAX);
                 let safe_len = usize::try_from(len).unwrap_or(path_bytes.len());
-                let _ = writer.write_all(&uid.to_le_bytes());
-                let _ = writer.write_all(&size.to_le_bytes());
-                let _ = writer.write_all(&len.to_le_bytes());
-                let _ = writer.write_all(&path_bytes[..safe_len.min(path_bytes.len())]);
+                mark_write_error(&self.write_error, writer.write_all(&uid.to_le_bytes()));
+                mark_write_error(&self.write_error, writer.write_all(&size.to_le_bytes()));
+                mark_write_error(&self.write_error, writer.write_all(&len.to_le_bytes()));
+                mark_write_error(&self.write_error, writer.write_all(&path_bytes[..safe_len.min(path_bytes.len())]));
             }
         }
     }
@@ -287,9 +306,11 @@ impl ThreadLocalState {
                 let write_header = f.metadata().map(|m| m.len() == 0).unwrap_or(false);
                 let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, f);
                 if write_header {
-                    let _ = writer.write_all(&DIR_OWNER_BIN_MAGIC_V1);
+                    mark_write_error(&self.write_error, writer.write_all(&DIR_OWNER_BIN_MAGIC_V1));
                 }
                 self.dir_owner_writer = Some(writer);
+            } else {
+                self.write_error.store(true, Ordering::Relaxed);
             }
         }
         if let Some(writer) = self.dir_owner_writer.as_mut() {
@@ -298,9 +319,9 @@ impl ThreadLocalState {
                 let path_bytes = path.as_bytes();
                 let len = u32::try_from(path_bytes.len()).unwrap_or(u32::MAX);
                 let safe_len = usize::try_from(len).unwrap_or(path_bytes.len());
-                let _ = writer.write_all(&uid.to_le_bytes());
-                let _ = writer.write_all(&len.to_le_bytes());
-                let _ = writer.write_all(&path_bytes[..safe_len.min(path_bytes.len())]);
+                mark_write_error(&self.write_error, writer.write_all(&uid.to_le_bytes()));
+                mark_write_error(&self.write_error, writer.write_all(&len.to_le_bytes()));
+                mark_write_error(&self.write_error, writer.write_all(&path_bytes[..safe_len.min(path_bytes.len())]));
             }
         }
     }
