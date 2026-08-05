@@ -1517,13 +1517,17 @@ fn show_history_compare(out: &str, target: Option<&str>, days: i64, top: usize, 
         };
         if dates.len() < 2 { continue; }
 
-        // Per-user usage series aligned to `dates` (0 where a user is absent
-        // that day). Collected user-first for easy growth computation.
+        // Per-account usage series aligned to `dates` (0 where an account is
+        // absent that day). Collected account-first for easy growth computation.
+        // Not filtered on `kind`: it only marks team_map membership at scan
+        // time, so on a target scanned without a team_map every row is 'other'
+        // and filtering would leave `series` empty — which `continue`s below and
+        // drops the target from the comparison entirely.
         let mut series: std::collections::BTreeMap<String, Vec<i64>> = std::collections::BTreeMap::new();
         for (col, (snap_id, _)) in dates.iter().enumerate() {
             let rows = {
                 let Ok(mut stmt) = conn.prepare(
-                    "SELECT name, size FROM hist_user_usage WHERE snapshot_id = ?1 AND kind = 'user'",
+                    "SELECT name, size FROM hist_user_usage WHERE snapshot_id = ?1",
                 ) else { continue };
                 let v: Vec<(String, i64)> = stmt.query_map(rusqlite::params![snap_id], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
@@ -1601,11 +1605,19 @@ fn fmt_date_short(d: i64) -> String {
     format!("{:02}-{:02}", (d / 100) % 100, d % 100)
 }
 
-/// Top users (kind='user') for a snapshot, largest first.
+/// Top accounts for a snapshot, largest first.
+///
+/// Deliberately unfiltered on `kind`. That column records only whether the
+/// account matched the scan config's `team_map` at write time (report_history.rs
+/// writes 'user' or 'other'; team aggregates go to hist_team_usage, so no total
+/// row can leak in here). A target scanned without a team_map has every row
+/// stored as 'other', and a `kind = 'user'` filter then returns nothing — the
+/// history listing prints each snapshot with no accounts under it. Same reason
+/// write_top_users_table has always been unfiltered.
 fn top_users_for_snapshot(conn: &rusqlite::Connection, snap_id: i64) -> Vec<(String, i64)> {
     conn.prepare(
         "SELECT name, size FROM hist_user_usage \
-         WHERE snapshot_id = ?1 AND kind = 'user' ORDER BY size DESC LIMIT 10",
+         WHERE snapshot_id = ?1 ORDER BY size DESC LIMIT 10",
     )
     .and_then(|mut s| {
         s.query_map(rusqlite::params![snap_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
