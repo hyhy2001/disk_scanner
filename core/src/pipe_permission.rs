@@ -76,7 +76,7 @@ pub fn write_permission_issues_db(
                 .map_err(|e| PyRuntimeError::new_err(format!("meta dir: {}", e)))?;
             stmt.execute(params!["total", events.len().to_string()])
                 .map_err(|e| PyRuntimeError::new_err(format!("meta total: {}", e)))?;
-            stmt.execute(params!["schema_version", "1"])
+            stmt.execute(params!["schema_version", "2"])
                 .map_err(|e| PyRuntimeError::new_err(format!("meta schema: {}", e)))?;
         }
         tx.commit()

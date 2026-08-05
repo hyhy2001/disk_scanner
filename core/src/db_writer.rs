@@ -93,7 +93,15 @@ CREATE TABLE users (
   total_dirs        INTEGER NOT NULL,
   total_size        INTEGER NOT NULL,
   permission_issues INTEGER NOT NULL DEFAULT 0,
-  is_target         INTEGER NOT NULL DEFAULT 0
+  is_target         INTEGER NOT NULL DEFAULT 0,
+  -- Directories where this user is the owner, as opposed to total_dirs, which
+  -- counts every directory the user has a byte in. The dashboard lists owned
+  -- directories, so counting them at read time meant a range scan over the
+  -- user's whole slice on every page load; tallying it here during the merge
+  -- turns that into a primary-key lookup. Column order is load-bearing: the
+  -- merge copies rows with SELECT *, so this must stay last in both this table
+  -- and detail_users below.
+  owned_dirs        INTEGER NOT NULL DEFAULT 0
 );
 
 -- File basename dictionary (unique basenames across all files).
@@ -174,7 +182,10 @@ CREATE TABLE IF NOT EXISTS detail_users (
   total_dirs        INTEGER NOT NULL,
   total_size        INTEGER NOT NULL,
   permission_issues INTEGER NOT NULL DEFAULT 0,
-  is_target         INTEGER NOT NULL DEFAULT 0
+  is_target         INTEGER NOT NULL DEFAULT 0,
+  -- Must match the column order of `users` above: the merge is
+  -- `INSERT OR IGNORE INTO detail_users SELECT * FROM srcdetail.users`.
+  owned_dirs        INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS detail_file_names (
   id   INTEGER PRIMARY KEY,
@@ -892,6 +903,9 @@ pub struct UserRow {
     pub total_size: i64,
     pub permission_issues: i64,
     pub is_target: i64,
+    /// Directories owned by this user — see the `users` DDL for why it is
+    /// tallied here rather than counted by the reader.
+    pub owned_dirs: i64,
 }
 
 
@@ -943,8 +957,8 @@ pub fn detail_insert_users(handle: &mut DetailBuildHandle, users: &[UserRow]) ->
         let mut stmt = tx
             .prepare(
                 "INSERT INTO users(uid, username, team_id, total_files, total_dirs, \
-                 total_size, permission_issues, is_target) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 total_size, permission_issues, is_target, owned_dirs) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .map_err(|e| PyRuntimeError::new_err(format!("prep users: {}", e)))?;
         for u in users {
@@ -957,6 +971,7 @@ pub fn detail_insert_users(handle: &mut DetailBuildHandle, users: &[UserRow]) ->
                 u.total_size,
                 u.permission_issues,
                 u.is_target,
+                u.owned_dirs,
             ])
             .map_err(|e| PyRuntimeError::new_err(format!("ins user: {}", e)))?;
         }

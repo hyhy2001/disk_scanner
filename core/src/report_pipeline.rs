@@ -1351,6 +1351,20 @@ pub fn build_detail_db_impl(
         dir_rows.sort_by_key(|r| (r.0, r.1));
         db_writer::detail_insert_dirs(&mut detail_handle, &dir_rows)?;
 
+        // Tally, per user, the directories that user owns. The dashboard's
+        // per-user directory list is filtered to `uid = owner_uid`, so total_dirs
+        // (every directory the user has bytes in) is the wrong count for it —
+        // on a real report the two differ by up to a thousand rows, and for
+        // nobody it is 0 owned against 102 contributed. Counting it at read time
+        // meant a range scan over the user's whole slice on every page load;
+        // dir_rows is already in hand here, so this is one pass over data we hold.
+        let mut owned_dirs: HashMap<i64, i64> = HashMap::new();
+        for (_dir_id, uid, _parent_id, _path, owner_uid, _size, _files) in &dir_rows {
+            if uid == owner_uid {
+                *owned_dirs.entry(*uid).or_insert(0) += 1;
+            }
+        }
+
         drop(dir_rows);
         drop(path_by_dir_id);
         drop(dir_meta);
@@ -1373,6 +1387,7 @@ pub fn build_detail_db_impl(
                 total_size: totals.size,
                 permission_issues: 0,
                 is_target: 0,
+                owned_dirs: owned_dirs.get(uid).copied().unwrap_or(0),
             });
         }
         user_rows.sort_by_key(|u| u.uid);
@@ -1380,6 +1395,7 @@ pub fn build_detail_db_impl(
         drop(user_totals);
         drop(user_dir_count);
         drop(user_rows);
+        drop(owned_dirs);
 
         // dir_user_size has been merged into the dirs table above.
         // top_files removed: no-filter pagination uses ix_files_uid_size index.
@@ -1412,7 +1428,8 @@ pub fn build_detail_db_impl(
                 dirs_in_order_arc.len().to_string(),
             ),
             ("total_size".to_string(), total_size.to_string()),
-            ("schema_version".to_string(), "1".to_string()),
+            // Generation 2 added detail_users.owned_dirs.
+            ("schema_version".to_string(), "2".to_string()),
             (
                 "treemap_db".to_string(),
                 treemap_db_pb
@@ -1639,7 +1656,8 @@ pub fn build_treemap_db_impl(
         ("max_level".to_string(), max_level.to_string()),
         ("total_size".to_string(), treemap_total_size.to_string()),
         ("total_dirs".to_string(), agg.dirs_in_order.len().to_string()),
-        ("schema_version".to_string(), "1".to_string()),
+        // Generation 2 added detail_users.owned_dirs.
+        ("schema_version".to_string(), "2".to_string()),
     ];
 
     let input = TreemapInput { names: agg.names, owners, dirs: dir_rows, meta };
