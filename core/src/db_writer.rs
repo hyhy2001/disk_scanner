@@ -606,16 +606,10 @@ fn finalize_db(
             );
         }
 
-        if final_path.exists() {
-            fs::remove_file(final_path).map_err(|e| {
-                PyRuntimeError::new_err(format!(
-                    "rm old final {}: {}",
-                    final_path.display(),
-                    e
-                ))
-            })?;
-        }
-
+        // No remove-then-rename: on POSIX rename() replaces the destination
+        // atomically, so deleting the old file first would leave a window where
+        // a kill loses the previous report entirely. The next merge then finds
+        // no source file and silently skips detail/treemap.
         let source = if skip_vacuum { build_path } else { &tmp_path };
         fs::rename(source, final_path).map_err(|e| {
             PyRuntimeError::new_err(format!(

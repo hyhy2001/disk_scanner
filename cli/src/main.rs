@@ -2205,6 +2205,42 @@ fn run_scan_headless(
     }
 }
 
+/// A cross-process exclusive lock on one target's output directory.
+///
+/// Two `duscan run` processes for the same target would otherwise race on the
+/// scratch DBs (`report.tmp`, `data_detail.db`, `treemap.db`) and the final
+/// rename, with outcomes from a failed merge to a mixed-generation report. The
+/// flock is held for the whole scan and released on drop (including a panic
+/// unwind). The lock file itself is left in place; it is an empty sentinel and
+/// the dashboard ignores it.
+struct TargetLock {
+    file: std::fs::File,
+}
+
+impl TargetLock {
+    /// Try to lock `dir/scan.lock` exclusively, creating the dir and file if
+    /// needed. Fails (rather than blocking) when another scan holds the lock.
+    fn acquire(dir: &std::path::Path) -> std::io::Result<TargetLock> {
+        std::fs::create_dir_all(dir)?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(dir.join("scan.lock"))?;
+        let rc = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(TargetLock { file })
+    }
+}
+
+impl Drop for TargetLock {
+    fn drop(&mut self) {
+        let _ = unsafe { libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN) };
+    }
+}
+
 /// Run the full pipeline for one target view: Phase 1 scan (feeding the live
 /// progress sink), Phase 2 detail DB, optional treemap, merge into report.db,
 /// and history snapshot. Updates the sink's phase label as it advances and
@@ -2239,6 +2275,19 @@ fn scan_one_view(
     let target_out = std::path::Path::new(out).join(&job.name);
     let run_started = now_epoch();
     let dir_str = job.scan_path.clone();
+
+    // Hold an exclusive flock on this target's output dir for the whole scan.
+    // A concurrent scan of the same target fails here cleanly instead of racing
+    // the scratch DBs. The running scan owns scan_status.json, so on lock
+    // failure we must not touch it.
+    let _target_lock = match TargetLock::acquire(&target_out) {
+        Ok(lock) => lock,
+        Err(e) => {
+            *sink.error.lock().unwrap() = e.to_string();
+            eprintln!("Target '{}' is already being scanned by another process: {}", job.name, e);
+            return;
+        }
+    };
 
     set_phase("scanning");
     write_scan_status(&target_out, "scanning", true, run_started, run_started, "Phase 1 scan", "", tree_map, 0, 0, 0);
@@ -2384,16 +2433,34 @@ fn scan_one_view(
     }
     let treemap_start = std::time::Instant::now();
 
+    // Only a tree built THIS run may be merged. A treemap.db left over from an
+    // earlier run (a crash between the build and the merge cleanup, or `--tree-map`
+    // now off) would otherwise be picked up by the merge and show the previous
+    // scan's tree alongside fresh detail/history.
+    let mut treemap_built = false;
+    let mut treemap_error: Option<String> = None;
     if tree_map {
         if let Some(agg) = &agg_opt {
             set_phase("treemap");
             let tm_out = out_path.join("treemap.db");
-            if let Err(e) = check_disk_core::report_pipeline::build_treemap_db_impl(
+            match check_disk_core::report_pipeline::build_treemap_db_impl(
                 agg, &tm_out, &dir_str, level, 0, timestamp, debug,
             ) {
-                eprintln!("Treemap error for '{}': {:?}", job.name, e);
+                Ok(_) => treemap_built = true,
+                Err(e) => {
+                    let msg = format!("treemap build failed: {e}");
+                    eprintln!("Treemap error for '{}': {}", job.name, msg);
+                    // The user asked for a treemap and did not get one; a scan
+                    // that silently succeeds without it would read as healthy
+                    // while the Treemap tab is empty. Flag it as an error.
+                    treemap_error = Some(msg);
+                }
             }
         }
+    }
+    if !treemap_built {
+        let _ = std::fs::remove_file(out_path.join("treemap.db"));
+        let _ = std::fs::remove_file(out_path.join("tree_map_data").join("treemap.db"));
     }
 
     // Move permission_issues.db from output root into the target dir.
@@ -2420,11 +2487,14 @@ fn scan_one_view(
     if debug {
         eprintln!("[stage] merge: {:.2}s", merge_start.elapsed().as_secs_f64());
     }
-    let merge_ok = merge_result.is_ok();
-    if !merge_ok {
-        eprintln!("Merge error for '{}': {:?}", job.name, merge_result);
+    // A failed merge must not be reported as success: report.db on disk is still
+    // the previous scan's, so "done" would make the dashboard show stale data as
+    // current. Capture the error and fold it into the final status below.
+    let merge_error = merge_result.err().map(|e| format!("merge failed: {e}"));
+    if let Some(msg) = &merge_error {
+        eprintln!("Merge error for '{}': {}", job.name, msg);
     }
-    if merge_ok {
+    if merge_error.is_none() {
         let _ = std::fs::remove_file(out_path.join("data_detail.db"));
         let _ = std::fs::remove_file(out_path.join("treemap.db"));
         let _ = std::fs::remove_file(out_path.join("report.tmp"));
@@ -2455,13 +2525,13 @@ fn scan_one_view(
         total_inodes,
         result["total_size"].as_i64().unwrap_or(0),
         result["permission_issues_count"].as_u64().unwrap_or(0),
-        total, tree_map, merge_ok, phase2_start.elapsed().as_secs() as i64,
+        total, tree_map, merge_error.is_none(), phase2_start.elapsed().as_secs() as i64,
     );
 
     // Per-target auto-sync: if this target declares a sync host, mirror its own
     // output dir to the remote after a successful merge. Failures are logged but
     // don't fail the scan.
-    if merge_ok {
+    if merge_error.is_none() {
         if let Some(host) = job.sync_host.as_deref() {
             if let Some(dest) = job.sync_dest_dir.as_deref() {
                 set_phase("syncing");
@@ -2487,8 +2557,21 @@ fn scan_one_view(
         }
     }
 
-    set_phase("done");
-    write_scan_status(&target_out, "done", false, run_started, timestamp, "Scan complete", "", tree_map, files, dirs, scanned_size);
+    // The final status must tell the truth. A merge failure leaves the previous
+    // report.db in place, and a treemap build failure leaves the Treemap tab
+    // empty — both report as "error" so the dashboard (and cron output) knows
+    // the scan did not complete cleanly instead of showing it as up to date.
+    let scan_error = merge_error.or(treemap_error);
+    match scan_error {
+        Some(msg) => {
+            set_phase("error");
+            write_scan_status(&target_out, "error", false, run_started, timestamp, "", &msg, tree_map, files, dirs, scanned_size);
+        }
+        None => {
+            set_phase("done");
+            write_scan_status(&target_out, "done", false, run_started, timestamp, "Scan complete", "", tree_map, files, dirs, scanned_size);
+        }
+    }
 }
 
 fn print_tree(
@@ -2829,6 +2912,26 @@ fn write_top_users_table(f: &mut std::fs::File, conn: &rusqlite::Connection, tot
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_lock_serialises_concurrent_scans() {
+        let dir = std::env::temp_dir().join(format!("duscan-lock-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // First scan takes the lock.
+        let first = TargetLock::acquire(&dir).expect("first acquire should succeed");
+
+        // A concurrent scan of the same target must fail, not block or race.
+        let second = TargetLock::acquire(&dir);
+        assert!(second.is_err(), "second concurrent scan should be refused");
+
+        // Releasing the lock (dropping the guard) lets the next scan through.
+        drop(first);
+        let third = TargetLock::acquire(&dir).expect("acquire after release should succeed");
+        drop(third);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn fmt_size_thresholds() {
