@@ -44,7 +44,7 @@ const TREEMAP_AGG_VERSION: u32 = 2;
 pub(crate) struct TreemapAggregates {
     pub(crate) version: u32,
     pub(crate) names: Vec<String>,
-    pub(crate) dirs_in_order: Vec<SerializableDirRow>,
+    pub(crate) dirs_in_order: Vec<DirRowDraft>,
     pub(crate) owner_weights: Vec<(i64, i64, i64)>,
     // Real directory inode owner (st_uid) per dir_id, dense 0..n_dirs, interned
     // to the same uid space as owner_weights. Replaces the old "top user by
@@ -56,14 +56,6 @@ pub(crate) struct TreemapAggregates {
     pub(crate) direct_file_count: Vec<i64>,
     pub(crate) total_size_by_dir: Vec<i64>,
     pub(crate) uid_to_username: HashMap<i64, String>,
-}
-
-#[derive(serde::Serialize, serde::Deserialize)]
-pub(crate) struct SerializableDirRow {
-    pub(crate) id: i64,
-    pub(crate) parent_id: Option<i64>,
-    pub(crate) name_id: i64,
-    pub(crate) depth: i64,
 }
 
 fn persist_aggregates(path: &Path, agg: &TreemapAggregates) -> PyResult<()> {
@@ -269,11 +261,12 @@ struct PathTree {
     names: Vec<String>,
 }
 
-struct DirRowDraft {
-    id: i64,
-    parent_id: Option<i64>,
-    name_id: i64,
-    depth: i64,
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DirRowDraft {
+    pub(crate) id: i64,
+    pub(crate) parent_id: Option<i64>,
+    pub(crate) name_id: i64,
+    pub(crate) depth: i64,
     // NOTE: `path: String` was removed. After PathTree::build, callers only
     // touch (id, parent_id, name_id, depth) — never the resolved path —
     // so carrying it for 15M dirs cost ~1.2 GB without benefit.
@@ -833,7 +826,7 @@ pub fn build_detail_db_impl(
             })
             .collect::<PyResult<Vec<_>>>()?;
 
-        let compact_row_spills: HashMap<String, Vec<PathBuf>> = compact_entries.into_iter().collect();
+        let mut compact_row_spills: HashMap<String, Vec<PathBuf>> = compact_entries.into_iter().collect();
         drop(row_spills); // free original spill map
 
         let total_compact_rows = total_compact_rows.load(Ordering::Relaxed);
@@ -1083,10 +1076,12 @@ pub fn build_detail_db_impl(
         let mut sorted_users: Vec<String> = compact_row_spills.keys().cloned().collect();
         sorted_users.sort();
 
-        let user_spill_paths: HashMap<String, Vec<PathBuf>> = compact_row_spills
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        // Move (not clone) the spill map: `compact_row_spills` is not read
+        // after this point (only its `drop` at the end of the insert pass),
+        // so a full clone would hold a second copy of every user's spill
+        // paths for the entire Pass A + insert phase.
+        let user_spill_paths: HashMap<String, Vec<PathBuf>> =
+            std::mem::take(&mut compact_row_spills);
 
         let total_users = sorted_users.len();
         if debug {
@@ -1241,8 +1236,8 @@ pub fn build_detail_db_impl(
         if debug {
             println!("{}", crate::pipe_types::mem_checkpoint("after insert"));
         }
-        // Insert pass is done — compact spill map can be dropped now.
-        drop(compact_row_spills);
+        // Insert pass is done. `compact_row_spills` was moved into
+        // `user_spill_paths` (empty map remains) and has been consumed.
         t_files_db = t_pipeline.elapsed().as_secs_f64();
 
         // path_tree.dir_id_of already cleared earlier after re-encode
@@ -1462,19 +1457,14 @@ pub fn build_detail_db_impl(
         // ─── STAGE 6: persist treemap aggregates if requested ─────────
         let agg_path_out: Option<PathBuf> = if build_treemap {
             let t_persist = Instant::now();
-            let dirs_serialized: Vec<SerializableDirRow> = dirs_in_order_arc
-                .iter()
-                .map(|d| SerializableDirRow {
-                    id: d.id,
-                    parent_id: d.parent_id,
-                    name_id: d.name_id,
-                    depth: d.depth,
-                })
-                .collect();
+            // Move the Vec out of the Arc (single strong ref, no clone) so the
+            // serialize pass does not hold a second copy of every DirRowDraft.
+            let dirs_in_order = Arc::try_unwrap(dirs_in_order_arc)
+                .unwrap_or_else(|arc| (*arc).clone());
             let agg = TreemapAggregates {
                 version: TREEMAP_AGG_VERSION,
                 names: std::mem::take(&mut path_tree.names),
-                dirs_in_order: dirs_serialized,
+                dirs_in_order,
                 owner_weights: std::mem::take(&mut owner_weights),
                 dir_owner_uid: std::mem::take(&mut dir_owner_uid),
                 subtree_size: std::mem::take(&mut subtree_size),
