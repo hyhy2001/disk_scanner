@@ -499,7 +499,14 @@ fn apply_build_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "synchronous", "OFF")?;
     conn.pragma_update(None, "temp_store", "MEMORY")?;
     conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
-    conn.pragma_update(None, "cache_size", -1_048_576i64)?;
+    // Page cache cap for throwaway build DBs (data_detail.db, treemap.db):
+    // these are written sequentially with journal_mode=OFF and then either
+    // merged-and-deleted or kept as-is. A 1GB cache just holds dirty pages
+    // in RAM that are only ever written back to a file that is about to be
+    // dropped — 256MB keeps the write-back pipeline fed without letting the
+    // detail build's pager balloon VSZ/RSS. The heavy CREATE INDEX path
+    // re-boosts cache+mmap explicitly in `detail_finalize`.
+    conn.pragma_update(None, "cache_size", -262_144i64)?;
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     Ok(())
 }
@@ -999,8 +1006,10 @@ pub fn detail_insert_file_names(handle: &mut DetailBuildHandle, names: &[String]
 
 pub(crate) fn detail_insert_dirs(
     handle: &mut DetailBuildHandle,
-    // (id, uid, parent_id, path, owner_uid, size, files)
-    dirs: &[(i64, i64, Option<i64>, String, i64, i64, i64)],
+    // (id, uid, parent_id, owner_uid, size, files)
+    dirs: &[(i64, i64, Option<i64>, i64, i64, i64)],
+    // dir_id -> full path, shared across all rows of that dir (NOT cloned per row).
+    paths: &[String],
 ) -> PyResult<()> {
     let tx = handle
         .conn
@@ -1010,7 +1019,10 @@ pub(crate) fn detail_insert_dirs(
         let mut stmt = tx
             .prepare_cached("INSERT INTO dirs(id, uid, parent_id, path, owner_uid, size, files) VALUES (?,?,?,?,?,?,?)")
             .map_err(|e| PyRuntimeError::new_err(format!("dirs prepare: {}", e)))?;
-        for (id, uid, parent_id, path, owner_uid, size, files) in dirs {
+        for (id, uid, parent_id, owner_uid, size, files) in dirs {
+            // Old behavior cloned the path into each row; missing entries were "".
+            // Preserved: resolve the shared path by dir_id here.
+            let path = paths.get(*id as usize).map(String::as_str).unwrap_or("");
             stmt.execute(params![id, uid, parent_id, path, owner_uid, size, files])
                 .map_err(|e| PyRuntimeError::new_err(format!("dirs insert: {}", e)))?;
         }
@@ -1066,18 +1078,20 @@ pub fn detail_set_meta(handle: &mut DetailBuildHandle, meta: &[(String, String)]
 /// Pass `false` when the caller wants a standalone, queryable `data_detail.db`
 /// (bare table names, as `detail_prefix()` supports) rather than a merge input.
 pub fn detail_finalize(handle: DetailBuildHandle, for_merge: bool) -> PyResult<i64> {
-    // Boost cache + mmap for CREATE INDEX phase. Indexes are built by
-    // scanning the entire `files` table multiple times — bigger cache
-    // means fewer disk re-reads. Restored to default after finalize.
-    handle
-        .conn
-        .execute_batch(
-            "PRAGMA cache_size = -4194304;\
-             PRAGMA mmap_size = 8589934592;",
-        )
-        .map_err(|e| PyRuntimeError::new_err(format!("pragma boost: {}", e)))?;
-
     if !for_merge {
+        // Boost cache + mmap for CREATE INDEX phase. Indexes are built by
+        // scanning the entire `files` table multiple times — bigger cache
+        // means fewer disk re-reads. Skipped entirely for a merge input: its
+        // index build is the merge's own, so the 4GB cache / 8GB mmap would
+        // only reserve memory the throwaway DB never uses.
+        handle
+            .conn
+            .execute_batch(
+                "PRAGMA cache_size = -4194304;\
+                 PRAGMA mmap_size = 8589934592;",
+            )
+            .map_err(|e| PyRuntimeError::new_err(format!("pragma boost: {}", e)))?;
+
         handle
             .conn
             .execute_batch(DETAIL_INDEX_DDL)

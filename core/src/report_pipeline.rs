@@ -294,11 +294,16 @@ impl PathTree {
         // walk stops as soon as the parent is already a known key (it will be
         // inserted under ITS parent when its own turn comes). Only ancestors
         // that are NOT keys (e.g. filtered empty dirs) are synthesized, which
-        // is rare. This keeps the total number of String allocations to ~2×
-        // the dir count instead of ~2×depth×dir count — a huge VSZ saving at
-        // multi-million-dir scale (deep trees were ballooning to 18GB+ VSZ).
-        let mut by_parent: HashMap<String, Vec<String>> = HashMap::new();
-        let known: HashSet<&str> = dir_sizes_by_user.keys().map(|s| s.as_str()).collect();
+        // is rare. This keeps the total number of String allocations to ~1×
+        // the dir count (in `dir_id_of`) instead of ~2×depth×dir count — a
+        // huge VSZ saving at multi-million-dir scale (deep trees were
+        // ballooning to 18GB+ VSZ).
+        //
+        // Keys AND values are `&str` borrowed from `dir_sizes_by_user`'s String
+        // keys: every path we insert (`parent`, `cur`) is a prefix slice of a
+        // key we iterate, so no path String is ever duplicated inside
+        // `by_parent` — the map is only a pointer index over the input.
+        let mut by_parent: HashMap<&str, Vec<&str>> = HashMap::new();
         for dp in dir_sizes_by_user.keys() {
             let mut cur: &str = dp;
             loop {
@@ -306,23 +311,21 @@ impl PathTree {
                 if parent == cur {
                     break; // "/" or a single-component path: top of the tree
                 }
-                by_parent
-                    .entry(parent.to_string())
-                    .or_default()
-                    .push(cur.to_string());
+                by_parent.entry(parent).or_default().push(cur);
                 if parent == root {
                     break;
                 }
                 // Ancestor is a known dir key: it will register itself under
-                // its own parent when processed. Stop walking here.
-                if known.contains(parent) {
+                // its own parent when processed. Stop walking here. (Borrows
+                // the map directly instead of a separate `known` set.)
+                if dir_sizes_by_user.contains_key(parent) {
                     break;
                 }
                 cur = parent;
             }
         }
         for v in by_parent.values_mut() {
-            v.sort();
+            v.sort_unstable();
             v.dedup();
         }
 
@@ -352,17 +355,17 @@ impl PathTree {
             depth: 0,
         });
 
-        let mut queue: VecDeque<(String, i64, i64)> = VecDeque::new();
-        queue.push_back((root.to_string(), 0, 0));
+        let mut queue: VecDeque<(&str, i64, i64)> = VecDeque::new();
+        queue.push_back((root, 0, 0));
         let mut next_id: i64 = 1;
         while let Some((parent_path, parent_id, depth)) = queue.pop_front() {
-            let Some(children) = by_parent.remove(&parent_path) else { continue };
+            let Some(children) = by_parent.remove(parent_path) else { continue };
             for child in children {
                 let id = next_id;
                 next_id += 1;
-                let seg = tm_basename(&child);
+                let seg = tm_basename(child);
                 let name_id = intern(seg);
-                dir_id_of.insert(child.clone(), id);
+                dir_id_of.insert(child.to_string(), id);
                 dirs_in_order.push(DirRowDraft {
                     id,
                     parent_id: Some(parent_id),
@@ -373,9 +376,9 @@ impl PathTree {
             }
         }
 
-        // BFS done. by_parent's children Vecs were consumed by remove(),
-        // but the outer HashMap still holds 15M String keys plus its own
-        // overhead (~1.2 GB at 15M-dir scale). Explicit drop frees it
+        // BFS done. by_parent's children Vecs were consumed by remove();
+        // the outer HashMap only ever held `&str` pointers (no String data),
+        // so its overhead is a fraction of the pre-borrow version. Drop it
         // immediately rather than waiting for end-of-function.
         drop(by_parent);
 
@@ -693,6 +696,19 @@ pub fn build_detail_db_impl(
         }
         // The tree is owned by path_tree now; lookups go through dir_id_of.
 
+        // Drain dir_sizes_by_user into dir_id-keyed form right away — before
+        // re-encode allocates the name/ext interning maps. The String keys are
+        // dropped here (~7 MB demo / ~1.2 GB worst case) instead of staying
+        // alive through the whole re-encode phase; owner aggregates and
+        // downstream lookups go through dir_id only.
+        let dir_sizes_drained: Vec<(i64, HashMap<u32, i64>)> = dir_sizes_by_user
+            .drain()
+            .filter_map(|(dir_path, uid_sizes)| {
+                path_tree.dir_id_of.get(&dir_path).map(|id| (*id, uid_sizes))
+            })
+            .collect();
+        drop(dir_sizes_by_user);
+
         // ─── STAGE 2b: re-encode full-path spills -> compact ID spills ─────
         // Replaces (size, path_str, ext_str) rows with (size, dir_id, name_id, ext_id).
         // Eliminates per-row String allocations in the streaming insert pass.
@@ -938,17 +954,6 @@ pub fn build_detail_db_impl(
                     ingested, owner_paths.len());
             }
         }
-
-        // Drain dir_sizes_by_user into dir_id-keyed form. The String keys are
-        // dropped here (~7 MB demo / ~1.2 GB worst case) — owner aggregates
-        // and downstream lookups go through dir_id only.
-        let dir_sizes_drained: Vec<(i64, HashMap<u32, i64>)> = dir_sizes_by_user
-            .drain()
-            .filter_map(|(dir_path, uid_sizes)| {
-                path_tree.dir_id_of.get(&dir_path).map(|id| (*id, uid_sizes))
-            })
-            .collect();
-        drop(dir_sizes_by_user);
 
         // dir_id_of is no longer needed after re-encode and dir aggregate remap.
         path_tree.dir_id_of = HashMap::new();
@@ -1332,35 +1337,28 @@ pub fn build_detail_db_impl(
         // not fabricate one where we don't. (The treemap DB additionally falls
         // back to the smallest known uid; detail keeps 0 to stay conservative.)
         let owner_uid_default: i64 = 0;
-        let owner_of = |dir_id: i64| -> i64 {
-            let idx = dir_id as usize;
-            match dir_owner_uid.get(idx) {
-                Some(&u) if u >= 0 => u,
-                _ => owner_uid_default,
-            }
-        };
-
-        // Collect dir_id -> (parent_id, owner_uid) for fast lookup.
-        let mut dir_meta: HashMap<i64, (Option<i64>, i64)> = HashMap::with_capacity(dirs_in_order_arc.len());
-        for d in dirs_in_order_arc.iter() {
-            dir_meta.insert(d.id, (d.parent_id, owner_of(d.id)));
-        }
 
         // Now build per-(dir_id, uid) rows from user_dir_size.
-        let mut dir_rows: Vec<(i64, i64, Option<i64>, String, i64, i64, i64)> =
+        // dir_ids are dense BFS-assigned (dirs_in_order[i].id == i), so
+        // parent_id and owner_uid are looked up by direct Vec indexing instead
+        // of a redundant dir_id -> (parent_id, owner_uid) HashMap.
+        let mut dir_rows: Vec<(i64, i64, Option<i64>, i64, i64, i64)> =
             Vec::with_capacity(user_dir_size.len());
         for ((uid, dir_id), (size, files)) in user_dir_size.iter() {
-            let (parent_id, owner_uid) = dir_meta.get(dir_id)
+            let idx = *dir_id as usize;
+            let parent_id = dirs_in_order_arc.get(idx).and_then(|d| d.parent_id);
+            let owner_uid = dir_owner_uid
+                .get(idx)
                 .copied()
-                .unwrap_or((None, owner_uid_default));
-            let path = path_by_dir_id.get(*dir_id as usize)
-                .cloned()
-                .unwrap_or_default();
-            dir_rows.push((*dir_id, *uid, parent_id, path, owner_uid, *size, *files));
+                .filter(|&u| u >= 0)
+                .unwrap_or(owner_uid_default);
+            dir_rows.push((*dir_id, *uid, parent_id, owner_uid, *size, *files));
         }
         // Sort for consistent insert order (helps SQLite write performance).
         dir_rows.sort_by_key(|r| (r.0, r.1));
-        db_writer::detail_insert_dirs(&mut detail_handle, &dir_rows)?;
+        // Paths are resolved from path_by_dir_id at insert time (dir_id -> path)
+        // instead of cloning a full path String into every (dir, uid) row.
+        db_writer::detail_insert_dirs(&mut detail_handle, &dir_rows, &path_by_dir_id)?;
 
         // Tally, per user, the directories that user owns. The dashboard's
         // per-user directory list is filtered to `uid = owner_uid`, so total_dirs
@@ -1370,7 +1368,7 @@ pub fn build_detail_db_impl(
         // meant a range scan over the user's whole slice on every page load;
         // dir_rows is already in hand here, so this is one pass over data we hold.
         let mut owned_dirs: HashMap<i64, i64> = HashMap::new();
-        for (_dir_id, uid, _parent_id, _path, owner_uid, _size, _files) in &dir_rows {
+        for (_dir_id, uid, _parent_id, owner_uid, _size, _files) in &dir_rows {
             if uid == owner_uid {
                 *owned_dirs.entry(*uid).or_insert(0) += 1;
             }
@@ -1378,7 +1376,6 @@ pub fn build_detail_db_impl(
 
         drop(dir_rows);
         drop(path_by_dir_id);
-        drop(dir_meta);
 
         // users
         let mut user_rows: Vec<UserRow> = Vec::with_capacity(user_totals.len());

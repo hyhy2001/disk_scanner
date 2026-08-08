@@ -35,11 +35,26 @@ extern "C" {
 /// failed" (SIGABRT / core dump), even though real RSS is well under the cap.
 /// Disabling arena pre-reservation routes large allocations straight to the OS
 /// in exact-size mmaps, keeping VSZ close to RSS.
-fn configure_mimalloc() {
+///
+/// This must run BEFORE `main()`: mimalloc's first ≥32MiB allocation (e.g.
+/// SQLite's page cache opening a report DB) reserves the default 1GiB arena at
+/// process load, so a `mi_option_set` from `main` is too late — the arena is
+/// already mapped (VSZ ~1GiB + the binary's own maps even for `duscan status`).
+/// A `.init_array` constructor runs during dynamic loading, before any
+/// application allocation, and pins the option to 0 there.
+extern "C" fn configure_mimalloc() {
     unsafe {
         mi_option_set(MI_OPTION_ARENA_RESERVE, 0);
     }
 }
+
+/// Registered in `.init_array` so `configure_mimalloc` runs before `main()` —
+/// before the first large allocation that would otherwise reserve mimalloc's
+/// 1GiB arena and blow up VSZ/VmPeak under RLIMIT_AS.
+#[used]
+#[cfg_attr(target_os = "linux", link_section = ".init_array")]
+#[cfg_attr(not(target_os = "linux"), link_section = "__DATA,__mod_init_func")]
+static MIMALLOC_INIT: extern "C" fn() = configure_mimalloc;
 
 #[derive(Parser)]
 #[command(name = "duscan", version = "0.1.0")]
