@@ -156,19 +156,23 @@ Per-target output: `<output-dir>/<target>/` holds `report.db`, `scan_status.json
 ## Architecture
 
 ```
-├── Cargo.toml              # Workspace
+├── Cargo.toml              # Workspace (members = core, cli)
 ├── core/src/               # Scanning engine (pure Rust, no PyO3)
 │   ├── scan_core.rs        # Phase 1 parallel filesystem walk
+│   ├── scan_state.rs       # Per-thread buffers + binary spill writers
 │   ├── report_pipeline.rs  # Phase 2+3 SQLite builder
-│   ├── db_writer.rs        # DDL, bulk insert, merge
+│   ├── report_history.rs   # hist_* DDL + per-day snapshots
+│   ├── db_writer.rs        # DDL, bulk insert, merge, atomic rename
+│   ├── pipe_*.rs           # Spill format, permission, treemap helpers
 │   └── pyo3.rs             # Stub for pyo3 compatibility
-├── cli/src/                # CLI binary
-│   ├── main.rs             # Clap dispatch + scan loop
+├── cli/src/                # CLI binary (duscan)
+│   ├── main.rs             # Clap dispatch + scan orchestration + status
 │   ├── config.rs           # TOML config CRUD
-│   ├── scheduler.rs        # Device-aware scan plan
-│   └── ui.rs               # Ratatui live TUI
-├── legacy/                 # Python reference code (read-only)
-└── src/rust_scanner/       # Original PyO3 crate (.so build)
+│   ├── scheduler.rs        # Device-aware scan plan (classify + cap workers)
+│   └── config_tui.rs       # Ratatui config + report TUI
+└── src/                    # Legacy PyO3 crates — reference only, NOT workspace
+    ├── rust_scanner/       # members and not built by `make build`
+    └── rust_exporter/
 ```
 
 ## Scan performance (NFS)
@@ -183,10 +187,12 @@ things keep it fast on NFS:
   inode-owner checks together. On old kernels where `statx()` isn't usable it
   falls back to `entry.metadata()` (correct, just more syscalls). Local
   filesystems keep the plain `metadata()` path (already one syscall).
-- **`nfs_parallel`** (in `duscan.toml`, default **16**) caps walker threads per
+- **`nfs_parallel`** (in `duscan.toml`, default **64**) caps walker threads per
   NFS device. NFS is latency-bound, so more RPCs in flight hide round-trip
   latency; raise it for high-latency mounts, lower it if the NFS server is the
-  bottleneck. HDDs stay capped low (seek-bound); SSD/NVMe get the full budget.
+  bottleneck. `hdd_parallel` (default **8**) caps HDDs low (seek-bound) and
+  `ssd_parallel` (default **0** = unlimited) leaves SSD/NVMe on the full budget.
+  An explicit `--workers N` bypasses all three caps.
 
 ## Memory / VSZ under virtual-memory caps (LSF `-M`, cgroups)
 
