@@ -230,20 +230,23 @@ space. Dirs that couldn't be stat'd fall back to the smallest known uid.
 ## Architecture
 
 ```
-├── Cargo.toml              # Workspace
+├── Cargo.toml              # Workspace (members = core, cli)
 ├── core/src/               # Scanning engine (pure Rust)
 │   ├── scan_core.rs        # Phase 1 parallel filesystem walk
 │   ├── scan_state.rs       # Per-thread buffers + binary spill writers
 │   ├── report_pipeline.rs  # Phase 2+3 SQLite builder
+│   ├── report_history.rs   # hist_* DDL + per-day snapshots
 │   ├── db_writer.rs        # DDL, bulk insert, merge, atomic rename
-│   └── pipe_*.rs           # Spill format, permission, treemap helpers
+│   ├── pipe_*.rs           # Spill format, permission, treemap helpers
+│   └── pyo3.rs             # Stub for pyo3 compatibility
 ├── cli/src/                # CLI binary (duscan)
 │   ├── main.rs             # Clap dispatch + scan orchestration + status
 │   ├── config.rs           # TOML config CRUD
 │   ├── scheduler.rs        # Device-aware scan plan (classify + cap workers)
 │   └── config_tui.rs       # Ratatui config + report TUI
-├── legacy/                 # Python reference code (read-only)
-└── src/rust_scanner/       # Original PyO3 crate (.so build, reference)
+└── src/                    # Legacy PyO3 crates — reference only, NOT workspace
+    ├── rust_scanner/       # members and not built by `make build`
+    └── rust_exporter/
 ```
 
 ### Pipeline phases
@@ -264,7 +267,8 @@ Merge + History: fold everything into report.db, append the day's snapshot
 ## Scan performance
 
 Phase 1 is metadata-I/O-bound: on NFS every `lstat`/`statx` is a network RPC, so
-metadata dominates wall time. Two things keep it fast:
+metadata dominates wall time. Two things keep it fast — one syscall per entry, and
+a walker-thread cap tuned per device class:
 
 - **One statx per entry.** Both the file and directory hot-paths issue a single
   `statx_lite()` syscall returning dev+ino+mnt_id+blocks+uid+nlink at once —
